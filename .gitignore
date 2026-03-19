@@ -1,0 +1,65 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Build outputs
+dist/
+build/
+*.pyc
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Uploads
+uploads/
+data/
+
+# Backend specific
+redbox-ops-core/backend/node_modules/
+redbox-ops-core/backend/dist/
+redbox-ops-core/backend/data/
+redbox-ops-core/backend/uploads/
+redbox-ops-core/backend/.env
+
+# Frontend specific
+redbox-ops-core/node_modules/
+redbox-ops-core/dist/
+redbox-ops-core/.env
