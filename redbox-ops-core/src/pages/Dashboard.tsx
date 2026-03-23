@@ -7,6 +7,7 @@ import {
 import AppLayout from "@/components/AppLayout";
 import MetricCard from "@/components/MetricCard";
 import StatusBadge from "@/components/StatusBadge";
+import RunDetailModal from "@/components/RunDetailModal";
 import { useMcp } from "@/context/McpContext";
 import { dashboard, type DashboardStats } from "@/services/api-client";
 
@@ -17,6 +18,11 @@ const Dashboard = () => {
   const { isOnline, llmOnline, ragIndexed } = useMcp();
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [loading, setLoading] = useState(true);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+
+  const refreshStats = () => {
+    dashboard.stats().then(setStats).catch(() => {});
+  };
 
   useEffect(() => {
     dashboard
@@ -35,6 +41,13 @@ const Dashboard = () => {
     { name: "HexStrike MCP", status: isOnline ? "online" : "offline" },
     { name: "RAG Engine",    status: ragIndexed ? "online" : "offline" },
     { name: "LLM Provider",  status: llmOnline  ? "online" : "offline" },
+  ];
+
+  const quickStart = [
+    { label: "AI Terminal",          path: "/terminal"     },
+    { label: "Pentest Orchestrator", path: "/orchestrator" },
+    { label: "RAG Advisor",          path: "/rag"          },
+    { label: "Settings",             path: "/settings"     },
   ];
 
   const totalFindings = stats?.totalFindings ?? 0;
@@ -118,7 +131,7 @@ const Dashboard = () => {
                   <div
                     key={run.id}
                     className="px-5 py-3.5 flex items-center gap-3 hover:bg-zinc-900/50 transition-colors cursor-pointer"
-                    onClick={() => navigate("/orchestrator")}
+                    onClick={() => setSelectedRunId(run.id)}
                   >
                     {severityIcon(run.status)}
                     <div className="flex-1 min-w-0">
@@ -145,6 +158,21 @@ const Dashboard = () => {
 
           {/* Right column */}
           <div className="space-y-4">
+            <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-5">
+              <h3 className="text-zinc-300 font-mono text-xs uppercase tracking-[0.15em] mb-4">// Quick Start</h3>
+              <div className="space-y-2">
+                {quickStart.map(({ label, path }) => (
+                  <button
+                    key={label}
+                    onClick={() => navigate(path)}
+                    className="w-full text-left px-3 py-2.5 rounded-md text-sm bg-zinc-800/80 border border-zinc-700/50 text-zinc-300 hover:text-red-400 hover:border-red-500/30 font-mono transition-all"
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
             {/* Findings breakdown */}
             {stats && totalFindings > 0 && (
               <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-5">
@@ -195,6 +223,14 @@ const Dashboard = () => {
           </div>
         </div>
       </div>
+
+      {/* Run Detail Modal */}
+      <RunDetailModal
+        runId={selectedRunId}
+        open={!!selectedRunId}
+        onClose={() => setSelectedRunId(null)}
+        onDeleted={refreshStats}
+      />
     </AppLayout>
   );
 };

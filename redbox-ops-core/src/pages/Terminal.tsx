@@ -10,7 +10,7 @@ import {
   ResizablePanel,
   ResizableHandle,
 } from "@/components/ui/resizable";
-import { shell, hexstrike, llmProviders, type LlmProvider } from "@/services/api-client";
+import { shell, hexstrike, llmProviders, chat, type LlmProvider } from "@/services/api-client";
 import { useToast } from "@/hooks/use-toast";
 import { useMcp } from "@/context/McpContext";
 
@@ -66,9 +66,9 @@ const Terminal = () => {
     setChatInput("");
     setIsSending(true);
     try {
-      const res = await hexstrike.command(content, false) as { output?: string; result?: string; error?: string };
-      const reply = res.output || res.result || "(no output)";
-      setMessages((m) => [...m, { role: "assistant", content: reply, timestamp: now() }]);
+      // Use the LLM chat endpoint instead of HexStrike
+      const res = await chat.send(content, "You are RedBox AI, a helpful security assistant. Be concise and helpful.");
+      setMessages((m) => [...m, { role: "assistant", content: res.response, timestamp: now() }]);
     } catch (err) {
       const msg = (err as { error?: string }).error || "Connection failed";
       setMessages((m) => [...m, { role: "assistant", content: `Error: ${msg}`, timestamp: now() }]);

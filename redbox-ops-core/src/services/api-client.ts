@@ -108,13 +108,24 @@ export interface McpServer {
 
 export interface LlmProvider {
   id: string;
-  type: "ollama" | "openai" | "anthropic" | "gemini" | "custom";
+  type: string; // Dynamic - any type registered in backend
   name: string;
   endpoint: string;
   model: string;
   active: number;
   is_default: number;
   created_at: string;
+}
+
+/** Provider registry entry from backend */
+export interface ProviderRegistryEntry {
+  value: string;
+  label: string;
+  defaultEndpoint: string;
+  defaultModel: string;
+  requiresApiKey: boolean;
+  availableModels?: string[];
+  description?: string;
 }
 
 export interface Run {
@@ -244,10 +255,13 @@ export const mcpServers = {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const llmProviders = {
+  /** Get list of available provider types from registry */
+  registry: () => request<{ providers: ProviderRegistryEntry[] }>("/api/llm-providers/registry"),
+
   list: () => request<{ providers: LlmProvider[] }>("/api/llm-providers"),
 
   create: (data: {
-    type: LlmProvider["type"];
+    type: string; // Dynamic from registry
     name: string;
     endpoint: string;
     apiKey?: string;
@@ -273,19 +287,64 @@ export const llmProviders = {
 // Orchestrator
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const orchestrator = {
-  pipelines: () => request<{ pipelines: { id: string; templates: string[] }[] }>("/api/orchestrator/pipelines"),
+export interface TestTypeOption {
+  value: string;
+  label: string;
+}
 
+export interface PurposeOption {
+  value: string;
+  label: string;
+}
+
+export interface RouteInfo {
+  promptFile: string | null;
+  pipeline: string;
+  description: string;
+  requiresMcp: boolean;
+  mcpTools?: string[];
+}
+
+export const orchestrator = {
+  /** Get available test types and purposes */
+  config: () => request<{ testTypes: TestTypeOption[]; purposes: PurposeOption[] }>("/api/orchestrator/config"),
+
+  /** Get route info for a test type + purpose combination */
+  routeInfo: (testType: string, purpose: string) =>
+    request<{ route: RouteInfo | null; compatiblePurposes: string[]; compatibleTestTypes: string[] }>(
+      `/api/orchestrator/route-info?testType=${encodeURIComponent(testType)}&purpose=${encodeURIComponent(purpose)}`
+    ),
+
+  /** Test MCP tool availability - Pre-flight check */
+  testTools: (mcpServerId?: string) =>
+    json("/api/orchestrator/test-tools", "POST", { mcpServerId }) as Promise<{
+      success: boolean;
+      results: {
+        serverStatus: 'connected' | 'disconnected' | 'error';
+        availableTools: string[];
+        missingTools: string[];
+        toolsStatus: Record<string, 'available' | 'missing' | 'error'>;
+        error?: string;
+      };
+      summary: {
+        totalTested: number;
+        availableCount: number;
+        missingCount: number;
+        serverConnected: boolean;
+      };
+    }>,
+
+  /** Start a run - routing is determined by testType + purpose */
   startRun: (data: {
     target: string;
     scope?: string;
     testType: string;
     purpose: string;
-    pipeline: string;
     mcpServerId?: string;
     llmProviderId?: string;
     modelOverride?: string;
     uploadIds?: string[];
+    challengeName?: string;
   }) => json("/api/orchestrator/run", "POST", data) as Promise<{ runId: string }>,
 
   listRuns: () => request<{ runs: Run[] }>("/api/orchestrator/runs"),
@@ -293,6 +352,8 @@ export const orchestrator = {
   getRun: (id: string) => request<{ run: Run }>(`/api/orchestrator/runs/${id}`),
 
   stopRun: (id: string) => json(`/api/orchestrator/runs/${id}/stop`, "POST"),
+
+  deleteRun: (id: string) => json(`/api/orchestrator/runs/${id}`, "DELETE") as Promise<{ ok: boolean }>,
 
   streamUrl: (runId: string) => `${BACKEND_URL}/api/orchestrator/runs/${runId}/stream`,
 };
@@ -395,4 +456,21 @@ export const hexstrike = {
     json(`/api/hexstrike/tools/${name}`, "POST", params),
 
   telemetry: () => request("/api/hexstrike/telemetry"),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Chat (LLM-powered)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const chat = {
+  /** Simple non-streaming chat request */
+  send: (message: string, systemPrompt?: string) =>
+    json("/api/chat/simple", "POST", { message, systemPrompt }) as Promise<{
+      response: string;
+      provider: string;
+      model: string;
+    }>,
+
+  /** Streaming chat - returns EventSource URL */
+  streamUrl: () => `${BACKEND_URL}/api/chat`,
 };

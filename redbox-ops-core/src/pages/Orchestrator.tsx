@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Crosshair, Upload, Play, Square, ChevronDown, AlertTriangle,
-  ShieldCheck, Info, Loader2, Server, Bot, FileText, X, Download,
+  ShieldCheck, Info, Loader2, Server, Bot, FileText, X, Download, Trash2, Zap,
 } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -9,14 +9,14 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { TerminalOutput, type TerminalLine } from "@/components/TerminalOutput";
 import StatusBadge from "@/components/StatusBadge";
+import RunDetailModal from "@/components/RunDetailModal";
 import {
   orchestrator, mcpServers, llmProviders, uploads, reports,
   type McpServer, type LlmProvider, type Finding, type Run,
+  type TestTypeOption, type PurposeOption, type RouteInfo,
 } from "@/services/api-client";
 import { useToast } from "@/hooks/use-toast";
 
-const testTypes = ["Web Application","Executable (Win/Linux)","APK / Mobile","Network Infrastructure","OSINT Investigation","API Testing"];
-const purposes  = ["CTF","Real-life Investigation","Red Team Simulation","Blue Team Validation","Malware Analysis","Research"];
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.replace(/\/$/, "") ?? "";
 
 type FindingSeverity = "critical" | "high" | "medium" | "low" | "info" | "warning";
@@ -25,42 +25,188 @@ const now = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 const Orchestrator = () => {
   const { toast } = useToast();
 
-  // ── Selectors from API ──
-  const [mcpList,     setMcpList]     = useState<McpServer[]>([]);
-  const [providerList,setProviderList]= useState<LlmProvider[]>([]);
-  const [pipelines,   setPipelines]   = useState<string[]>([]);
-  const [selMcp,      setSelMcp]      = useState("");
+  // ── Config from API ──
+  const [testTypes, setTestTypes] = useState<TestTypeOption[]>([]);
+  const [purposes, setPurposes] = useState<PurposeOption[]>([]);
+  const [routeInfo, setRouteInfo] = useState<RouteInfo | null>(null);
+
+  // ── Selectors ──
+  const [mcpList, setMcpList] = useState<McpServer[]>([]);
+  const [providerList, setProviderList] = useState<LlmProvider[]>([]);
+  const [selMcp, setSelMcp] = useState("");
   const [selProvider, setSelProvider] = useState("");
-  const [pipeline,    setPipeline]    = useState("real-pentesting");
-  const [testType,    setTestType]    = useState(testTypes[0]);
-  const [purpose,     setPurpose]     = useState(purposes[0]);
-  const [target,      setTarget]      = useState("");
-  const [scope,       setScope]       = useState("");
+  const [testType, setTestType] = useState("");
+  const [purpose, setPurpose] = useState("");
+  const [target, setTarget] = useState("");
+  const [scope, setScope] = useState("");
+  const [challengeName, setChallengeName] = useState("");
 
   // ── Run state ──
-  const [isRunning, setIsRunning]     = useState(false);
-  const [runId,     setRunId]         = useState<string | null>(null);
-  const [output,    setOutput]        = useState<TerminalLine[]>([
+  const [isRunning, setIsRunning] = useState(false);
+  const [runId, setRunId] = useState<string | null>(null);
+  const [output, setOutput] = useState<TerminalLine[]>([
     { type: "system", content: "RedBox Orchestrator — ready.", timestamp: now() },
-    { type: "system", content: "Configure a task and press Execute.", timestamp: now() },
+    { type: "system", content: "Select test type and purpose to see the prompt that will be executed.", timestamp: now() },
   ]);
-  const [findings,  setFindings]      = useState<Finding[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
   const eventSourceRef = useRef<EventSource | null>(null);
 
   // ── Uploads ──
   const [uploadedFiles, setUploadedFiles] = useState<{ id: string; name: string }[]>([]);
-  const [isUploading,   setIsUploading]   = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Run history ──
-  const [runs,       setRuns]        = useState<Run[]>([]);
-  const [showHistory,setShowHistory] = useState(false);
+  const [runs, setRuns] = useState<Run[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
+
+  // ── MCP Tool Testing ──
+  const [isTestingTools, setIsTestingTools] = useState(false);
+  const [toolTestResults, setToolTestResults] = useState<{
+    serverStatus?: 'connected' | 'disconnected' | 'error';
+    availableTools?: string[];
+    missingTools?: string[];
+    toolsStatus?: Record<string, 'available' | 'missing' | 'error'>;
+    error?: string;
+    totalTested?: number;
+    availableCount?: number;
+    missingCount?: number;
+  } | null>(null);
+  const [showToolTestResults, setShowToolTestResults] = useState(false);
+
+  const refreshRuns = () => {
+    orchestrator.listRuns().then(({ runs: r }) => setRuns(r)).catch(() => {});
+  };
+
+  // Handle MCP tool testing
+  const handleTestTools = async () => {
+    if (isTestingTools) return;
+
+    setIsTestingTools(true);
+    setToolTestResults(null);
+    setShowToolTestResults(false);
+
+    try {
+      appendLine({
+        type: "system",
+        content: "🔍 Testing MCP tool availability...",
+        timestamp: now()
+      });
+
+      const response = await orchestrator.testTools(selMcp || undefined);
+
+      if (response.success) {
+        const { results, summary } = response;
+
+        setToolTestResults({
+          serverStatus: results.serverStatus,
+          availableTools: results.availableTools,
+          missingTools: results.missingTools,
+          toolsStatus: results.toolsStatus,
+          error: results.error,
+          totalTested: summary.totalTested,
+          availableCount: summary.availableCount,
+          missingCount: summary.missingCount
+        });
+
+        appendLine({
+          type: "success",
+          content: `✅ Tool test completed: ${summary.availableCount}/${summary.totalTested} tools available`,
+          timestamp: now()
+        });
+
+        if (summary.missingCount > 0) {
+          appendLine({
+            type: "warning",
+            content: `⚠️ ${summary.missingCount} tools missing or unavailable. Check results for details.`,
+            timestamp: now()
+          });
+        }
+
+        setShowToolTestResults(true);
+      } else {
+        appendLine({
+          type: "error",
+          content: "❌ Tool test failed. Check MCP server connection.",
+          timestamp: now()
+        });
+      }
+    } catch (error) {
+      console.error("Tool test error:", error);
+      appendLine({
+        type: "error",
+        content: `❌ Tool test failed: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        timestamp: now()
+      });
+    } finally {
+      setIsTestingTools(false);
+    }
+  };
+
+  // Helper function to get appropriate target field info based on test type
+  const getTargetFieldInfo = (testType: string) => {
+    switch (testType) {
+      case "web-application":
+      case "api":
+        return {
+          label: "// Target URL",
+          placeholder: "https://target.com or http://10.0.0.1:8080"
+        };
+      case "reverse-engineering":
+      case "binary-exploitation":
+        return {
+          label: "// Binary File",
+          placeholder: "C:\\path\\to\\binary.exe or /path/to/executable"
+        };
+      case "forensics":
+        return {
+          label: "// Evidence File",
+          placeholder: "C:\\evidence\\memory.dump or /evidence/disk.img"
+        };
+      case "cryptography":
+        return {
+          label: "// Cipher / Data",
+          placeholder: "VGhpcyBpcyBlbmNyeXB0ZWQgZGF0YQ== or encrypted_file.txt"
+        };
+      case "mobile-app":
+        return {
+          label: "// APK/IPA File",
+          placeholder: "C:\\apps\\target.apk or /apps/target.ipa"
+        };
+      case "network":
+        return {
+          label: "// Network Target",
+          placeholder: "10.0.0.1/24 or network.pcap"
+        };
+      case "osint":
+        return {
+          label: "// Target Entity",
+          placeholder: "company.com or @username or John Doe"
+        };
+      default:
+        return {
+          label: "// Target",
+          placeholder: "Enter target (URL, file, IP, etc.)"
+        };
+    }
+  };
+
+  const targetInfo = getTargetFieldInfo(testType);
 
   const appendLine = useCallback((line: TerminalLine) =>
     setOutput((p) => [...p, line]), []);
 
-  // Load selectors on mount
+  // Load config on mount
   useEffect(() => {
+    orchestrator.config().then(({ testTypes: tt, purposes: pp }) => {
+      setTestTypes(tt);
+      setPurposes(pp);
+      if (tt.length > 0) setTestType(tt[0].value);
+      if (pp.length > 0) setPurpose(pp[0].value);
+    }).catch(() => {});
+
     mcpServers.list().then(({ servers }) => {
       setMcpList(servers);
       const def = servers.find((s) => s.is_default) || servers[0];
@@ -73,14 +219,19 @@ const Orchestrator = () => {
       if (active) setSelProvider(active.id);
     }).catch(() => {});
 
-    orchestrator.pipelines().then(({ pipelines: ps }) => {
-      const ids = ps.map((p) => p.id);
-      setPipelines(ids);
-      if (ids.length > 0 && !ids.includes(pipeline)) setPipeline(ids[0]);
-    }).catch(() => {});
-
-    orchestrator.listRuns().then(({ runs: r }) => setRuns(r)).catch(() => {});
+    refreshRuns();
   }, []);
+
+  // Update route info when test type or purpose changes
+  useEffect(() => {
+    if (!testType || !purpose) {
+      setRouteInfo(null);
+      return;
+    }
+    orchestrator.routeInfo(testType, purpose).then(({ route }) => {
+      setRouteInfo(route);
+    }).catch(() => setRouteInfo(null));
+  }, [testType, purpose]);
 
   // File upload
   const handleFileSelect = async (files: FileList | null) => {
@@ -103,7 +254,6 @@ const Orchestrator = () => {
   const connectStream = useCallback((id: string) => {
     if (eventSourceRef.current) eventSourceRef.current.close();
     const token = localStorage.getItem("redbox_token") || "";
-    // EventSource doesn't support custom headers; use fetch streaming instead
     const ctrl = new AbortController();
     const url = `${BACKEND_URL}/api/orchestrator/runs/${id}/stream`;
 
@@ -140,10 +290,14 @@ const Orchestrator = () => {
               appendLine({ type: "error", content: `Error (${ev.step || "run"}): ${ev.content}`, timestamp: now() });
             } else if (ev.type === "status") {
               appendLine({ type: "system", content: ev.content || "", timestamp: now() });
+            } else if (ev.type === "mcp_call" || ev.type === "tool_call") {
+              appendLine({ type: "info", content: `🔧 Tool: ${ev.content}`, timestamp: now() });
+            } else if (ev.type === "mcp_result" || ev.type === "tool_result") {
+              appendLine({ type: "output", content: `   ↳ ${ev.content}`, timestamp: now() });
             } else if (ev.type === "complete") {
               appendLine({ type: "system", content: "— Run complete —", timestamp: now() });
               setIsRunning(false);
-              orchestrator.listRuns().then(({ runs: r }) => setRuns(r)).catch(() => {});
+              refreshRuns();
               ctrl.abort();
             }
           } catch { /* skip */ }
@@ -164,16 +318,28 @@ const Orchestrator = () => {
       toast({ title: "Target required", description: "Enter a target before executing.", variant: "destructive" });
       return;
     }
+    if (!routeInfo) {
+      toast({ title: "Invalid configuration", description: "Select a valid test type and purpose combination.", variant: "destructive" });
+      return;
+    }
     setIsRunning(true);
     setFindings([]);
-    setOutput([{ type: "system", content: `Starting: ${testType} on ${target}`, timestamp: now() }]);
+    setOutput([
+      { type: "system", content: `Starting: ${routeInfo.description}`, timestamp: now() },
+      { type: "info", content: `Target: ${target}`, timestamp: now() },
+      { type: "info", content: `Pipeline: ${routeInfo.pipeline} → ${routeInfo.promptFile || "direct"}`, timestamp: now() },
+    ]);
 
     try {
       const { runId: id } = await orchestrator.startRun({
-        target, scope, testType, purpose, pipeline,
+        target,
+        scope,
+        testType,
+        purpose,
         mcpServerId: selMcp || undefined,
         llmProviderId: selProvider || undefined,
         uploadIds: uploadedFiles.map((f) => f.id),
+        challengeName: purpose === "ctf" ? challengeName : undefined,
       });
       setRunId(id);
       appendLine({ type: "info", content: `Run ID: ${id}`, timestamp: now() });
@@ -204,6 +370,20 @@ const Orchestrator = () => {
     }
   };
 
+  const handleDeleteRun = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setDeletingRunId(id);
+    try {
+      await orchestrator.deleteRun(id);
+      toast({ title: "Run deleted", description: "The scan has been removed from history." });
+      refreshRuns();
+    } catch (err) {
+      toast({ title: "Delete failed", description: (err as {error?:string}).error || "error", variant: "destructive" });
+    } finally {
+      setDeletingRunId(null);
+    }
+  };
+
   const severityIcon = (s: FindingSeverity) => {
     if (s === "critical" || s === "high") return <AlertTriangle className="w-4 h-4 text-primary" />;
     if (s === "medium" || s === "warning") return <ShieldCheck className="w-4 h-4 text-warning" />;
@@ -211,7 +391,6 @@ const Orchestrator = () => {
   };
 
   const activeProvider = providerList.find((p) => p.id === selProvider);
-  const activeMcp       = mcpList.find((s) => s.id === selMcp);
 
   return (
     <AppLayout>
@@ -250,6 +429,75 @@ const Orchestrator = () => {
             <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-5 space-y-4">
               <h3 className="text-zinc-200 font-mono text-xs uppercase tracking-[0.15em]">// Task Configuration</h3>
 
+              {/* Test Type */}
+              <div>
+                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Test Type</label>
+                <div className="relative">
+                  <select
+                    value={testType}
+                    onChange={(e) => setTestType(e.target.value)}
+                    className="w-full bg-zinc-800/80 border border-zinc-700 text-zinc-200 font-mono rounded-md px-3 py-2 text-sm appearance-none cursor-pointer"
+                  >
+                    {testTypes.map((t) => <option key={t.value} value={t.value}>{t.label}</option>)}
+                  </select>
+                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
+                </div>
+              </div>
+
+              {/* Purpose */}
+              <div>
+                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Purpose</label>
+                <div className="relative">
+                  <select
+                    value={purpose}
+                    onChange={(e) => setPurpose(e.target.value)}
+                    className="w-full bg-zinc-800/80 border border-zinc-700 text-zinc-200 font-mono rounded-md px-3 py-2 text-sm appearance-none cursor-pointer"
+                  >
+                    {purposes.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+                  </select>
+                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
+                </div>
+              </div>
+
+              {/* Route Info Badge */}
+              {routeInfo && (
+                <div className="bg-zinc-800/60 border border-zinc-700/50 rounded-md p-3">
+                  <div className="flex items-center gap-2 mb-2">
+                    <Zap className="w-3.5 h-3.5 text-red-400" />
+                    <span className="text-[10px] font-mono text-red-400 uppercase">Smart Route</span>
+                  </div>
+                  <p className="text-xs font-mono text-zinc-300">{routeInfo.description}</p>
+                  <p className="text-[10px] font-mono text-zinc-500 mt-1">
+                    Pipeline: {routeInfo.pipeline} → {routeInfo.promptFile || "direct analysis"}
+                  </p>
+                  {routeInfo.requiresMcp && routeInfo.mcpTools && (
+                    <p className="text-[10px] font-mono text-zinc-500 mt-1">
+                      MCP Tools: {routeInfo.mcpTools.slice(0, 3).join(", ")}{routeInfo.mcpTools.length > 3 ? "..." : ""}
+                    </p>
+                  )}
+                </div>
+              )}
+              {!routeInfo && testType && purpose && (
+                <div className="bg-yellow-500/10 border border-yellow-500/30 rounded-md p-3">
+                  <p className="text-xs font-mono text-yellow-400">
+                    No specific prompt for this combination. Will use direct analysis.
+                  </p>
+                </div>
+              )}
+
+              {/* Challenge Name (for CTF) */}
+              {purpose === "ctf" && (
+                <div>
+                  <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Challenge Name</label>
+                  <Input
+                    placeholder="e.g., Super Secure Login"
+                    value={challengeName}
+                    onChange={(e) => setChallengeName(e.target.value)}
+                    className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
+                  />
+                </div>
+              )}
+
               {/* MCP Server */}
               <div>
                 <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 flex items-center gap-1">
@@ -268,44 +516,110 @@ const Orchestrator = () => {
                   </select>
                   <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
                 </div>
-              </div>
 
-              {/* Pipeline */}
-              <div>
-                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Pipeline</label>
-                <div className="relative">
-                  <select
-                    value={pipeline}
-                    onChange={(e) => setPipeline(e.target.value)}
-                    className="w-full bg-zinc-800/80 border border-zinc-700 text-zinc-200 font-mono rounded-md px-3 py-2 text-sm appearance-none cursor-pointer"
+                {/* MCP Tool Test Button */}
+                <div className="mt-2">
+                  <Button
+                    onClick={handleTestTools}
+                    disabled={isTestingTools || !selMcp || mcpList.length === 0}
+                    size="sm"
+                    variant="outline"
+                    className="w-full bg-zinc-900/50 border-zinc-600 text-zinc-300 hover:bg-zinc-800/70 hover:text-zinc-200 font-mono text-xs"
                   >
-                    {pipelines.length === 0 && <option value="real-pentesting">real-pentesting</option>}
-                    {pipelines.map((p) => <option key={p} value={p}>{p}</option>)}
-                  </select>
-                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
+                    {isTestingTools ? (
+                      <>
+                        <Loader2 className="w-3 h-3 animate-spin mr-2" />
+                        Testing tools...
+                      </>
+                    ) : (
+                      <>
+                        <Zap className="w-3 h-3 mr-2" />
+                        Test MCP Tools
+                      </>
+                    )}
+                  </Button>
                 </div>
-              </div>
 
-              {/* Test Type */}
-              <div>
-                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Test Type</label>
-                <div className="relative">
-                  <select value={testType} onChange={(e) => setTestType(e.target.value)} className="w-full bg-zinc-800/80 border border-zinc-700 text-zinc-200 font-mono rounded-md px-3 py-2 text-sm appearance-none cursor-pointer">
-                    {testTypes.map((t) => <option key={t}>{t}</option>)}
-                  </select>
-                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
-                </div>
-              </div>
+                {/* Tool Test Results */}
+                {showToolTestResults && toolTestResults && (
+                  <div className="mt-3 p-3 bg-zinc-900/60 border border-zinc-700 rounded-md">
+                    <div className="flex items-center justify-between mb-2">
+                      <div className="flex items-center gap-2">
+                        {toolTestResults.serverStatus === 'connected' ? (
+                          <div className="w-2 h-2 rounded-full bg-green-500"></div>
+                        ) : (
+                          <div className="w-2 h-2 rounded-full bg-red-500"></div>
+                        )}
+                        <span className="text-[10px] font-mono text-zinc-400 uppercase tracking-wider">
+                          {toolTestResults.serverStatus === 'connected' ? 'MCP Connected' : 'MCP Disconnected'}
+                        </span>
+                      </div>
+                      <Button
+                        onClick={() => setShowToolTestResults(false)}
+                        size="sm"
+                        variant="ghost"
+                        className="h-auto p-1 text-zinc-500 hover:text-zinc-300"
+                      >
+                        <X className="w-3 h-3" />
+                      </Button>
+                    </div>
 
-              {/* Purpose */}
-              <div>
-                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Purpose</label>
-                <div className="relative">
-                  <select value={purpose} onChange={(e) => setPurpose(e.target.value)} className="w-full bg-zinc-800/80 border border-zinc-700 text-zinc-200 font-mono rounded-md px-3 py-2 text-sm appearance-none cursor-pointer">
-                    {purposes.map((p) => <option key={p}>{p}</option>)}
-                  </select>
-                  <ChevronDown className="absolute right-3 top-1/2 -translate-y-1/2 w-4 h-4 text-zinc-500 pointer-events-none" />
-                </div>
+                    <div className="grid grid-cols-2 gap-2 mb-3">
+                      <div className="text-center">
+                        <div className="text-lg font-mono font-bold text-green-400">
+                          {toolTestResults.availableCount || 0}
+                        </div>
+                        <div className="text-[10px] text-zinc-500 uppercase tracking-wide">Available</div>
+                      </div>
+                      <div className="text-center">
+                        <div className="text-lg font-mono font-bold text-red-400">
+                          {toolTestResults.missingCount || 0}
+                        </div>
+                        <div className="text-[10px] text-zinc-500 uppercase tracking-wide">Missing</div>
+                      </div>
+                    </div>
+
+                    {toolTestResults.error && (
+                      <div className="text-xs text-red-400 font-mono mb-2">
+                        Error: {toolTestResults.error}
+                      </div>
+                    )}
+
+                    <div className="max-h-32 overflow-y-auto">
+                      <div className="text-[10px] text-zinc-400 uppercase tracking-wide mb-1">Available Tools:</div>
+                      <div className="flex flex-wrap gap-1 mb-2">
+                        {toolTestResults.availableTools?.slice(0, 10).map((tool) => (
+                          <span key={tool} className="px-2 py-1 bg-green-500/20 text-green-400 text-xs font-mono rounded">
+                            {tool}
+                          </span>
+                        ))}
+                        {(toolTestResults.availableTools?.length || 0) > 10 && (
+                          <span className="px-2 py-1 bg-zinc-700 text-zinc-400 text-xs font-mono rounded">
+                            +{(toolTestResults.availableTools?.length || 0) - 10} more
+                          </span>
+                        )}
+                      </div>
+
+                      {(toolTestResults.missingTools?.length || 0) > 0 && (
+                        <>
+                          <div className="text-[10px] text-zinc-400 uppercase tracking-wide mb-1">Missing Tools:</div>
+                          <div className="flex flex-wrap gap-1">
+                            {toolTestResults.missingTools?.slice(0, 8).map((tool) => (
+                              <span key={tool} className="px-2 py-1 bg-red-500/20 text-red-400 text-xs font-mono rounded">
+                                {tool}
+                              </span>
+                            ))}
+                            {(toolTestResults.missingTools?.length || 0) > 8 && (
+                              <span className="px-2 py-1 bg-zinc-700 text-zinc-400 text-xs font-mono rounded">
+                                +{(toolTestResults.missingTools?.length || 0) - 8} more
+                              </span>
+                            )}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* LLM Provider */}
@@ -330,9 +644,9 @@ const Orchestrator = () => {
 
               {/* Target */}
               <div>
-                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Target</label>
+                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">{targetInfo.label}</label>
                 <Input
-                  placeholder="https://target.com or 10.0.0.1"
+                  placeholder={targetInfo.placeholder}
                   value={target}
                   onChange={(e) => setTarget(e.target.value)}
                   className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
@@ -460,15 +774,33 @@ const Orchestrator = () => {
                 ) : (
                   <div className="divide-y divide-zinc-800/60 max-h-64 overflow-auto">
                     {runs.map((r) => (
-                      <div key={r.id} className="px-5 py-3 flex items-center justify-between text-sm hover:bg-zinc-900/50 transition-colors">
-                        <div>
-                          <p className="font-mono text-zinc-100">{r.target}</p>
-                          <p className="text-[11px] font-mono text-zinc-400">{r.pipeline} · {new Date(r.created_at).toLocaleString()}</p>
+                      <div
+                        key={r.id}
+                        className="px-5 py-3 flex items-center justify-between text-sm hover:bg-zinc-900/50 transition-colors cursor-pointer group"
+                        onClick={() => setSelectedRunId(r.id)}
+                      >
+                        <div className="flex-1 min-w-0">
+                          <p className="font-mono text-zinc-100 truncate">{r.target}</p>
+                          <p className="text-[11px] font-mono text-zinc-400">{r.test_type} · {r.purpose} · {new Date(r.created_at).toLocaleString()}</p>
                         </div>
-                        <StatusBadge
-                          variant={r.status === "completed" ? "online" : r.status === "failed" ? "offline" : "warning"}
-                          label={r.status}
-                        />
+                        <div className="flex items-center gap-2">
+                          <StatusBadge
+                            variant={r.status === "completed" ? "online" : r.status === "failed" ? "offline" : "warning"}
+                            label={r.status}
+                          />
+                          <button
+                            onClick={(e) => handleDeleteRun(r.id, e)}
+                            disabled={deletingRunId === r.id}
+                            className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 transition-all p-1"
+                            title="Delete run"
+                          >
+                            {deletingRunId === r.id ? (
+                              <Loader2 className="w-4 h-4 animate-spin" />
+                            ) : (
+                              <Trash2 className="w-4 h-4" />
+                            )}
+                          </button>
+                        </div>
                       </div>
                     ))}
                   </div>
@@ -478,6 +810,14 @@ const Orchestrator = () => {
           </div>
         </div>
       </div>
+
+      {/* Run Detail Modal */}
+      <RunDetailModal
+        runId={selectedRunId}
+        open={!!selectedRunId}
+        onClose={() => setSelectedRunId(null)}
+        onDeleted={refreshRuns}
+      />
     </AppLayout>
   );
 };

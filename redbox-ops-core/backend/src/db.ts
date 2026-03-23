@@ -41,7 +41,7 @@ function initSchema() {
 
     CREATE TABLE IF NOT EXISTS llm_providers (
       id TEXT PRIMARY KEY,
-      type TEXT NOT NULL CHECK(type IN ('ollama','openai','anthropic','gemini','custom')),
+      type TEXT NOT NULL,
       name TEXT NOT NULL,
       endpoint TEXT NOT NULL,
       api_key TEXT,

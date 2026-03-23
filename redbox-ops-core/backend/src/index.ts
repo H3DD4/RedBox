@@ -19,6 +19,7 @@ import shellRoutes from "./routes/shell.js";
 import ragRoutes from "./routes/rag.js";
 import reportRoutes from "./routes/reports.js";
 import dashboardRoutes from "./routes/dashboard.js";
+import chatRoutes from "./routes/chat.js";
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 const app = express();
@@ -58,6 +59,7 @@ app.use("/api/shell", requireAuth, shellRoutes);
 app.use("/api/rag", requireAuth, ragRoutes);
 app.use("/api/reports", requireAuth, reportRoutes);
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
+app.use("/api/chat", requireAuth, chatRoutes);
 
 // ─── Error handling ──────────────────────────────────────────────────────────
 app.use(notFound);

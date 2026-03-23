@@ -2,10 +2,14 @@
  * LLM Gateway Service
  *
  * Provides a unified interface for chat completions across
- * Ollama, OpenAI, Anthropic, Gemini, and Custom OpenAI-compatible endpoints.
+ * all providers registered in llm-registry.ts
+ *
+ * Adding new providers: Just add to registry with correct apiStyle.
+ * No changes needed here unless the provider has a custom API format.
  */
 
 import { getDb } from "../db.js";
+import { getApiStyle } from "../lib/llm-registry.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -67,19 +71,35 @@ export async function chat(
 
   const model = options.modelOverride || provider.model;
 
-  switch (provider.type) {
+  // Use apiStyle from registry to determine which handler to use
+  const apiStyle = getApiStyle(provider.type);
+
+  switch (apiStyle) {
     case "ollama":
       return chatOllama(provider, model, messages, options);
     case "openai":
-    case "custom":
+      // Handles: openai, cerebras, groq, together, deepseek, openrouter, custom, and any future OpenAI-compatible
       return chatOpenAI(provider, model, messages, options);
     case "anthropic":
       return chatAnthropic(provider, model, messages, options);
     case "gemini":
       return chatGemini(provider, model, messages, options);
     default:
-      throw new Error(`Unsupported provider type: ${provider.type}`);
+      // Fallback to OpenAI-compatible for unknown providers
+      return chatOpenAI(provider, model, messages, options);
   }
+}
+
+/**
+ * Simple helper that returns just the content string from a chat completion.
+ * Used by the orchestrator agent loop.
+ */
+export async function chatComplete(
+  messages: ChatMessage[],
+  options: ChatOptions & { providerId?: string; modelOverride?: string } = {}
+): Promise<string> {
+  const result = await chat(messages, options);
+  return result.content;
 }
 
 /**
@@ -99,12 +119,15 @@ export async function* chatStream(
 
   const model = options.modelOverride || provider.model;
 
-  switch (provider.type) {
+  // Use apiStyle from registry to determine which handler to use
+  const apiStyle = getApiStyle(provider.type);
+
+  switch (apiStyle) {
     case "ollama":
       yield* streamOllama(provider, model, messages, options);
       return;
     case "openai":
-    case "custom":
+      // Handles: openai, cerebras, groq, together, deepseek, openrouter, custom, and any future OpenAI-compatible
       yield* streamOpenAI(provider, model, messages, options);
       return;
     case "anthropic":
@@ -116,7 +139,9 @@ export async function* chatStream(
       yield result.content;
       return;
     default:
-      throw new Error(`Unsupported provider type: ${provider.type}`);
+      // Fallback to OpenAI-compatible for unknown providers
+      yield* streamOpenAI(provider, model, messages, options);
+      return;
   }
 }
 

@@ -2,6 +2,13 @@ import { Router, Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { getDb } from "../db.js";
 import { AppError } from "../lib/errors.js";
+import {
+  isValidProviderType,
+  getValidProviderTypes,
+  getApiStyle,
+  getProviderList,
+  getProviderConfig,
+} from "../lib/llm-registry.js";
 
 const router = Router();
 
@@ -16,6 +23,12 @@ interface LlmProvider {
   is_default: number;
   created_at: string;
 }
+
+// GET /api/llm-providers/registry
+// Returns the provider registry for frontend to consume dynamically
+router.get("/registry", (_req: Request, res: Response) => {
+  res.json({ providers: getProviderList() });
+});
 
 // GET /api/llm-providers
 router.get("/", (_req: Request, res: Response) => {
@@ -33,9 +46,8 @@ router.post("/", (req: Request, res: Response, next) => {
     if (!type || !name || !endpoint || !model) {
       throw new AppError(400, "MISSING_FIELDS", "Type, name, endpoint, and model are required");
     }
-    const validTypes = ["ollama", "openai", "anthropic", "gemini", "custom"];
-    if (!validTypes.includes(type)) {
-      throw new AppError(400, "INVALID_TYPE", `Type must be one of: ${validTypes.join(", ")}`);
+    if (!isValidProviderType(type)) {
+      throw new AppError(400, "INVALID_TYPE", `Type must be one of: ${getValidProviderTypes().join(", ")}`);
     }
 
     const db = getDb();
@@ -117,16 +129,19 @@ router.post("/:id/test", async (req: Request, res: Response) => {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
     let testOk = false;
-    let modelInfo = provider.model;
+    const modelInfo = provider.model;
 
-    switch (provider.type) {
+    // Use apiStyle from registry to determine test strategy
+    const apiStyle = getApiStyle(provider.type);
+
+    switch (apiStyle) {
       case "ollama": {
         const resp = await fetch(`${provider.endpoint}/api/tags`, { signal: controller.signal });
         testOk = resp.ok;
         break;
       }
-      case "openai":
-      case "custom": {
+      case "openai": {
+        // OpenAI-compatible APIs (includes cerebras, groq, together, deepseek, openrouter, custom)
         const headers: Record<string, string> = { "Content-Type": "application/json" };
         if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
         const resp = await fetch(`${provider.endpoint}/models`, {
@@ -162,6 +177,16 @@ router.post("/:id/test", async (req: Request, res: Response) => {
         testOk = resp.ok;
         break;
       }
+      default: {
+        // Fallback: try OpenAI-compatible test
+        const headers: Record<string, string> = { "Content-Type": "application/json" };
+        if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
+        const resp = await fetch(`${provider.endpoint}/models`, {
+          signal: controller.signal,
+          headers,
+        });
+        testOk = resp.ok;
+      }
     }
 
     clearTimeout(timeout);
@@ -189,7 +214,10 @@ router.get("/:id/models", async (req: Request, res: Response) => {
     const timeout = setTimeout(() => controller.abort(), 10000);
     let models: string[] = [];
 
-    switch (provider.type) {
+    const apiStyle = getApiStyle(provider.type);
+    const config = getProviderConfig(provider.type);
+
+    switch (apiStyle) {
       case "ollama": {
         const resp = await fetch(`${provider.endpoint}/api/tags`, { signal: controller.signal });
         if (resp.ok) {
@@ -198,8 +226,7 @@ router.get("/:id/models", async (req: Request, res: Response) => {
         }
         break;
       }
-      case "openai":
-      case "custom": {
+      case "openai": {
         const headers: Record<string, string> = {};
         if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
         const resp = await fetch(`${provider.endpoint}/models`, {
@@ -213,14 +240,21 @@ router.get("/:id/models", async (req: Request, res: Response) => {
         break;
       }
       default:
-        models = [provider.model];
+        // Use static models from registry if available
+        models = config?.availableModels || [provider.model];
+    }
+
+    // If no models fetched, fall back to registry's available models
+    if (models.length === 0 && config?.availableModels) {
+      models = config.availableModels;
     }
 
     clearTimeout(timeout);
     res.json({ models });
   } catch (err) {
+    const config = getProviderConfig(provider.type);
     res.json({
-      models: [provider.model],
+      models: config?.availableModels || [provider.model],
       error: err instanceof Error ? err.message : "Failed to fetch models",
     });
   }

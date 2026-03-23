@@ -31,10 +31,10 @@ export function listPipelines(): string[] {
 export function listTemplates(pipeline: string): string[] {
   const folder = PIPELINE_FOLDERS[pipeline];
   if (!folder) return [];
-  
+
   const dir = path.join(config.promptsDir, folder);
   if (!fs.existsSync(dir)) return [];
-  
+
   return fs.readdirSync(dir)
     .filter(f => f.endsWith(".txt"))
     .map(f => f.replace(".txt", ""));
@@ -44,10 +44,10 @@ export function listTemplates(pipeline: string): string[] {
 function loadTemplate(pipeline: string, templateName: string): string | null {
   const folder = PIPELINE_FOLDERS[pipeline];
   if (!folder) return null;
-  
+
   const filePath = path.join(config.promptsDir, folder, `${templateName}.txt`);
   if (!fs.existsSync(filePath)) return null;
-  
+
   return fs.readFileSync(filePath, "utf-8");
 }
 
@@ -58,8 +58,8 @@ function loadShared(templateName: string): string {
   return fs.readFileSync(filePath, "utf-8");
 }
 
-// Inject context into template placeholders
-function injectContext(template: string, ctx: PromptContext): string {
+// Simple placeholder replacement (no recursive includes)
+function replaceSimplePlaceholders(template: string, ctx: PromptContext): string {
   let result = template;
   result = result.replace(/\{\{WEB_URL\}\}/g, ctx.target);
   result = result.replace(/\{\{TARGET_URL\}\}/g, ctx.target);
@@ -72,26 +72,30 @@ function injectContext(template: string, ctx: PromptContext): string {
   result = result.replace(/\{\{AUTH_REQUIRED\}\}/g, ctx.authRequired || "No");
   result = result.replace(/\{\{RULES_AVOID\}\}/g, ctx.rulesAvoid || "None specified");
   result = result.replace(/\{\{PRIOR_FINDINGS\}\}/g, ctx.priorFindings || "None yet");
-  
-  // Inject shared templates where referenced
-  const targetTpl = loadShared("_target");
-  const rulesTpl = loadShared("_rules");
-  const vulnScope = loadShared("_vuln-scope");
-  const exploitScope = loadShared("_exploit-scope");
-  
-  // If template references shared includes
-  if (targetTpl) result = result.replace(/\{\{INCLUDE:_target\}\}/g, injectContext(targetTpl, ctx));
-  if (rulesTpl) result = result.replace(/\{\{INCLUDE:_rules\}\}/g, injectContext(rulesTpl, ctx));
-  if (vulnScope) result = result.replace(/\{\{INCLUDE:_vuln-scope\}\}/g, injectContext(vulnScope, ctx));
-  if (exploitScope) result = result.replace(/\{\{INCLUDE:_exploit-scope\}\}/g, injectContext(exploitScope, ctx));
-  
+  return result;
+}
+
+// Inject context into template placeholders
+function injectContext(template: string, ctx: PromptContext): string {
+  // First replace simple placeholders
+  let result = replaceSimplePlaceholders(template, ctx);
+
+  // Then handle includes (only one level deep to prevent infinite recursion)
+  const includePattern = /\{\{INCLUDE:([^}]+)\}\}/g;
+  result = result.replace(includePattern, (_match, templateName: string) => {
+    const sharedContent = loadShared(templateName);
+    if (!sharedContent) return `[Missing template: ${templateName}]`;
+    // Only replace simple placeholders in included templates (no nested includes)
+    return replaceSimplePlaceholders(sharedContent, ctx);
+  });
+
   return result;
 }
 
 // Get the orchestration steps for a pipeline
 export function getOrchestratorPipeline(pipeline: string): string[] {
   const templates = listTemplates(pipeline);
-  
+
   // Order: pre-recon-code -> recon -> vuln-* -> exploit-* -> report-executive
   const order = [
     "pre-recon-code",
@@ -104,7 +108,7 @@ export function getOrchestratorPipeline(pipeline: string): string[] {
     ...templates.filter(t => !t.startsWith("vuln-") && !t.startsWith("exploit-") && !["pre-recon-code", "recon", "report-executive"].includes(t)),
     "report-executive",
   ];
-  
+
   // Filter to only templates that actually exist
   return order.filter(t => templates.includes(t));
 }

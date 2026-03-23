@@ -36,12 +36,16 @@ router.get("/", async (_req: Request, res: Response) => {
         const timeout = setTimeout(() => controller.abort(), 5000);
         // Test based on provider type
         let testUrl = provider.endpoint;
+        const headers: Record<string, string> = {};
         if (provider.type === "ollama") {
           testUrl = `${provider.endpoint}/api/tags`;
-        } else if (provider.type === "openai" || provider.type === "custom") {
+        } else {
+          // OpenAI-compatible APIs (openai, cerebras, groq, together, deepseek, custom, etc.)
           testUrl = `${provider.endpoint}/models`;
+          const apiKey = (provider as { api_key?: string }).api_key;
+          if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
         }
-        const resp = await fetch(testUrl, { signal: controller.signal });
+        const resp = await fetch(testUrl, { signal: controller.signal, headers });
         clearTimeout(timeout);
         llmStatus.online = resp.ok;
       } catch {
