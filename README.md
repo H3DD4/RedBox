@@ -281,5 +281,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 <div align="center">
-  <sub>Developped by H3DD4</sub>
+  <sub>Developed by H3DD4</sub>
 </div>
