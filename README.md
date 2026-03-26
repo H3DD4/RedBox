@@ -272,14 +272,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-## 🙏 Acknowledgments
 
-- Built with ❤️ using React, TypeScript, and Express
-- Powered by multiple LLM providers
-- Security tools integration via Model Context Protocol
-- UI components from [shadcn/ui](https://ui.shadcn.com/)
-
----
 
 ## 📧 Contact
 
@@ -288,5 +281,5 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ---
 
 <div align="center">
-  <sub>Built with Claude Opus 4.6</sub>
+  <sub>Developped by H3DD4</sub>
 </div>
