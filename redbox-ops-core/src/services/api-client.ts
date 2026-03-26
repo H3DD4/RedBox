@@ -65,6 +65,19 @@ async function request<T = unknown>(
     } catch {
       /* ignore */
     }
+
+    // CRITICAL FIX: Handle auth errors gracefully without forcing page refresh
+    if (res.status === 401 || res.status === 403) {
+      // Only clear token if it's actually invalid (not just missing permissions)
+      if (errBody.code === "INVALID_TOKEN" || errBody.code === "TOKEN_EXPIRED") {
+        console.warn("[API] Token expired/invalid, clearing token");
+        clearToken();
+        // Don't throw immediately - let components handle gracefully
+      } else {
+        console.warn("[API] Auth error but token may be valid:", errBody.code);
+      }
+    }
+
     const err: ApiError = {
       error: errBody.error || `HTTP ${res.status}`,
       code: errBody.code || "REQUEST_FAILED",
@@ -183,6 +196,7 @@ export interface Upload {
   id: string;
   filename: string;
   original_name: string;
+  file_path?: string;  // ADDED: Full path to uploaded file (for LLM access)
   mime_type?: string;
   size?: number;
   run_id?: string;

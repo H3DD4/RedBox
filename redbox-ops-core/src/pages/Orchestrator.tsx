@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import {
   Crosshair, Upload, Play, Square, ChevronDown, AlertTriangle,
   ShieldCheck, Info, Loader2, Server, Bot, FileText, X, Download, Trash2, Zap,
+  Trophy, Flag,
 } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
 import { Button } from "@/components/ui/button";
@@ -40,6 +41,11 @@ const Orchestrator = () => {
   const [target, setTarget] = useState("");
   const [scope, setScope] = useState("");
   const [challengeName, setChallengeName] = useState("");
+  // FIXED: UI-01, UI-04 — new form state variables
+  const [flagFormat, setFlagFormat] = useState("");
+  const [loginInstructions, setLoginInstructions] = useState("");
+  const [rulesAvoid, setRulesAvoid] = useState("");
+  const [rulesFocus, setRulesFocus] = useState("");
 
   // ── Run state ──
   const [isRunning, setIsRunning] = useState(false);
@@ -52,7 +58,7 @@ const Orchestrator = () => {
   const eventSourceRef = useRef<EventSource | null>(null);
 
   // ── Uploads ──
-  const [uploadedFiles, setUploadedFiles] = useState<{ id: string; name: string }[]>([]);
+  const [uploadedFiles, setUploadedFiles] = useState<{ id: string; name: string; path?: string }[]>([]);
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
@@ -237,16 +243,24 @@ const Orchestrator = () => {
   const handleFileSelect = async (files: FileList | null) => {
     if (!files || files.length === 0) return;
     setIsUploading(true);
-    const added: { id: string; name: string }[] = [];
+    const added: { id: string; name: string; path: string }[] = [];
     for (const file of Array.from(files)) {
       try {
         const { upload } = await uploads.upload(file);
-        added.push({ id: upload.id, name: upload.original_name });
+        added.push({ id: upload.id, name: upload.original_name, path: upload.file_path || upload.original_name });
       } catch (err) {
         toast({ title: "Upload failed", description: `${file.name}: ${(err as {error?:string}).error || "error"}`, variant: "destructive" });
       }
     }
     setUploadedFiles((p) => [...p, ...added]);
+
+    // Auto-fill target for file-based test types if target is empty
+    const fileBasedTypes = ["reverse-engineering", "binary-exploitation", "forensics", "cryptography", "mobile-app"];
+    if (fileBasedTypes.includes(testType) && !target.trim() && added.length > 0) {
+      // Use the first uploaded file's path as target
+      setTarget(added[0].path);
+    }
+
     setIsUploading(false);
   };
 
@@ -314,8 +328,9 @@ const Orchestrator = () => {
   }, [appendLine]);
 
   const handleRun = async () => {
-    if (!target.trim()) {
-      toast({ title: "Target required", description: "Enter a target before executing.", variant: "destructive" });
+    // Target is required UNLESS files are uploaded
+    if (!target.trim() && uploadedFiles.length === 0) {
+      toast({ title: "Target required", description: "Enter a target or upload files before executing.", variant: "destructive" });
       return;
     }
     if (!routeInfo) {
@@ -324,10 +339,15 @@ const Orchestrator = () => {
     }
     setIsRunning(true);
     setFindings([]);
+
+    // Use uploaded file name as target display if no explicit target
+    const displayTarget = target.trim() || (uploadedFiles.length > 0 ? uploadedFiles.map(f => f.name).join(", ") : "N/A");
+
     setOutput([
       { type: "system", content: `Starting: ${routeInfo.description}`, timestamp: now() },
-      { type: "info", content: `Target: ${target}`, timestamp: now() },
+      { type: "info", content: `Target: ${displayTarget}`, timestamp: now() },
       { type: "info", content: `Pipeline: ${routeInfo.pipeline} → ${routeInfo.promptFile || "direct"}`, timestamp: now() },
+      ...(uploadedFiles.length > 0 ? [{ type: "info" as const, content: `Files: ${uploadedFiles.map(f => f.name).join(", ")}`, timestamp: now() }] : []),
     ]);
 
     try {
@@ -340,6 +360,11 @@ const Orchestrator = () => {
         llmProviderId: selProvider || undefined,
         uploadIds: uploadedFiles.map((f) => f.id),
         challengeName: purpose === "ctf" ? challengeName : undefined,
+        // FIXED: UI-01, UI-04 — include new optional fields
+        flagFormat: flagFormat || undefined,
+        loginInstructions: loginInstructions || undefined,
+        rulesAvoid: rulesAvoid || undefined,
+        rulesFocus: rulesFocus || undefined,
       });
       setRunId(id);
       appendLine({ type: "info", content: `Run ID: ${id}`, timestamp: now() });
@@ -496,6 +521,53 @@ const Orchestrator = () => {
                     className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
                   />
                 </div>
+              )}
+
+              {/* FIXED: UI-01 — Flag Format (for CTF) */}
+              {purpose === "ctf" && (
+                <div>
+                  <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Flag Format (optional)</label>
+                  <Input
+                    placeholder="e.g. HTB{}, picoCTF{}, COMPNAME{} — leave empty for auto-detect"
+                    value={flagFormat}
+                    onChange={(e) => setFlagFormat(e.target.value)}
+                    className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
+                  />
+                </div>
+              )}
+
+              {/* FIXED: UI-04 — Pentest-specific fields (for non-CTF) */}
+              {purpose !== "ctf" && purpose && (
+                <>
+                  <div>
+                    <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Login Instructions (optional)</label>
+                    <Textarea
+                      placeholder="e.g. Use admin/password123 at /login — leave empty if no auth required"
+                      value={loginInstructions}
+                      onChange={(e) => setLoginInstructions(e.target.value)}
+                      className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
+                      rows={2}
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Rules / Focus (optional)</label>
+                    <Input
+                      placeholder="Areas to focus on, e.g. SQL injection, authentication bypass"
+                      value={rulesFocus}
+                      onChange={(e) => setRulesFocus(e.target.value)}
+                      className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Rules / Avoid (optional)</label>
+                    <Input
+                      placeholder="Areas to avoid, e.g. DoS attacks, database modifications"
+                      value={rulesAvoid}
+                      onChange={(e) => setRulesAvoid(e.target.value)}
+                      className="bg-black/60 border-zinc-700 text-zinc-100 placeholder:text-zinc-500 font-mono text-sm"
+                    />
+                  </div>
+                </>
               )}
 
               {/* MCP Server */}
@@ -666,7 +738,7 @@ const Orchestrator = () => {
 
               {/* File Upload */}
               <div>
-                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Artifacts</label>
+                <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1.5 block">// Artifacts (multiple supported)</label>
                 <div
                   className="border border-dashed border-zinc-700 rounded-md p-4 text-center hover:border-red-500/30 transition-colors cursor-pointer"
                   onClick={() => fileInputRef.current?.click()}
@@ -675,12 +747,16 @@ const Orchestrator = () => {
                 >
                   <Upload className="w-5 h-5 text-zinc-500 mx-auto mb-2" />
                   <p className="text-xs text-zinc-500 font-mono">
-                    {isUploading ? "Uploading..." : "Drop EXE, APK, PCAP or click"}
+                    {isUploading ? "Uploading..." : "Drop files or click to upload"}
+                  </p>
+                  <p className="text-[10px] text-zinc-600 font-mono mt-1">
+                    EXE, APK, PCAP, binaries, evidence — multiple files OK
                   </p>
                   <input ref={fileInputRef} type="file" multiple className="hidden" onChange={(e) => handleFileSelect(e.target.files)} />
                 </div>
                 {uploadedFiles.length > 0 && (
                   <div className="mt-2 space-y-1">
+                    <div className="text-[10px] text-zinc-500 font-mono mb-1">{uploadedFiles.length} file(s) uploaded:</div>
                     {uploadedFiles.map((f) => (
                       <div key={f.id} className="flex items-center gap-2 text-xs text-zinc-400 font-mono bg-zinc-800/60 rounded px-2 py-1">
                         <FileText className="w-3 h-3 shrink-0" />
@@ -773,36 +849,85 @@ const Orchestrator = () => {
                   <div className="flex items-center justify-center py-8 text-zinc-500 font-mono text-sm">No runs yet.</div>
                 ) : (
                   <div className="divide-y divide-zinc-800/60 max-h-64 overflow-auto">
-                    {runs.map((r) => (
-                      <div
-                        key={r.id}
-                        className="px-5 py-3 flex items-center justify-between text-sm hover:bg-zinc-900/50 transition-colors cursor-pointer group"
-                        onClick={() => setSelectedRunId(r.id)}
-                      >
-                        <div className="flex-1 min-w-0">
-                          <p className="font-mono text-zinc-100 truncate">{r.target}</p>
-                          <p className="text-[11px] font-mono text-zinc-400">{r.test_type} · {r.purpose} · {new Date(r.created_at).toLocaleString()}</p>
+                    {runs.map((r) => {
+                      const isCTF = r.purpose === "ctf";
+                      const flags = r.findings?.filter((f: any) => f.title.includes("🚩 Flag Captured:")) || [];
+                      const vulnerabilities = r.findings?.filter((f: any) => !f.title.includes("🚩 Flag Captured:")) || [];
+                      const hasFlags = flags.length > 0;
+
+                      return (
+                        <div
+                          key={r.id}
+                          className="px-5 py-3 flex items-center justify-between text-sm hover:bg-zinc-900/50 transition-colors cursor-pointer group"
+                          onClick={() => setSelectedRunId(r.id)}
+                        >
+                          <div className="flex items-center gap-3 flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              {/* Status icon with CTF special handling */}
+                              {r.status === "completed" ? (
+                                isCTF ? <Trophy className="w-4 h-4 text-yellow-500" /> : <ShieldCheck className="w-4 h-4 text-emerald-500" />
+                              ) : r.status === "failed" ? (
+                                <AlertTriangle className="w-4 h-4 text-red-500" />
+                              ) : (
+                                <Loader2 className="w-4 h-4 text-blue-400 animate-spin" />
+                              )}
+
+                              {/* CTF flag indicator */}
+                              {isCTF && hasFlags && (
+                                <div className="flex items-center gap-1 text-yellow-500">
+                                  <Flag className="w-3 h-3" />
+                                  <span className="text-xs font-mono">{flags.length}</span>
+                                </div>
+                              )}
+                            </div>
+
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <p className="font-mono text-zinc-100 truncate">{r.target}</p>
+                                {isCTF && (
+                                  <div className="bg-yellow-500/20 px-1.5 py-0.5 rounded text-[10px] font-mono text-yellow-400 uppercase">
+                                    CTF
+                                  </div>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <p className="text-[11px] font-mono text-zinc-400">
+                                  {r.test_type} · {r.purpose} · {new Date(r.created_at).toLocaleString()}
+                                </p>
+                                {r.status === "completed" && (
+                                  <span className="text-[10px] text-zinc-500 font-mono">
+                                    {isCTF && hasFlags
+                                      ? `🚩 ${flags.length} flag${flags.length !== 1 ? 's' : ''}`
+                                      : vulnerabilities.length > 0
+                                      ? `${vulnerabilities.length} finding${vulnerabilities.length !== 1 ? 's' : ''}`
+                                      : "No findings"}
+                                  </span>
+                                )}
+                              </div>
+                            </div>
+                          </div>
+
+                          <div className="flex items-center gap-2">
+                            <StatusBadge
+                              variant={r.status === "completed" ? "online" : r.status === "failed" ? "offline" : "warning"}
+                              label={r.status}
+                            />
+                            <button
+                              onClick={(e) => handleDeleteRun(r.id, e)}
+                              disabled={deletingRunId === r.id}
+                              className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 transition-all p-1"
+                              title="Delete run"
+                            >
+                              {deletingRunId === r.id ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <Trash2 className="w-4 h-4" />
+                              )}
+                            </button>
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2">
-                          <StatusBadge
-                            variant={r.status === "completed" ? "online" : r.status === "failed" ? "offline" : "warning"}
-                            label={r.status}
-                          />
-                          <button
-                            onClick={(e) => handleDeleteRun(r.id, e)}
-                            disabled={deletingRunId === r.id}
-                            className="opacity-0 group-hover:opacity-100 text-zinc-500 hover:text-red-400 transition-all p-1"
-                            title="Delete run"
-                          >
-                            {deletingRunId === r.id ? (
-                              <Loader2 className="w-4 h-4 animate-spin" />
-                            ) : (
-                              <Trash2 className="w-4 h-4" />
-                            )}
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

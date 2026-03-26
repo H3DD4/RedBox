@@ -10,6 +10,7 @@
 
 import { getDb } from "../db.js";
 import { getApiStyle } from "../lib/llm-registry.js";
+import { getRateLimiter } from "../lib/rate-limiter.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -71,22 +72,84 @@ export async function chat(
 
   const model = options.modelOverride || provider.model;
 
+  // SMART RATE LIMITING: Get rate limiter for this provider type
+  const rateLimiter = getRateLimiter(provider.type);
+
+  // Check if we should recommend switching providers due to excessive rate limiting
+  if (rateLimiter.shouldRecommendProviderSwitch()) {
+    console.warn(`[LLM] ⚠️  RECOMMENDATION: Consider switching from ${provider.name} to Groq or OpenAI for better performance due to frequent rate limits.`);
+  }
+
+  // Estimate tokens for this request
+  const estimatedTokens = rateLimiter.estimateTokens(messages);
+
+  // Log current rate limiter status
+  const status = rateLimiter.getStatus();
+  console.log(`[LLM] ${provider.name}: ${status.tokensUsed}/${status.tokensLimit} tokens, ${status.requestsUsed}/${status.requestsLimit} requests, est: +${estimatedTokens}`);
+
+  if (status.circuitBreakerActive) {
+    console.warn(`[LLM] 🚨 Circuit breaker active for ${provider.name} - waiting for recovery`);
+  }
+
+  // Wait if necessary to avoid hitting rate limits
+  try {
+    await rateLimiter.waitForSlot(estimatedTokens);
+  } catch (err) {
+    console.error('[LLM] Rate limiter failed:', err);
+    // Continue anyway - rate limiter is auxiliary
+  }
+
   // Use apiStyle from registry to determine which handler to use
   const apiStyle = getApiStyle(provider.type);
 
-  switch (apiStyle) {
-    case "ollama":
-      return chatOllama(provider, model, messages, options);
-    case "openai":
-      // Handles: openai, cerebras, groq, together, deepseek, openrouter, custom, and any future OpenAI-compatible
-      return chatOpenAI(provider, model, messages, options);
-    case "anthropic":
-      return chatAnthropic(provider, model, messages, options);
-    case "gemini":
-      return chatGemini(provider, model, messages, options);
-    default:
-      // Fallback to OpenAI-compatible for unknown providers
-      return chatOpenAI(provider, model, messages, options);
+  let result: ChatResult;
+
+  try {
+    switch (apiStyle) {
+      case "ollama":
+        result = await chatOllama(provider, model, messages, options);
+        break;
+      case "openai":
+        // Handles: openai, cerebras, groq, together, deepseek, openrouter, custom, and any future OpenAI-compatible
+        result = await chatOpenAI(provider, model, messages, options);
+        break;
+      case "anthropic":
+        result = await chatAnthropic(provider, model, messages, options);
+        break;
+      case "gemini":
+        result = await chatGemini(provider, model, messages, options);
+        break;
+      default:
+        // Fallback to OpenAI-compatible for unknown providers
+        result = await chatOpenAI(provider, model, messages, options);
+        break;
+    }
+
+    // Record actual usage in rate limiter
+    if (result.usage) {
+      rateLimiter.recordUsage(result.usage.promptTokens, result.usage.completionTokens);
+    }
+
+    return result;
+
+  } catch (error) {
+    // Check if this is a rate limit error
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    if (errorMessage.includes('RATE_LIMIT') || errorMessage.includes('429')) {
+      console.warn(`[LLM] 🚨 Rate limit hit for ${provider.name}: ${errorMessage}`);
+      rateLimiter.markRateLimited();
+
+      // After marking rate limited, check if we should recommend switching
+      if (rateLimiter.shouldRecommendProviderSwitch()) {
+        console.error(`[LLM] 💡 STRONG RECOMMENDATION: Switch to Groq (llama-3.3-70b-versatile) or OpenAI (gpt-4o-mini) for ${Math.round(15/1)} times faster execution!`);
+
+        // Add provider switching suggestion to error message
+        throw new Error(`${errorMessage}\n\n💡 TIP: This provider (${provider.name}) has very restrictive rate limits. Consider switching to Groq or OpenAI in Settings for much faster execution.`);
+      }
+    }
+
+    throw error;
   }
 }
 
@@ -266,6 +329,22 @@ async function chatOpenAI(
 
   if (!resp.ok) {
     const text = await resp.text();
+
+    // RATE LIMIT HANDLING: Detect 429 errors and provide more context
+    if (resp.status === 429) {
+      // Parse error to check if it's token quota vs request rate
+      let errorDetail = text;
+      try {
+        const errorJson = JSON.parse(text);
+        errorDetail = errorJson.message || errorJson.error?.message || text;
+      } catch {
+        // plain text error
+      }
+
+      // Throw with RATE_LIMIT prefix so orchestrator can implement smart backoff
+      throw new Error(`RATE_LIMIT: ${errorDetail}  [Provider: ${provider.name}, Model: ${model}]`);
+    }
+
     throw new Error(`OpenAI error (${resp.status}): ${text}`);
   }
 

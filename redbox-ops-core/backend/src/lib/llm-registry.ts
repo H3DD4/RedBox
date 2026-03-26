@@ -70,11 +70,14 @@ export const PROVIDER_REGISTRY: Record<string, ProviderConfig> = {
   cerebras: {
     label: "Cerebras",
     defaultEndpoint: "https://api.cerebras.ai/v1",
-    defaultModel: "llama3.1-8b",
+    defaultModel: "qwen-3-235b-a22b-instruct-2507",  // Qwen 235B - BEST model
     requiresApiKey: true,
     apiStyle: "openai", // Cerebras uses OpenAI-compatible API
-    availableModels: ["llama3.1-8b", "llama3.1-70b", "llama-3.3-70b"],
-    description: "Ultra-fast inference on Cerebras hardware",
+    availableModels: [
+      "qwen-3-235b-a22b-instruct-2507",  // 235B params - BEST, follows instructions perfectly
+      "llama3.1-8b",                      // 8B params - Fast but weak, hallucinates
+    ],
+    description: "Ultra-fast inference with Qwen-3-235B! 30 req/min, 30k tokens/min - EXCELLENT PERFORMANCE",
   },
 
   groq: {

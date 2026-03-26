@@ -39,14 +39,19 @@ router.post("/", upload.single("file"), (req: Request, res: Response, next) => {
     db.prepare(
       "INSERT INTO uploads (id, filename, original_name, mime_type, size) VALUES (?, ?, ?, ?, ?)"
     ).run(id, req.file.filename, req.file.originalname, req.file.mimetype, req.file.size);
-    
+
+    // Full absolute path to the uploaded file
+    const filePath = path.join(config.uploadsDir, req.file.filename);
+
     res.status(201).json({
       upload: {
         id,
         filename: req.file.filename,
-        originalName: req.file.originalname,
+        original_name: req.file.originalname,  // snake_case for consistency with DB
+        originalName: req.file.originalname,    // Keep camelCase for backwards compat
         mimeType: req.file.mimetype,
         size: req.file.size,
+        file_path: filePath,  // ADDED: Full path for LLM to access the file
       },
     });
   } catch (err) {

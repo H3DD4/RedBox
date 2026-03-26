@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
   Crosshair, Activity, ShieldAlert, Cpu, FileSearch, ArrowUpRight,
-  AlertTriangle, ShieldCheck, Info,
+  AlertTriangle, ShieldCheck, Info, Trophy, Flag,
 } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
 import MetricCard from "@/components/MetricCard";
@@ -20,8 +20,8 @@ const Dashboard = () => {
   const [loading, setLoading] = useState(true);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
-  const refreshStats = () => {
-    dashboard.stats().then(setStats).catch(() => {});
+  const refreshData = () => {
+    dashboard.stats().then(setStats).catch(() => setStats(null));
   };
 
   useEffect(() => {
@@ -43,13 +43,6 @@ const Dashboard = () => {
     { name: "LLM Provider",  status: llmOnline  ? "online" : "offline" },
   ];
 
-  const quickStart = [
-    { label: "AI Terminal",          path: "/terminal"     },
-    { label: "Pentest Orchestrator", path: "/orchestrator" },
-    { label: "RAG Advisor",          path: "/rag"          },
-    { label: "Settings",             path: "/settings"     },
-  ];
-
   const totalFindings = stats?.totalFindings ?? 0;
   const activeRuns = stats?.activeRuns ?? 0;
   const modelLabel = stats?.activeLlmProvider
@@ -63,11 +56,29 @@ const Dashboard = () => {
     return "text-zinc-400";
   };
 
-  const severityIcon = (status: string) => {
-    if (status === "completed") return <ShieldCheck className="w-4 h-4 text-emerald-500" />;
+  const severityIcon = (status: string, purpose?: string) => {
+    if (status === "completed") {
+      // Show trophy for CTF challenges
+      if (purpose === "ctf") return <Trophy className="w-4 h-4 text-yellow-500" />;
+      return <ShieldCheck className="w-4 h-4 text-emerald-500" />;
+    }
     if (status === "failed")    return <AlertTriangle className="w-4 h-4 text-red-500" />;
     if (status === "running")   return <Activity className="w-4 h-4 text-red-400 animate-pulse" />;
     return <Info className="w-4 h-4 text-zinc-500" />;
+  };
+
+  const getRunSummary = (run: any) => {
+    const isCTF = run.purpose === "ctf";
+    const flags = run.findings?.filter((f: any) => f.title.includes("🚩 Flag Captured:")) || [];
+    const vulnerabilities = run.findings?.filter((f: any) => !f.title.includes("🚩 Flag Captured:")) || [];
+
+    if (isCTF && flags.length > 0) {
+      return `🚩 ${flags.length} flag${flags.length !== 1 ? 's' : ''} captured`;
+    }
+    if (vulnerabilities.length > 0) {
+      return `${vulnerabilities.length} finding${vulnerabilities.length !== 1 ? 's' : ''}`;
+    }
+    return "No findings";
   };
 
   return (
@@ -127,52 +138,65 @@ const Dashboard = () => {
               </div>
             ) : (
               <div className="divide-y divide-zinc-800/60">
-                {stats.recentRuns.map((run) => (
-                  <div
-                    key={run.id}
-                    className="px-5 py-3.5 flex items-center gap-3 hover:bg-zinc-900/50 transition-colors cursor-pointer"
-                    onClick={() => setSelectedRunId(run.id)}
-                  >
-                    {severityIcon(run.status)}
-                    <div className="flex-1 min-w-0">
-                      <p className="text-sm text-zinc-100 font-mono truncate">{run.target}</p>
-                      <p className="text-[11px] text-zinc-400 font-mono">
-                        {run.test_type} · {run.pipeline} · {new Date(run.created_at).toLocaleString()}
-                      </p>
+                {stats.recentRuns.map((run) => {
+                  const isCTF = run.purpose === "ctf";
+                  const flags = run.findings?.filter((f: any) => f.title.includes("🚩 Flag Captured:")) || [];
+                  const hasFlags = flags.length > 0;
+
+                  return (
+                    <div
+                      key={run.id}
+                      className="px-5 py-3.5 flex items-center gap-3 hover:bg-zinc-900/50 transition-colors cursor-pointer group"
+                      onClick={() => setSelectedRunId(run.id)}
+                    >
+                      <div className="flex items-center gap-2">
+                        {severityIcon(run.status, run.purpose)}
+                        {isCTF && hasFlags && (
+                          <div className="flex items-center gap-1 text-yellow-500">
+                            <Flag className="w-3 h-3" />
+                            <span className="text-xs font-mono">{flags.length}</span>
+                          </div>
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm text-zinc-100 font-mono truncate">{run.target}</p>
+                          {isCTF && (
+                            <div className="bg-yellow-500/20 px-1.5 py-0.5 rounded text-[10px] font-mono text-yellow-400 uppercase">
+                              CTF
+                            </div>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <p className="text-[11px] text-zinc-400 font-mono">
+                            {run.test_type} · {run.pipeline} · {new Date(run.created_at).toLocaleString()}
+                          </p>
+                          {run.status === "completed" && (
+                            <span className="text-[10px] text-zinc-500 font-mono">
+                              {getRunSummary(run)}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                      <StatusBadge
+                        variant={
+                          run.status === "completed" ? "online"
+                          : run.status === "failed"    ? "offline"
+                          : run.status === "running"   ? "warning"
+                          : "offline"
+                        }
+                        label={run.status}
+                        pulse={run.status === "running"}
+                      />
                     </div>
-                    <StatusBadge
-                      variant={
-                        run.status === "completed" ? "online"
-                        : run.status === "failed"    ? "offline"
-                        : run.status === "running"   ? "warning"
-                        : "offline"
-                      }
-                      label={run.status}
-                      pulse={run.status === "running"}
-                    />
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
 
           {/* Right column */}
           <div className="space-y-4">
-            <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-5">
-              <h3 className="text-zinc-300 font-mono text-xs uppercase tracking-[0.15em] mb-4">// Quick Start</h3>
-              <div className="space-y-2">
-                {quickStart.map(({ label, path }) => (
-                  <button
-                    key={label}
-                    onClick={() => navigate(path)}
-                    className="w-full text-left px-3 py-2.5 rounded-md text-sm bg-zinc-800/80 border border-zinc-700/50 text-zinc-300 hover:text-red-400 hover:border-red-500/30 font-mono transition-all"
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
             {/* Findings breakdown */}
             {stats && totalFindings > 0 && (
               <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-5">
@@ -229,7 +253,7 @@ const Dashboard = () => {
         runId={selectedRunId}
         open={!!selectedRunId}
         onClose={() => setSelectedRunId(null)}
-        onDeleted={refreshStats}
+        onDeleted={refreshData}
       />
     </AppLayout>
   );

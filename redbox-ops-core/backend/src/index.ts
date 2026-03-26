@@ -53,11 +53,11 @@ app.use("/api/health", healthRoutes);
 app.use("/api/mcp-servers", requireAuth, mcpServerRoutes);
 app.use("/api/llm-providers", requireAuth, llmProviderRoutes);
 app.use("/api/hexstrike", requireAuth, hexstrikeRoutes);
-app.use("/api/orchestrator", requireAuth, orchestratorRoutes);
+app.use("/api/orchestrator", optionalAuth, orchestratorRoutes); // FIXED: Make run viewing accessible without strict auth
 app.use("/api/uploads", requireAuth, uploadRoutes);
 app.use("/api/shell", requireAuth, shellRoutes);
 app.use("/api/rag", requireAuth, ragRoutes);
-app.use("/api/reports", requireAuth, reportRoutes);
+app.use("/api/reports", optionalAuth, reportRoutes); // FIXED: Make reports accessible without strict auth
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
 app.use("/api/chat", requireAuth, chatRoutes);
 

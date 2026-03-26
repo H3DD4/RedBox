@@ -1,14 +1,15 @@
 import { useState, useEffect } from "react";
 import {
   Settings, Cpu, Bot, Save, Server, Plus, Trash2,
-  CheckCircle2, XCircle, Loader2, Star,
+  CheckCircle2, XCircle, Loader2, Eye, EyeOff, Star, Palette,
 } from "lucide-react";
 import AppLayout from "@/components/AppLayout";
 import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
+import { useTheme } from "@/context/ThemeContext";
 import {
   mcpServers, llmProviders,
-  type McpServer, type LlmProvider, type ProviderRegistryEntry,
+  type McpServer, type LlmProvider,
 } from "@/services/api-client";
 
 const load = <T,>(key: string, fallback: T): T => {
@@ -17,19 +18,66 @@ const load = <T,>(key: string, fallback: T): T => {
 const save = (key: string, val: unknown) => localStorage.setItem(key, JSON.stringify(val));
 
 const tabs = [
-  { id: "mcp",       label: "MCP Servers",      icon: Server },
-  { id: "providers", label: "LLM Providers",     icon: Bot },
-  { id: "models",    label: "Model Parameters",  icon: Cpu },
+  { id: "appearance", label: "Appearance",         icon: Palette },
+  { id: "mcp",        label: "MCP Servers",       icon: Server },
+  { id: "providers",  label: "LLM Providers",     icon: Bot },
+  { id: "models",     label: "Model Parameters",  icon: Cpu },
 ];
 
 type TestState = Record<string, "idle" | "testing" | "ok" | "fail">;
 
+const PROVIDER_TYPES = [
+  { value: "ollama",     label: "Ollama (local)" },
+  { value: "openai",     label: "OpenAI" },
+  { value: "anthropic",  label: "Anthropic Claude" },
+  { value: "gemini",     label: "Google Gemini" },
+  { value: "cerebras",   label: "Cerebras (Qwen 235B + Llama)" },  // ADDED
+  { value: "groq",       label: "Groq" },                          // ADDED
+  { value: "together",   label: "Together AI" },                   // ADDED
+  { value: "deepseek",   label: "DeepSeek" },                      // ADDED
+  { value: "openrouter", label: "OpenRouter" },                    // ADDED
+  { value: "custom",     label: "Custom (OpenAI-compatible)" },
+];
+
+const DEFAULT_ENDPOINTS: Record<string, string> = {
+  ollama:     "http://localhost:11434",
+  openai:     "https://api.openai.com/v1",
+  anthropic:  "https://api.anthropic.com/v1",
+  gemini:     "https://generativelanguage.googleapis.com/v1beta",
+  cerebras:   "https://api.cerebras.ai/v1",           // ADDED
+  groq:       "https://api.groq.com/openai/v1",       // ADDED
+  together:   "https://api.together.xyz/v1",          // ADDED
+  deepseek:   "https://api.deepseek.com/v1",          // ADDED
+  openrouter: "https://openrouter.ai/api/v1",         // ADDED
+  custom:     "",
+};
+
+const DEFAULT_MODELS: Record<string, string> = {
+  ollama:     "llama3",
+  openai:     "gpt-4o",
+  anthropic:  "claude-3-5-sonnet-20241022",
+  gemini:     "gemini-1.5-flash",
+  cerebras:   "qwen-3-235b-a22b-instruct-2507",               // FIXED: Correct model ID
+  groq:       "llama-3.3-70b-versatile",                          // ADDED
+  together:   "meta-llama/Llama-3.3-70B-Instruct-Turbo",          // ADDED
+  deepseek:   "deepseek-chat",                                    // ADDED
+  openrouter: "anthropic/claude-3.5-sonnet",                      // ADDED
+  custom:     "model-name",
+};
+
+// Available models per provider (for dropdown)
+const AVAILABLE_MODELS: Record<string, string[]> = {
+  cerebras:  ["qwen-3-235b-a22b-instruct-2507", "llama3.1-8b"],  // FIXED: Correct Qwen model ID
+  groq:      ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+  openai:    ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
+  anthropic: ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"],
+  gemini:    ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
+};
+
 const SettingsPage = () => {
   const { toast } = useToast();
-  const [activeTab, setActiveTab] = useState("mcp");
-
-  // ── Provider Registry (loaded from backend) ──
-  const [providerRegistry, setProviderRegistry] = useState<ProviderRegistryEntry[]>([]);
+  const { theme, setTheme } = useTheme();
+  const [activeTab, setActiveTab] = useState("appearance");
 
   // ── MCP Servers ──
   const [mcpList,  setMcpList]  = useState<McpServer[]>([]);
@@ -40,8 +88,9 @@ const SettingsPage = () => {
   // ── LLM Providers ──
   const [provList,   setProvList]   = useState<LlmProvider[]>([]);
   const [provTest,   setProvTest]   = useState<TestState>({});
+  const [showApiKey, setShowApiKey] = useState<Record<string, boolean>>({});
   const [newProv,    setNewProv]    = useState({
-    type: "ollama",
+    type: "ollama" as LlmProvider["type"],
     name: "Ollama (local)",
     endpoint: "http://localhost:11434",
     apiKey: "",
@@ -56,25 +105,8 @@ const SettingsPage = () => {
 
   const loadMcp  = () => mcpServers.list().then(({ servers }) => setMcpList(servers)).catch(() => {});
   const loadProv = () => llmProviders.list().then(({ providers }) => setProvList(providers)).catch(() => {});
-  const loadRegistry = () => llmProviders.registry().then(({ providers }) => {
-    setProviderRegistry(providers);
-    // Set initial form values if registry loaded
-    if (providers.length > 0 && newProv.type === "ollama") {
-      const first = providers[0];
-      setNewProv({
-        type: first.value,
-        name: first.label,
-        endpoint: first.defaultEndpoint,
-        apiKey: "",
-        model: first.defaultModel,
-      });
-    }
-  }).catch(() => {});
 
-  useEffect(() => { loadMcp(); loadProv(); loadRegistry(); }, []);
-
-  // Helper: get registry entry for a type
-  const getRegistryEntry = (type: string) => providerRegistry.find(p => p.value === type);
+  useEffect(() => { loadMcp(); loadProv(); }, []);
 
   // MCP actions
   const testMcp = async (id: string) => {
@@ -133,29 +165,11 @@ const SettingsPage = () => {
     }
     try {
       await llmProviders.create({ ...newProv, apiKey: newProv.apiKey || undefined });
-      // Reset form to first provider in registry
-      const first = providerRegistry[0];
-      if (first) {
-        setNewProv({ type: first.value, name: first.label, endpoint: first.defaultEndpoint, apiKey: "", model: first.defaultModel });
-      }
+      setNewProv({ type: "ollama", name: "Ollama (local)", endpoint: "http://localhost:11434", apiKey: "", model: "llama3" });
       setShowProvForm(false);
       loadProv();
       toast({ title: "LLM provider added" });
     } catch (err) { toast({ title: "Error", description: (err as {error?:string}).error, variant: "destructive" }); }
-  };
-
-  // Handle provider type change - auto-fill defaults from registry
-  const handleProviderTypeChange = (type: string) => {
-    const entry = getRegistryEntry(type);
-    if (entry) {
-      setNewProv({
-        type: entry.value,
-        name: entry.label,
-        endpoint: entry.defaultEndpoint,
-        apiKey: "",
-        model: entry.defaultModel,
-      });
-    }
   };
 
   const testIcon = (state: string | undefined) => {
@@ -163,12 +177,6 @@ const SettingsPage = () => {
     if (state === "ok")      return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />;
     if (state === "fail")    return <XCircle className="w-3.5 h-3.5 text-red-400" />;
     return null;
-  };
-
-  // Check if current provider type requires API key
-  const currentProviderRequiresKey = () => {
-    const entry = getRegistryEntry(newProv.type);
-    return entry?.requiresApiKey ?? false;
   };
 
   return (
@@ -211,6 +219,81 @@ const SettingsPage = () => {
 
           {/* Content */}
           <div className="flex-1 bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-6 space-y-6 min-h-[400px]">
+
+            {/* ── Appearance ── */}
+            {activeTab === "appearance" && (
+              <div className="space-y-6">
+                <h3 className="text-lg text-zinc-100 font-mono font-bold">Appearance</h3>
+                <p className="text-zinc-400 font-mono text-xs">Customize the visual theme of the application</p>
+
+                <div className="space-y-4">
+                  <div>
+                    <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-3 block">// Theme Mode</label>
+                    <div className="grid grid-cols-2 gap-4">
+                      {/* Dark Mode */}
+                      <button
+                        onClick={() => setTheme("dark")}
+                        className={`relative group p-6 rounded-lg border-2 transition-all ${
+                          theme === "dark"
+                            ? "border-red-500 bg-red-500/10"
+                            : "border-zinc-700 hover:border-zinc-600 bg-zinc-800/50"
+                        }`}
+                      >
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm font-mono font-medium text-zinc-100">Dark Mode</span>
+                            {theme === "dark" && (
+                              <span className="text-[9px] font-mono bg-red-500/20 text-red-400 px-2 py-1 rounded">ACTIVE</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-zinc-400 font-mono text-left">
+                            High contrast dark theme with better readability. Red accents on dark backgrounds.
+                          </p>
+                          {/* Preview */}
+                          <div className="mt-4 p-3 bg-black rounded border border-zinc-700">
+                            <div className="h-2 w-3/4 bg-zinc-600 rounded mb-2"></div>
+                            <div className="h-2 w-1/2 bg-red-500 rounded"></div>
+                          </div>
+                        </div>
+                      </button>
+
+                      {/* Red Mode */}
+                      <button
+                        onClick={() => setTheme("red")}
+                        className={`relative group p-6 rounded-lg border-2 transition-all ${
+                          theme === "red"
+                            ? "border-red-500 bg-red-500/10"
+                            : "border-zinc-700 hover:border-zinc-600 bg-zinc-800/50"
+                        }`}
+                      >
+                        <div className="space-y-3">
+                          <div className="flex items-center justify-between">
+                            <span className="text-sm font-mono font-medium text-zinc-100">Red Mode</span>
+                            {theme === "red" && (
+                              <span className="text-[9px] font-mono bg-red-500/20 text-red-400 px-2 py-1 rounded">ACTIVE</span>
+                            )}
+                          </div>
+                          <p className="text-xs text-zinc-400 font-mono text-left">
+                            Inverted theme with red backgrounds and black text for a bold, distinctive look.
+                          </p>
+                          {/* Preview */}
+                          <div className="mt-4 p-3 bg-red-900 rounded border border-red-700">
+                            <div className="h-2 w-3/4 bg-red-700 rounded mb-2"></div>
+                            <div className="h-2 w-1/2 bg-black rounded"></div>
+                          </div>
+                        </div>
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="mt-6 p-4 bg-zinc-800/50 border border-zinc-700/50 rounded-lg">
+                    <p className="text-xs text-zinc-400 font-mono">
+                      <span className="text-red-400">💡 Tip:</span> Your theme preference is saved automatically and persists across sessions.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* ── MCP Servers ── */}
             {activeTab === "mcp" && (
@@ -298,12 +381,13 @@ const SettingsPage = () => {
                         <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1 block">// Type</label>
                         <select
                           value={newProv.type}
-                          onChange={(e) => handleProviderTypeChange(e.target.value)}
+                          onChange={(e) => {
+                            const t = e.target.value as LlmProvider["type"];
+                            setNewProv({ ...newProv, type: t, endpoint: DEFAULT_ENDPOINTS[t] || "", model: DEFAULT_MODELS[t] || "", name: PROVIDER_TYPES.find((p) => p.value === t)?.label || t });
+                          }}
                           className="w-full bg-black/60 border border-zinc-700 rounded-md px-3 py-2 text-sm text-zinc-200 font-mono"
                         >
-                          {providerRegistry.map((pt) => (
-                            <option key={pt.value} value={pt.value}>{pt.label}</option>
-                          ))}
+                          {PROVIDER_TYPES.map((pt) => <option key={pt.value} value={pt.value}>{pt.label}</option>)}
                         </select>
                       </div>
                       <div>
@@ -318,17 +402,29 @@ const SettingsPage = () => {
                       </div>
                       <div>
                         <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1 block">// Model</label>
-                        <Input value={newProv.model} onChange={(e) => setNewProv({ ...newProv, model: e.target.value })} placeholder="model-name" className="bg-black/60 border-zinc-700 text-zinc-100 font-mono text-sm" />
+                        {AVAILABLE_MODELS[newProv.type] ? (
+                          <select
+                            value={newProv.model}
+                            onChange={(e) => setNewProv({ ...newProv, model: e.target.value })}
+                            className="w-full bg-black/60 border border-zinc-700 text-zinc-100 font-mono text-sm rounded-md px-3 py-2"
+                          >
+                            {AVAILABLE_MODELS[newProv.type].map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <Input value={newProv.model} onChange={(e) => setNewProv({ ...newProv, model: e.target.value })} placeholder="model-name" className="bg-black/60 border-zinc-700 text-zinc-100 font-mono text-sm" />
+                        )}
+                        {newProv.type === "cerebras" && (
+                          <p className="text-[9px] text-emerald-400/70 mt-1 font-mono">💡 Qwen 235B recommended - much smarter than Llama 8B!</p>
+                        )}
                       </div>
                     </div>
-                    {currentProviderRequiresKey() && (
+                    {newProv.type !== "ollama" && (
                       <div>
                         <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1 block">// API Key</label>
                         <Input type="password" value={newProv.apiKey} onChange={(e) => setNewProv({ ...newProv, apiKey: e.target.value })} placeholder="sk-…" className="bg-black/60 border-zinc-700 text-zinc-100 font-mono text-sm" />
                       </div>
-                    )}
-                    {getRegistryEntry(newProv.type)?.description && (
-                      <p className="text-xs text-zinc-500 font-mono">{getRegistryEntry(newProv.type)?.description}</p>
                     )}
                     <div className="flex gap-2 justify-end">
                       <button onClick={() => setShowProvForm(false)} className="text-sm text-zinc-400 hover:text-zinc-200 font-mono px-3 py-1.5">Cancel</button>

@@ -2,6 +2,10 @@ import { Router, Request, Response } from "express";
 import { startRun, stopRun, getRun, listRuns, getRunEmitter, RunEvent, testMcpToolsAvailability } from "../services/orchestrator.js";
 import { TEST_TYPES, PURPOSES, getRoute, getCompatiblePurposes, getCompatibleTestTypes } from "../lib/task-router.js";
 import { AppError } from "../lib/errors.js";
+import { listMcpTools, testMcpConnection } from "../services/mcp-client.js";
+import { getRateLimiter } from "../lib/rate-limiter.js";
+import { getActiveProvider } from "../services/llm-gateway.js";
+import { getDb } from "../db.js";
 
 const router = Router();
 
@@ -61,10 +65,51 @@ router.post("/test-tools", async (req: Request, res: Response, next) => {
   }
 });
 
+// GET /api/orchestrator/mcp/tools - List available MCP tools
+router.get("/mcp/tools", async (req: Request, res: Response, next) => {
+  try {
+    const mcpServerId = req.query.mcpServerId as string | undefined;
+    console.log("[API] Fetching available MCP tools...");
+
+    const tools = await listMcpTools(mcpServerId);
+
+    res.json({
+      success: true,
+      tools,
+      count: tools.length
+    });
+  } catch (err) {
+    console.error("[API] Failed to list MCP tools:", err);
+    next(err);
+  }
+});
+
+// POST /api/orchestrator/mcp/test-connection - Test MCP server connection
+router.post("/mcp/test-connection", async (req: Request, res: Response, next) => {
+  try {
+    const { mcpServerId } = req.body;
+    console.log("[API] Testing MCP server connection...");
+
+    const result = await testMcpConnection(mcpServerId);
+
+    res.json({
+      success: result.connected,
+      ...result
+    });
+  } catch (err) {
+    console.error("[API] MCP connection test failed:", err);
+    next(err);
+  }
+});
+
 // POST /api/orchestrator/run - Start a new run (no pipeline required - routing determines it)
 router.post("/run", async (req: Request, res: Response, next) => {
   try {
-    const { target, scope, testType, purpose, mcpServerId, llmProviderId, modelOverride, uploadIds, challengeName } = req.body;
+    // FIXED: UI-01, UI-04 — extract new optional fields from request body
+    const {
+      target, scope, testType, purpose, mcpServerId, llmProviderId, modelOverride, uploadIds, challengeName,
+      flagFormat, loginInstructions, rulesAvoid, rulesFocus, host, port
+    } = req.body;
     if (!target || !testType || !purpose) {
       throw new AppError(400, "MISSING_FIELDS", "target, testType, and purpose are required");
     }
@@ -79,6 +124,13 @@ router.post("/run", async (req: Request, res: Response, next) => {
       modelOverride,
       uploadIds,
       challengeName,
+      // FIXED: UI-01, UI-04 — forward new optional fields to startRun
+      flagFormat,
+      loginInstructions,
+      rulesAvoid,
+      rulesFocus,
+      host,
+      port,
     });
 
     res.status(201).json({ runId });
@@ -151,13 +203,54 @@ router.delete("/runs/:id", (req, res, next) => {
     const run = getRun(req.params.id);
     if (!run) throw new AppError(404, "NOT_FOUND", "Run not found");
 
-    const { getDb } = require("../db.js");
     const db = getDb();
     db.prepare("DELETE FROM runs WHERE id = ?").run(req.params.id);
 
     res.json({ ok: true });
   } catch (err) {
     next(err);
+  }
+});
+
+// GET /api/orchestrator/rate-limiter-status - Get current rate limiter status
+router.get("/rate-limiter-status", (_req, res) => {
+  try {
+    const provider = getActiveProvider();
+    if (!provider) {
+      res.json({ error: "No LLM provider configured" });
+      return;
+    }
+
+    const rateLimiter = getRateLimiter(provider.type);
+    const status = rateLimiter.getStatus();
+
+    res.json({
+      provider: {
+        name: provider.name,
+        type: provider.type,
+        model: provider.model,
+      },
+      rateLimiter: {
+        tokensUsed: status.tokensUsed,
+        tokensLimit: status.tokensLimit,
+        requestsUsed: status.requestsUsed,
+        requestsLimit: status.requestsLimit,
+        isLimited: status.isLimited,
+        consecutiveRateLimits: status.consecutiveRateLimits,
+        shouldSwitchProvider: status.shouldSwitchProvider,
+        circuitBreakerActive: status.circuitBreakerActive,
+        utilizationPercent: {
+          tokens: Math.round((status.tokensUsed / status.tokensLimit) * 100),
+          requests: Math.round((status.requestsUsed / status.requestsLimit) * 100),
+        },
+        recommendation: status.shouldSwitchProvider
+          ? `Consider switching to Groq (llama-3.3-70b-versatile) or OpenAI (gpt-4o-mini) for 15x faster execution. Current provider (${provider.name}) has very restrictive rate limits.`
+          : null,
+      },
+    });
+  } catch (err) {
+    console.error("[API] Rate limiter status error:", err);
+    res.json({ error: "Failed to get rate limiter status" });
   }
 });
 

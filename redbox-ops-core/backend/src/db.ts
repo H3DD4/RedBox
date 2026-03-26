@@ -15,6 +15,11 @@ export function getDb(): Database.Database {
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     initSchema();
+
+    // FIXED: DB-02 — periodic WAL checkpoint every 5 minutes
+    setInterval(() => {
+      try { db.pragma("wal_checkpoint(PASSIVE)"); } catch {}
+    }, 5 * 60 * 1000);
   }
   return db;
 }
@@ -123,6 +128,28 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+
+  // FIXED: DB-01 — missing indexes for performance
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_runs_status ON runs(status);
+    CREATE INDEX IF NOT EXISTS idx_runs_created ON runs(created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_runs_target ON runs(target);
+    CREATE INDEX IF NOT EXISTS idx_reports_run_id ON reports(run_id);
+    CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc_id ON rag_chunks(document_id);
+    CREATE INDEX IF NOT EXISTS idx_uploads_run_id ON uploads(run_id);
+  `);
+
+  // FIXED: DB-02 — WAL checkpoint configuration
+  db.pragma("wal_autocheckpoint = 1000");
+
+  // FIXED: DB-03 — add missing columns (safe ALTER TABLE)
+  const safeAlter = (sql: string) => { try { db.exec(sql); } catch {} };
+  safeAlter("ALTER TABLE runs ADD COLUMN flag_captured TEXT");
+  safeAlter("ALTER TABLE runs ADD COLUMN iteration_count INTEGER DEFAULT 0");
+  safeAlter("ALTER TABLE runs ADD COLUMN token_usage INTEGER DEFAULT 0");
+  safeAlter("ALTER TABLE uploads ADD COLUMN is_temp INTEGER DEFAULT 1");
+  safeAlter("ALTER TABLE uploads ADD COLUMN expires_at TEXT");
+  safeAlter("ALTER TABLE reports ADD COLUMN format TEXT DEFAULT 'markdown'");
 
   // Seed default user if none exists
   const userCount = db.prepare("SELECT COUNT(*) as count FROM users").get() as { count: number };

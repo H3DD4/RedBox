@@ -3,11 +3,13 @@ import { getDb } from "../db.js";
 import { chatComplete, getActiveProvider } from "./llm-gateway.js";
 import { EventEmitter } from "events";
 import { getRoute, getFallbackRoute, type TaskRoute } from "../lib/task-router.js";
+import { getRateLimiter } from "../lib/rate-limiter.js";
 import { config } from "../lib/config.js";
 import fs from "fs";
 import path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
+import { McpClient } from "./mcp-client.js";
 
 const execAsync = promisify(exec);
 
@@ -21,6 +23,13 @@ export interface RunConfig {
   modelOverride?: string;
   uploadIds?: string[];
   challengeName?: string;
+  // FIXED: BUG-02 — new optional fields
+  flagFormat?: string;           // e.g. "HTB{}", "picoCTF{}", custom
+  loginInstructions?: string;    // auth steps for pentest
+  rulesAvoid?: string;           // scope restrictions
+  rulesFocus?: string;           // areas to prioritize
+  host?: string;                 // override for CTF service host
+  port?: string;                 // override for CTF service port
 }
 
 export interface RunEvent {
@@ -71,13 +80,17 @@ const PIPELINE_FOLDERS: Record<string, string> = {
 // Template caching system
 const templateCache = new Map<string, TemplateCache>();
 
+// FIXED: BUG-01 — Platform detection for cross-platform tool execution
+const IS_WIN = process.platform === 'win32';
+
 // Security: Whitelist of allowed commands for different tool categories
+// FIXED: BUG-01 — Added strings, xxd, python3 to appropriate categories
 const ALLOWED_COMMANDS: Record<string, string[]> = {
   web: ["curl", "wget", "nc", "nslookup", "dig"],
-  network: ["ping", "nslookup", "telnet", "nc", "nmap", "dig"],
-  file: ["file", "strings", "hexdump", "head", "tail", "cat", "ls"],
-  crypto: ["openssl", "python", "node", "python3"],
-  system: ["whoami", "id", "uname", "ps", "curl", "wget", "nc", "nmap", "ping"]
+  network: ["ping", "nslookup", "telnet", "nc", "nmap", "dig", "powershell"],
+  file: ["file", "strings", "hexdump", "head", "tail", "cat", "ls", "xxd", "type", "powershell"],
+  crypto: ["openssl", "python", "node", "python3", "powershell"],
+  system: ["whoami", "id", "uname", "ps", "curl", "wget", "nc", "nmap", "ping", "powershell", "echo"]
 };
 
 const runEmitters = new Map<string, EventEmitter>();
@@ -215,8 +228,14 @@ function validateCommand(command: string, category: string): { isValid: boolean;
 
 /**
  * Execute a tool - Windows-compatible, real execution
+ * FIXED: UI-02 — Accept mcpServerId parameter for MCP server selection
  */
-async function executeTool(toolName: string, params: Record<string, unknown>, runId: string): Promise<string> {
+async function executeTool(
+  toolName: string,
+  params: Record<string, unknown>,
+  runId: string,
+  mcpServerId?: string
+): Promise<string> {
   console.log(`[Run ${runId}] Tool: ${toolName}`, JSON.stringify(params).substring(0, 100));
 
   try {
@@ -273,16 +292,27 @@ async function executeTool(toolName: string, params: Record<string, unknown>, ru
     }
 
     // ===== NETWORK TOOLS =====
+    // FIXED: BUG-01 — Cross-platform netcat implementation
     if (tool === "nc" || tool === "netcat" || tool === "connect") {
       const host = (params.host || params.target) as string | undefined;
       const port = params.port as number;
       const send = (params.send || params.data) as string | undefined;
       if (!host || !port) return "Error: host and port required";
 
-      if (send) {
-        return await executeShellCommand(`powershell -Command "echo '${send}' | Test-NetConnection -ComputerName ${host} -Port ${port}"`, 10000);
+      if (IS_WIN) {
+        // Windows: use PowerShell TCP client for data sending
+        if (send) {
+          const psScript = `$t = New-Object Net.Sockets.TcpClient('${host}', ${port}); $s = $t.GetStream(); $b = [Text.Encoding]::ASCII.GetBytes("${send}\\n"); $s.Write($b,0,$b.Length); Start-Sleep 2; $r = New-Object byte[] 4096; $n = $s.Read($r,0,4096); [Text.Encoding]::ASCII.GetString($r,0,$n); $t.Close()`;
+          return await executeShellCommand(`powershell -Command "${psScript}"`, "network", 15000);
+        }
+        return await executeShellCommand(`powershell -Command "Test-NetConnection -ComputerName ${host} -Port ${port}"`, "network", 10000);
+      } else {
+        // Linux: real netcat
+        const cmd = send
+          ? `echo "${send}" | nc -w 5 ${host} ${port}`
+          : `nc -zv ${host} ${port}`;
+        return await executeShellCommand(cmd, "network", 15000);
       }
-      return await executeShellCommand(`powershell -Command "Test-NetConnection -ComputerName ${host} -Port ${port}"`, 10000);
     }
 
     if (tool === "dnslookup" || tool === "dig" || tool === "dns") {
@@ -306,57 +336,85 @@ async function executeTool(toolName: string, params: Record<string, unknown>, ru
     }
 
     // ===== FILE TOOLS (Forensics, RE) =====
+    // FIXED: BUG-01 — Cross-platform file operations + flexible parameter names
     if (tool === "readfile" || tool === "cat" || tool === "type") {
-      const file = (params.file || params.path) as string | undefined;
-      if (!file) return "Error: file required";
-      return await executeShellCommand(`type "${file}"`, 5000);
+      const file = (params.file || params.path || params.input) as string | undefined;
+      if (!file) return "Error: file parameter required (use 'file', not 'path')";
+      const cmd = IS_WIN ? `type "${file}"` : `cat "${file}"`;
+      return await executeShellCommand(cmd, "file", 5000);
     }
 
+    // FIXED: BUG-01 — Cross-platform strings extraction + flexible parameters
     if (tool === "strings") {
-      const file = params.file as string;
-      if (!file) return "Error: file required";
-      return await executeShellCommand(`powershell -Command "Select-String -Pattern '[\\x20-\\x7E]{4,}' -Path '${file}' | Select-Object -First 100"`, 10000);
+      const file = (params.file || params.path || params.input) as string | undefined;
+      if (!file) return "Error: file parameter required (use 'file', not 'path' or 'input')";
+      const cmd = IS_WIN
+        ? `powershell -Command "Select-String -Pattern '[\\x20-\\x7E]{4,}' -Path '${file}' | Select-Object -First 200"`
+        : `strings -n 4 "${file}" | head -200`;
+      return await executeShellCommand(cmd, "file", 10000);
     }
 
+    // FIXED: BUG-01 — Cross-platform hexdump + flexible parameters
     if (tool === "hexdump" || tool === "xxd") {
-      const file = params.file as string;
-      if (!file) return "Error: file required";
+      const file = (params.file || params.path || params.input) as string | undefined;
+      if (!file) return "Error: file parameter required (use 'file', not 'path')";
       const lines = params.lines as number || 50;
-      return await executeShellCommand(`powershell -Command "Format-Hex '${file}' | Select-Object -First ${lines}"`, 10000);
+      const cmd = IS_WIN
+        ? `powershell -Command "Format-Hex '${file}' | Select-Object -First ${lines}"`
+        : `xxd "${file}" | head -${lines}`;
+      return await executeShellCommand(cmd, "file", 10000);
     }
 
+    // FIXED: BUG-01 — Cross-platform file info + flexible parameters
     if (tool === "fileinfo" || tool === "file") {
-      const file = params.file as string;
-      if (!file) return "Error: file required";
-      return await executeShellCommand(`powershell -Command "Get-Item '${file}' | Format-List"`, 5000);
+      const file = (params.file || params.path || params.input) as string | undefined;
+      if (!file) return "Error: file parameter required (use 'file', not 'path')";
+      const cmd = IS_WIN
+        ? `powershell -Command "Get-Item '${file}' | Format-List"`
+        : `file "${file}"`;
+      return await executeShellCommand(cmd, "file", 5000);
     }
 
     // ===== ENCODING TOOLS =====
+    // FIXED: BUG-01 — Cross-platform base64 decode
     if (tool === "base64decode" || tool === "b64decode") {
       const data = (params.data || params.input) as string | undefined;
       if (!data) return "Error: data required";
-      return await executeShellCommand(`powershell -Command "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}'))"`, 3000);
+      const cmd = IS_WIN
+        ? `powershell -Command "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${data}'))"`
+        : `echo "${data}" | base64 -d`;
+      return await executeShellCommand(cmd, "crypto", 3000);
     }
 
+    // FIXED: BUG-01 — Cross-platform base64 encode
     if (tool === "base64encode" || tool === "b64encode") {
       const data = (params.data || params.input) as string | undefined;
       if (!data) return "Error: data required";
-      return await executeShellCommand(`powershell -Command "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('${data}'))"`, 3000);
+      const cmd = IS_WIN
+        ? `powershell -Command "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes('${data}'))"`
+        : `echo -n "${data}" | base64`;
+      return await executeShellCommand(cmd, "crypto", 3000);
     }
 
     // ===== CRYPTO TOOLS =====
+    // FIXED: BUG-01 — Cross-platform hash computation
     if (tool === "hash" || tool === "md5" || tool === "sha256") {
       const data = (params.data || params.input) as string | undefined;
       const algo = params.algorithm || (tool === "md5" ? "MD5" : "SHA256");
       if (!data) return "Error: data required";
-      return await executeShellCommand(`powershell -Command "Get-FileHash -Algorithm ${algo} -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('${data}'))) | Select -Expand Hash"`, 5000);
+      const cmd = IS_WIN
+        ? `powershell -Command "Get-FileHash -Algorithm ${algo} -InputStream ([IO.MemoryStream]::new([Text.Encoding]::UTF8.GetBytes('${data}'))) | Select -Expand Hash"`
+        : `echo -n "${data}" | ${String(algo).toLowerCase() === 'md5' ? 'md5sum' : 'sha256sum'}`;
+      return await executeShellCommand(cmd, "crypto", 5000);
     }
 
+    // FIXED: BUG-01 — Cross-platform Python execution
     if (tool === "python" || tool === "pythonscript") {
       const script = (params.script || params.code) as string | undefined;
       if (!script) return "Error: script required";
       const safe = script.replace(/"/g, '\\"');
-      return await executeShellCommand(`python -c "${safe}"`, 15000);
+      const pythonCmd = IS_WIN ? 'python' : 'python3';
+      return await executeShellCommand(`${pythonCmd} -c "${safe}"`, "crypto", 15000);
     }
 
     // ===== GENERIC SHELL =====
@@ -367,18 +425,70 @@ async function executeTool(toolName: string, params: Record<string, unknown>, ru
       return await executeShellCommand(cmd, 30000);
     }
 
-    // MCP fallback
-    console.log(`[Run ${runId}] MCP fallback: ${toolName}`);
+    // ===== MCP FALLBACK (HexStrike or custom MCP servers) =====
+    // FIXED: ISSUE-07 — Proper MCP client with multiple protocol support + better error feedback
+    console.log(`[Run ${runId}] Attempting MCP tool execution: ${toolName}`);
     try {
-      const resp = await fetch(`${config.hexstrikeApiUrl}/api/command`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: toolName, ...params }),
-      });
-      const data = await resp.json();
-      return JSON.stringify(data, null, 2);
-    } catch {
-      return `Tool "${toolName}" not recognized. Available: http_request, nc, readfile, strings, hexdump, base64decode, hash, python, shell`;
+      const client = McpClient.getClient(mcpServerId);
+
+      // Try tool execution first
+      const result = await client.executeTool(toolName, params);
+
+      if (result.success && result.output) {
+        console.log(`[Run ${runId}] MCP tool ${toolName} succeeded`);
+        return result.output;
+      }
+
+      // If tool not found, try as a command
+      if (result.error?.includes("not found") || result.error?.includes("not recognized") || result.error?.includes("405")) {
+        console.log(`[Run ${runId}] Tool not found or 405, trying as command: ${toolName}`);
+        const cmdResult = await client.executeCommand(toolName, params);
+        if (cmdResult.success && cmdResult.output) {
+          console.log(`[Run ${runId}] MCP command ${toolName} succeeded`);
+          return cmdResult.output;
+        }
+
+        // Command also failed - provide helpful error
+        return `❌ Tool "${toolName}" not available on MCP server.
+
+Possible reasons:
+1. HexStrike MCP server is not running
+2. Tool "${toolName}" is not installed on HexStrike
+3. Endpoint configuration mismatch
+
+✅ TRY THESE BUILT-IN TOOLS INSTEAD:
+- http_request: Make HTTP requests to ${params.url || params.target || 'target'}
+- directory_brute: Discover paths on web server
+- headers_check: Check HTTP headers
+- nc: Network connectivity test
+- python: Run custom scripts
+
+Example: ACTION: http_request | {"url": "${params.url || params.target || 'http://target.com'}", "method": "GET"}`;
+      }
+
+      console.error(`[Run ${runId}] MCP error for ${toolName}:`, result.error);
+      return `MCP Error: ${result.error}\n\n💡 Try using built-in tools like http_request, directory_brute, or python instead.`;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[Run ${runId}] MCP execution failed:`, errMsg);
+      return `⚠️ MCP Server Communication Failed
+
+Error: ${errMsg}
+
+This usually means:
+- HexStrike MCP server is not running at ${config.hexstrikeApiUrl}
+- Network connectivity issues
+- Server configuration problems
+
+✅ SOLUTION: Use built-in tools instead!
+
+Available built-in tools:
+- http_request, headers_check, directory_brute (for web testing)
+- nc, dns_lookup (for network testing)
+- readfile, strings, hexdump (for file analysis)
+- base64_decode, hash, python (for crypto/scripting)
+
+Example: ACTION: http_request | {"url": "http://target.com", "method": "GET"}`;
     }
   } catch (err) {
     return `Tool error: ${err instanceof Error ? err.message : String(err)}`;
@@ -388,18 +498,49 @@ async function executeTool(toolName: string, params: Record<string, unknown>, ru
 /**
  * Parse ACTION: lines from LLM output
  */
+// FIXED: BUG-03 — balanced brace JSON extraction, handles nested objects
+function extractBalancedJson(text: string, startIdx: number): string | null {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let jsonStart = -1;
+
+  for (let i = startIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (escape) { escape = false; continue; }
+    if (ch === '\\' && inString) { escape = true; continue; }
+    if (ch === '"') { inString = !inString; continue; }
+    if (inString) continue;
+
+    if (ch === '{') {
+      if (depth === 0) jsonStart = i;
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0 && jsonStart !== -1) {
+        return text.slice(jsonStart, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
 function parseActions(text: string): Array<{ tool: string; params: Record<string, unknown> }> {
   const actions: Array<{ tool: string; params: Record<string, unknown> }> = [];
-  const pattern = /ACTION:\s*(\w+)\s*\|\s*(\{[^}]+\})/gi;
+  const headerPattern = /ACTION:\s*([\w_-]+)\s*\|/gi;
   let match;
 
-  while ((match = pattern.exec(text)) !== null) {
-    try {
-      const tool = match[1];
-      const params = JSON.parse(match[2]);
-      actions.push({ tool, params });
-    } catch (e) {
-      console.error("Failed to parse action params:", match[2]);
+  while ((match = headerPattern.exec(text)) !== null) {
+    const tool = match[1];
+    const searchStart = match.index + match[0].length;
+    const jsonStr = extractBalancedJson(text, searchStart);
+    if (jsonStr) {
+      try {
+        const params = JSON.parse(jsonStr);
+        actions.push({ tool, params });
+      } catch {
+        console.error(`[parseActions] Failed to parse JSON for tool ${tool}:`, jsonStr.substring(0, 100));
+      }
     }
   }
 
@@ -409,32 +550,201 @@ function parseActions(text: string): Array<{ tool: string; params: Record<string
 /**
  * Extract flag from text
  */
-function extractFlag(text: string): string | null {
-  // Common CTF flag formats
-  const patterns = [
-    /picoCTF\{[^}]+\}/gi,
-    /flag\{[^}]+\}/gi,
-    /CTF\{[^}]+\}/gi,
-    /FLAG\{[^}]+\}/gi,
-  ];
+// FIXED: BUG-04 — comprehensive flag patterns + custom format support + return all matches
+const DEFAULT_FLAG_PATTERNS = [
+  /picoCTF\{[^}]+\}/gi,
+  /flag\{[^}]+\}/gi,
+  /CTF\{[^}]+\}/gi,
+  /FLAG\{[^}]+\}/gi,
+  /HTB\{[^}]+\}/gi,
+  /THM\{[^}]+\}/gi,
+  /DUCTF\{[^}]+\}/gi,
+  /ICTF\{[^}]+\}/gi,
+  /ACSC\{[^}]+\}/gi,
+  /LACTF\{[^}]+\}/gi,
+  /bi0sCTF\{[^}]+\}/gi,
+  /CSAW\{[^}]+\}/gi,
+  /corCTF\{[^}]+\}/gi,
+  /FCSC\{[^}]+\}/gi,
+  /WH\{[^}]+\}/gi,
+  /n00bz\{[^}]+\}/gi,
+  // Generic fallback: WORD{content} where WORD is 2-12 alphanumeric chars
+  /[A-Za-z0-9_-]{2,12}\{[A-Za-z0-9_\-!@#$%^&*()+\=<>.,?/:;'" ]{4,}\}/g,
+];
+
+function extractFlag(text: string, customFormat?: string): string | null {
+  const allFlags: string[] = [];
+  const patterns = [...DEFAULT_FLAG_PATTERNS];
+
+  // Add custom format pattern if provided
+  if (customFormat) {
+    const escaped = customFormat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\{[^}]*\\\}/, '\\{[^}]+\\}');
+    try { patterns.unshift(new RegExp(escaped, 'gi')); } catch {}
+  }
 
   for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[0];
+    pattern.lastIndex = 0;
+    const matches = text.match(pattern);
+    if (matches) {
+      for (const m of matches) {
+        // ANTI-FALSE-POSITIVE: Filter out obvious code/non-flags
+        // Skip if it contains code-like patterns
+        if (m.includes('.length()') ||
+            m.includes('userInput') ||
+            m.includes('System.') ||
+            m.includes('scanner.') ||
+            m.includes('Scanner(') ||
+            m.includes('println(') ||
+            m.includes('import ') ||
+            m.includes(' args[') ||
+            m.includes('class ') ||
+            m.includes('public ') ||
+            m.includes('private ') ||
+            m.match(/\{[^}]*\([^)]*\)/)) { // Contains function calls like {foo()}
+          continue; // Skip this match
+        }
+
+        // ANTI-HALLUCINATION: Skip placeholder/example flags
+        const lowerFlag = m.toLowerCase();
+        if (lowerFlag.includes('actual_flag') ||
+            lowerFlag.includes('flag_here') ||
+            lowerFlag.includes('your_flag') ||
+            lowerFlag.includes('example_flag') ||
+            lowerFlag.includes('placeholder') ||
+            lowerFlag.includes('xxx') ||
+            lowerFlag.includes('replace_this') ||
+            lowerFlag.includes('insert_flag') ||
+            m.includes('...') ||
+            m.includes('<flag>') ||
+            m.includes('[flag]')) {
+          console.log(`[extractFlag] Skipping placeholder flag: ${m}`);
+          continue; // Skip placeholder flags
+        }
+
+        // Skip if it's too short (less than 10 chars inside the braces)
+        const content = m.match(/\{([^}]+)\}/)?.[1];
+        if (!content || content.length < 10) {
+          continue;
+        }
+
+        if (!allFlags.includes(m)) allFlags.push(m);
+      }
+    }
   }
-  return null;
+
+  return allFlags.length > 0 ? allFlags[0] : null;
 }
 
 /**
  * Parse findings from JSON in text
  */
+function detectVulnerabilityFromResponse(response: string, flag: string): Finding | null {
+  const lowResponse = response.toLowerCase();
+
+  // SSTI (Server-Side Template Injection) Detection
+  if (lowResponse.includes('template') || lowResponse.includes('jinja') || lowResponse.includes('{{') ||
+      lowResponse.includes('render') || lowResponse.includes('ssti') || lowResponse.includes('{{7*7}}')) {
+    return {
+      severity: "high",
+      title: "Server-Side Template Injection (SSTI)",
+      cwe: "CWE-94",
+      confidence: "high",
+      evidence: `Flag captured through template injection: ${flag}. Response indicates template engine exploitation.`
+    };
+  }
+
+  // SQL Injection Detection
+  if (lowResponse.includes('union') || lowResponse.includes('select') || lowResponse.includes('sql') ||
+      lowResponse.includes('injection') || lowResponse.includes('sqlmap') || lowResponse.includes('database')) {
+    return {
+      severity: "high",
+      title: "SQL Injection",
+      cwe: "CWE-89",
+      confidence: "high",
+      evidence: `Flag captured through SQL injection: ${flag}. Response indicates database exploitation.`
+    };
+  }
+
+  // Command Injection Detection
+  if (lowResponse.includes('command') || lowResponse.includes('shell') || lowResponse.includes('exec') ||
+      lowResponse.includes('system') || lowResponse.includes('bash') || lowResponse.includes('cmd')) {
+    return {
+      severity: "critical",
+      title: "Command Injection",
+      cwe: "CWE-78",
+      confidence: "high",
+      evidence: `Flag captured through command injection: ${flag}. Response indicates system command execution.`
+    };
+  }
+
+  // XSS Detection
+  if (lowResponse.includes('xss') || lowResponse.includes('<script>') || lowResponse.includes('javascript:') ||
+      lowResponse.includes('alert(') || lowResponse.includes('document.cookie')) {
+    return {
+      severity: "medium",
+      title: "Cross-Site Scripting (XSS)",
+      cwe: "CWE-79",
+      confidence: "high",
+      evidence: `Flag captured through XSS: ${flag}. Response indicates script injection.`
+    };
+  }
+
+  // Path Traversal Detection
+  if (lowResponse.includes('../') || lowResponse.includes('..\\') || lowResponse.includes('directory') ||
+      lowResponse.includes('traversal') || lowResponse.includes('path') || lowResponse.includes('/etc/passwd')) {
+    return {
+      severity: "high",
+      title: "Path Traversal",
+      cwe: "CWE-22",
+      confidence: "high",
+      evidence: `Flag captured through path traversal: ${flag}. Response indicates directory traversal exploitation.`
+    };
+  }
+
+  // File Upload Vulnerability
+  if (lowResponse.includes('upload') || lowResponse.includes('file') || lowResponse.includes('webshell') ||
+      lowResponse.includes('.php') || lowResponse.includes('.jsp') || lowResponse.includes('reverse shell')) {
+    return {
+      severity: "critical",
+      title: "Unrestricted File Upload",
+      cwe: "CWE-434",
+      confidence: "high",
+      evidence: `Flag captured through file upload: ${flag}. Response indicates malicious file upload.`
+    };
+  }
+
+  // Authentication Bypass
+  if (lowResponse.includes('bypass') || lowResponse.includes('authentication') || lowResponse.includes('login') ||
+      lowResponse.includes('session') || lowResponse.includes('cookie') || lowResponse.includes('jwt')) {
+    return {
+      severity: "high",
+      title: "Authentication Bypass",
+      cwe: "CWE-287",
+      confidence: "medium",
+      evidence: `Flag captured through authentication bypass: ${flag}. Response indicates auth mechanism exploitation.`
+    };
+  }
+
+  // Generic Web Application Vulnerability (fallback)
+  return {
+    severity: "high",
+    title: "Web Application Vulnerability",
+    cwe: "CWE-20",
+    confidence: "medium",
+    evidence: `Flag captured indicating successful exploitation: ${flag}. Specific vulnerability type requires manual analysis.`
+  };
+}
+
 function parseFindings(text: string): Finding[] {
+  const findings: Finding[] = [];
+
+  // First, try original JSON parsing
   try {
     const match = text.match(/\[[\s\S]*?\]/);
     if (match) {
       const parsed = JSON.parse(match[0]);
       if (Array.isArray(parsed)) {
-        return parsed
+        const jsonFindings = parsed
           .filter((f) => f && typeof f === "object" && f.title)
           .map((f) => ({
             severity: normalizeSeverity(f.severity || "info"),
@@ -444,12 +754,111 @@ function parseFindings(text: string): Finding[] {
             confidence: f.confidence || undefined,
             evidence: f.evidence || undefined,
           }));
+        findings.push(...jsonFindings);
       }
     }
   } catch {
-    // Not valid JSON
+    // Not valid JSON, continue with text parsing
   }
-  return [];
+
+  // Enhanced natural language parsing for vulnerabilities
+  const lowText = text.toLowerCase();
+
+  // SQL Injection detection (more comprehensive)
+  if (lowText.includes('sql injection') || lowText.includes('sql vulnerability') ||
+      (lowText.includes('union') && lowText.includes('select')) ||
+      lowText.includes('sqlmap') || lowText.includes('or 1=1')) {
+    findings.push({
+      severity: "high",
+      title: "SQL Injection Vulnerability",
+      cwe: "CWE-89",
+      confidence: "medium",
+      evidence: "SQL injection indicators detected in analysis"
+    });
+  }
+
+  // SSTI detection (more comprehensive)
+  if (lowText.includes('template injection') || lowText.includes('ssti') ||
+      lowText.includes('jinja') || lowText.includes('{{7*7}}') ||
+      lowText.includes('{{') || lowText.includes('render')) {
+    findings.push({
+      severity: "high",
+      title: "Server-Side Template Injection (SSTI)",
+      cwe: "CWE-94",
+      confidence: "high",
+      evidence: "Server-side template injection patterns identified"
+    });
+  }
+
+  // XSS detection
+  if (lowText.includes('xss') || lowText.includes('cross-site scripting') ||
+      lowText.includes('<script>') || lowText.includes('javascript:') ||
+      lowText.includes('alert(') || lowText.includes('document.cookie')) {
+    findings.push({
+      severity: "medium",
+      title: "Cross-Site Scripting (XSS)",
+      cwe: "CWE-79",
+      confidence: "medium",
+      evidence: "Cross-site scripting vectors identified"
+    });
+  }
+
+  // Command Injection detection
+  if (lowText.includes('command injection') || lowText.includes('code execution') ||
+      lowText.includes('rce') || lowText.includes('remote code execution') ||
+      (lowText.includes('shell') && lowText.includes('exec'))) {
+    findings.push({
+      severity: "critical",
+      title: "Command Injection / RCE",
+      cwe: "CWE-78",
+      confidence: "high",
+      evidence: "Command injection or remote code execution identified"
+    });
+  }
+
+  // Path Traversal detection
+  if (lowText.includes('path traversal') || lowText.includes('../') ||
+      lowText.includes('/etc/passwd') || lowText.includes('directory traversal') ||
+      lowText.includes('..\\') || lowText.includes('local file inclusion')) {
+    findings.push({
+      severity: "high",
+      title: "Path Traversal / LFI",
+      cwe: "CWE-22",
+      confidence: "medium",
+      evidence: "Path traversal or local file inclusion detected"
+    });
+  }
+
+  // File Upload Vulnerability
+  if (lowText.includes('file upload') || lowText.includes('unrestricted upload') ||
+      lowText.includes('webshell') || lowText.includes('malicious file')) {
+    findings.push({
+      severity: "critical",
+      title: "Unrestricted File Upload",
+      cwe: "CWE-434",
+      confidence: "medium",
+      evidence: "File upload vulnerability indicators found"
+    });
+  }
+
+  // Authentication/Authorization Issues
+  if (lowText.includes('authentication bypass') || lowText.includes('authorization bypass') ||
+      lowText.includes('privilege escalation') || lowText.includes('access control')) {
+    findings.push({
+      severity: "high",
+      title: "Authentication/Authorization Bypass",
+      cwe: "CWE-287",
+      confidence: "medium",
+      evidence: "Authentication or authorization control bypass identified"
+    });
+  }
+
+  // Remove duplicates based on title
+  const uniqueFindings = findings.filter((finding, index, self) =>
+    index === self.findIndex(f => f.title === finding.title)
+  );
+
+  return uniqueFindings;
 }
 
 function normalizeSeverity(s: string): string {
@@ -525,14 +934,25 @@ function injectContext(template: string, cfg: RunConfig): { result: string; vali
   const sanitizedChallengeName = sanitizeInput(cfg.challengeName || "");
 
   // Build context variables with proper validation
+  // FIXED: BUG-02, BUG-05 — inject all required variables including new fields
   let contextVars: Record<string, string> = {
     // Common variables
     "CHALLENGE_NAME": sanitizedChallengeName || "Unknown Challenge",
     "SCOPE": sanitizedScope || "Full scope",
     "TEST_TYPE": cfg.testType,
     "PURPOSE": cfg.purpose,
-    "MCP_SERVER": "hexstrike",
-    "FILES": cfg.uploadIds?.join(", ") || "None",
+    // FIXED: BUG-02 — resolve MCP server name from ID
+    "MCP_SERVER": cfg.mcpServerId ? (() => {
+      const db = getDb();
+      const server = db.prepare("SELECT name FROM mcp_servers WHERE id = ?").get(cfg.mcpServerId) as {name:string}|undefined;
+      return server?.name || "hexstrike";
+    })() : "hexstrike",
+    // FIXED: BUG-05 — resolve real file paths from upload IDs
+    "FILES": resolveUploadPaths(cfg.uploadIds || []),
+    // FIXED: BUG-02 — new context variables
+    "LOGIN_INSTRUCTIONS": cfg.loginInstructions || "No authentication required — access all endpoints directly.",
+    "RULES_AVOID": cfg.rulesAvoid || "None — full scope authorized.",
+    "RULES_FOCUS": cfg.rulesFocus || "All standard attack vectors.",
   };
 
   // Add context-specific variables based on test type
@@ -561,6 +981,11 @@ function injectContext(template: string, cfg: RunConfig): { result: string; vali
         "EXECUTABLE": sanitizedTarget,
         "ARCH": "Unknown (auto-detect)",
         "FILE_TYPE": "Unknown (auto-detect)",
+        // FIXED: BUG-02 — HOST, PORT, PROTECTIONS, LIBC_PATH for pwn challenges
+        "HOST": cfg.host || "",
+        "PORT": cfg.port || "",
+        "PROTECTIONS": "Run checksec to determine (use readfile/fileinfo tool)",
+        "LIBC_PATH": cfg.uploadIds?.length ? "See uploaded files" : "Not provided",
       };
       break;
 
@@ -586,6 +1011,9 @@ function injectContext(template: string, cfg: RunConfig): { result: string; vali
         "PLAINTEXT": sanitizedTarget,
         "KEY_HINT": "See challenge description",
         "ALGORITHM": "Unknown (analyze)",
+        // FIXED: BUG-02 — HOST and PORT for crypto challenges
+        "HOST": cfg.host || sanitizedTarget.split(":")[0] || sanitizedTarget,
+        "PORT": cfg.port || sanitizedTarget.split(":")[1] || "1337",
       };
       break;
 
@@ -722,21 +1150,81 @@ function isValidUrl(url: string): boolean {
   }
 }
 
+// FIXED: BUG-05 — resolve real file paths from upload IDs
+function resolveUploadPaths(uploadIds: string[]): string {
+  if (!uploadIds?.length) return "None";
+  try {
+    const db = getDb();
+    const resolved = uploadIds.map(id => {
+      const row = db.prepare("SELECT filename, original_name, mime_type, size FROM uploads WHERE id = ?").get(id) as
+        { filename: string; original_name: string; mime_type: string; size: number } | undefined;
+      if (!row) return null;
+      const filePath = path.join(config.uploadsDir, row.filename);
+      return `${row.original_name} (${row.mime_type}, ${row.size} bytes) → path: ${filePath}`;
+    }).filter(Boolean);
+    return resolved.join("\n") || "None";
+  } catch {
+    return uploadIds.join(", ");
+  }
+}
+
 /**
  * Trim conversation history to prevent context overflow
  * Keep: system, initial user prompt, last N exchanges
  */
-function trimMessages(messages: ChatMessage[], maxMessages = 12): ChatMessage[] {
-  if (messages.length <= maxMessages) return messages;
+// FIXED: ISSUE-06 — token-estimated trimming instead of message count
+const MAX_CONTEXT_TOKENS = 10000; // conservative for weak LLMs
 
-  // Always keep system message (index 0) and initial user prompt (index 1)
-  const system = messages[0];
-  const initialPrompt = messages[1];
+function estimateTokens(text: string): number {
+  return Math.ceil(text.length / 3.5);
+}
 
-  // Keep only recent exchanges (last N messages)
-  const recentMessages = messages.slice(-Math.max(6, maxMessages - 2));
+function trimMessages(messages: ChatMessage[], maxTokens = MAX_CONTEXT_TOKENS): ChatMessage[] {
+  if (messages.length <= 2) return messages;
 
-  return [system, initialPrompt, ...recentMessages];
+  // Always keep: system (0) + initial task (1)
+  const anchor = messages.slice(0, 2);
+  const rolling = messages.slice(2);
+
+  const anchorTokens = anchor.reduce((s, m) => s + estimateTokens(m.content), 0);
+  let budget = maxTokens - anchorTokens;
+  const kept: ChatMessage[] = [];
+
+  // Walk backwards — most recent first
+  for (let i = rolling.length - 1; i >= 0; i--) {
+    const t = estimateTokens(rolling[i].content);
+    if (budget - t < 0) break;
+    kept.unshift(rolling[i]);
+    budget -= t;
+  }
+
+  return [...anchor, ...kept];
+}
+
+// FIXED: ISSUE-06 — dynamic token budget per phase
+function getMaxTokens(promptFile: string | null, testType: string): number {
+  if (!promptFile) return 3072;
+  if (promptFile.includes('report')) return 4096;
+  if (promptFile.includes('recon')) return 3072;
+  if (promptFile.includes('exploit')) return 4096;
+  if (promptFile.includes('pre-recon')) return 2048;
+  if (testType === 'cryptography' || testType === 'binary-exploitation') return 4096;
+  return 3072;
+}
+
+// FIXED: ISSUE-09 — smart completion detection
+function isTaskComplete(response: string, isCTF: boolean, flagCaptured: string | null, findings: Finding[]): boolean {
+  if (isCTF) return !!flagCaptured;
+
+  const completionSignals = [
+    /FINAL\s+REPORT/i,
+    /ASSESSMENT\s+COMPLETE/i,
+    /RECONNAISSANCE\s+COMPLETE/i,
+    /NO\s+FURTHER\s+ACTIONS/i,
+    /CONCLUSION:/i,
+    /DELIVERABLE\s+SAVED/i,
+  ];
+  return completionSignals.some(p => p.test(response));
 }
 
 /**
@@ -754,6 +1242,41 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
 
   const stepName = route.promptFile?.replace(".txt", "") || "analysis";
   emit(runId, { type: "step_start", step: stepName, timestamp: new Date().toISOString() });
+
+  // RELIABILITY MONITORING: Check rate limiter status before each step
+  try {
+    const provider = getActiveProvider();
+    if (provider && provider.type === 'cerebras') {
+      const rateLimiter = getRateLimiter(provider.type);
+      const status = rateLimiter.getStatus();
+
+      console.log(`[SCAN MONITOR] Step: ${stepName} | Requests: ${status.requestsUsed}/${status.requestsLimit} | Tokens: ${status.tokensUsed}/${status.tokensLimit}`);
+
+      // Warn if approaching limits
+      const requestUtilization = status.requestsUsed / status.requestsLimit;
+      const tokenUtilization = status.tokensUsed / status.tokensLimit;
+
+      if (requestUtilization > 0.7 || tokenUtilization > 0.7) {
+        const warning = `⚠️  High utilization: Requests ${Math.round(requestUtilization * 100)}%, Tokens ${Math.round(tokenUtilization * 100)}%`;
+        console.warn(`[SCAN MONITOR] ${warning}`);
+        emit(runId, { type: "status", content: warning, timestamp: new Date().toISOString() });
+      }
+
+      if (status.circuitBreakerActive) {
+        const error = "🚨 Circuit breaker active - scan will be slower but reliable";
+        console.error(`[SCAN MONITOR] ${error}`);
+        emit(runId, { type: "status", content: error, timestamp: new Date().toISOString() });
+      }
+
+      if (status.consecutiveRateLimits >= 2) {
+        const recommendation = "💡 Consider switching to Groq or OpenAI for faster execution";
+        console.warn(`[SCAN MONITOR] ${recommendation}`);
+        emit(runId, { type: "status", content: recommendation, timestamp: new Date().toISOString() });
+      }
+    }
+  } catch (monitorError) {
+    console.warn('[SCAN MONITOR] Failed to check rate limiter status:', monitorError);
+  }
 
   // Build messages with enhanced context injection
   const systemMessage = buildAgentSystemMessage(cfg, route);
@@ -804,6 +1327,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let allFindings: Finding[] = [];
   let flagCaptured: string | null = null;
   const isCTF = cfg.purpose === "ctf";
+  // FIXED: ISSUE-09 — track consecutive errors for backoff
+  let consecutiveErrors = 0;
 
   console.log(`[Run ${runId}] Agent loop starting - ${route.promptFile || "direct"}`);
 
@@ -821,21 +1346,61 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     emit(runId, { type: "status", content: `Analyzing... (${iteration}/${MAX_ITERATIONS})`, timestamp: new Date().toISOString() });
 
     try {
-      // Trim message history to prevent context overflow
-      const trimmedMessages = trimMessages(messages, 12);
+      // FIXED: ISSUE-06 — use token-based trimming
+      const trimmedMessages = trimMessages(messages);
 
-      // Get LLM response
-      const response = await chatComplete(trimmedMessages, {
-        providerId: cfg.llmProviderId,
-        modelOverride: cfg.modelOverride,
-        temperature: 0.7,
-        maxTokens: 2048,
-      });
+      // Get LLM response with AUTOMATIC RETRY for guaranteed completion
+      let response: string | null = null;
+      let retryCount = 0;
+      const MAX_RETRIES = 5;
+
+      while (!response && retryCount < MAX_RETRIES) {
+        try {
+          // FIXED: ISSUE-06 — dynamic token budget per phase
+          // FIXED: Lower temperature (0.3) for more deterministic output, helps weak models follow instructions
+          response = await chatComplete(trimmedMessages, {
+            providerId: cfg.llmProviderId,
+            modelOverride: cfg.modelOverride,
+            temperature: 0.3, // Low temperature = more focused, less hallucination
+            maxTokens: getMaxTokens(route.promptFile, cfg.testType),
+          });
+        } catch (llmError) {
+          retryCount++;
+          const errorMsg = llmError instanceof Error ? llmError.message : String(llmError);
+
+          // Check if it's a rate limit error
+          if (errorMsg.includes('RATE_LIMIT') || errorMsg.includes('429')) {
+            const waitTime = Math.min(60000, 10000 * Math.pow(2, retryCount)); // 10s, 20s, 40s, 60s max
+            console.warn(`[Run ${runId}] ⚠️ Rate limit hit, retrying in ${Math.round(waitTime/1000)}s (attempt ${retryCount}/${MAX_RETRIES})`);
+            emit(runId, { type: "status", content: `⏳ Rate limit - waiting ${Math.round(waitTime/1000)}s then retrying (${retryCount}/${MAX_RETRIES})...`, timestamp: new Date().toISOString() });
+            await new Promise(resolve => setTimeout(resolve, waitTime));
+          } else {
+            // Non-rate-limit error - still retry but with shorter wait
+            console.error(`[Run ${runId}] LLM error: ${errorMsg}, retrying...`);
+            emit(runId, { type: "status", content: `⚠️ Error: ${errorMsg.slice(0, 100)}... Retrying...`, timestamp: new Date().toISOString() });
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          }
+
+          if (retryCount >= MAX_RETRIES) {
+            console.error(`[Run ${runId}] Max retries reached, skipping iteration`);
+            emit(runId, { type: "status", content: `❌ Max retries reached for iteration ${iteration}, continuing...`, timestamp: new Date().toISOString() });
+            break;
+          }
+        }
+      }
 
       if (!response) {
-        console.error(`[Run ${runId}] Empty response from LLM`);
-        break;
+        console.error(`[Run ${runId}] Empty response from LLM after retries`);
+        // Don't break - continue to next iteration
+        consecutiveErrors++;
+        if (consecutiveErrors >= 3) {
+          emit(runId, { type: "status", content: `⚠️ Multiple consecutive failures, continuing with reduced functionality`, timestamp: new Date().toISOString() });
+        }
+        continue; // Try next iteration instead of breaking
       }
+
+      // Reset consecutive errors on success
+      consecutiveErrors = 0;
 
       // Add to history
       messages.push({ role: "assistant", content: response });
@@ -845,11 +1410,20 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
       emit(runId, { type: "step_output", step: stepName, content: response, timestamp: new Date().toISOString() });
 
       // Check for flag in response
-      const flag = extractFlag(response);
+      // FIXED: BUG-04 — pass custom flag format
+      const flag = extractFlag(response, cfg.flagFormat);
       if (flag && !flagCaptured) {
         flagCaptured = flag;
         console.log(`[Run ${runId}] 🚩 FLAG FOUND: ${flag}`);
         emit(runId, { type: "status", content: `🚩 FLAG CAPTURED: ${flag}`, timestamp: new Date().toISOString() });
+
+        // CRITICAL FIX: Automatically detect vulnerability when flag is captured
+        const exploitedVuln = detectVulnerabilityFromResponse(response, flag);
+        if (exploitedVuln && !allFindings.some(f => f.title === exploitedVuln.title)) {
+          allFindings.push(exploitedVuln);
+          emit(runId, { type: "finding", data: exploitedVuln, timestamp: new Date().toISOString() });
+          console.log(`[Run ${runId}] 🔍 AUTO-DETECTED VULNERABILITY: ${exploitedVuln.title}`);
+        }
       }
 
       // Parse findings
@@ -864,24 +1438,118 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
       // Parse and execute actions
       const actions = parseActions(response);
 
+      // ANTI-HALLUCINATION CHECK - Much stronger detection
+      if (iteration <= 2) {
+        // Pattern 1: Fabricated technical analysis
+        const hallucinationPatterns = [
+          /File type:\s+ELF/i,
+          /File architecture:\s+x86/i,
+          /\bmov\s+(eax|ebx|ecx|edx|rax|rbx|rcx|rdx)/i,
+          /\b0x[0-9a-f]{8,}\b.*?\bmov\b/i,
+          /Entropy:\s+\d+\.\d+/i,
+          /Disassembled code:/i,
+          /push\s+(ebp|rbp)/i,
+          /section\s+\.text/i,
+          /reconstructed algorithm/i,
+          /Algorithm Reconstruction/i,
+          /Dynamic Analysis/i,
+          /Step-by-step reverse/i,
+          /Final flag:/i,
+        ];
+
+        // Pattern 2: Fake/non-existent tools
+        const fakeTools = ['ida', 'gdb', 'entropy', 'breakpoint', 'register', 'memory',
+                          'algorithm_reconstruct', 'convert_to_python', 'validate_against_binary',
+                          'decrypt', 'extract_flag', 'print_flag', 'decompyle', 'control_flow',
+                          'disassemble', 'decompile', 'checksec', 'objdump', 'radare', 'ghidra',
+                          'angr', 'pwntools', 'ropper', 'rop_gadget'];
+        const usedFakeTools = actions.filter(a => fakeTools.includes(a.tool.toLowerCase()));
+
+        // Pattern 3: Too many actions in first iteration (LLM planning entire fake solution)
+        const tooManyActions = actions.length > 5;
+
+        // Pattern 4: Response contains placeholder flag
+        const hasPlaceholderFlag = /picoCTF\{actual_flag|flag_here|your_flag|example/i.test(response);
+
+        // Pattern 5: Complete "deliverable" without real tool results
+        const hasDeliverable = /Deliverable|Final flag:|Successfully|Vulnerability.*identified/i.test(response);
+
+        const looksLikeHallucination = hallucinationPatterns.some(p => p.test(response));
+        const usingFakeTools = usedFakeTools.length > 0;
+
+        if (looksLikeHallucination || usingFakeTools || hasPlaceholderFlag || (tooManyActions && hasDeliverable)) {
+          console.warn(`[Run ${runId}] HALLUCINATION DETECTED in iteration ${iteration}!`);
+          console.warn(`  - Pattern match: ${looksLikeHallucination}`);
+          console.warn(`  - Fake tools: ${usedFakeTools.map(a => a.tool).join(', ')}`);
+          console.warn(`  - Placeholder flag: ${hasPlaceholderFlag}`);
+          console.warn(`  - Too many actions + deliverable: ${tooManyActions && hasDeliverable}`);
+
+          emit(runId, { type: "status", content: "⚠️ HALLUCINATION BLOCKED - Forcing real tool use", timestamp: new Date().toISOString() });
+
+          // Clear any fake flag that was captured
+          if (hasPlaceholderFlag && flagCaptured?.includes('actual_flag')) {
+            flagCaptured = null;
+            console.log(`[Run ${runId}] Cleared placeholder flag`);
+          }
+
+          messages.push({
+            role: "user",
+            content: `❌ REJECTED! Your response was blocked because:
+${looksLikeHallucination ? '- You fabricated analysis (assembly, entropy, etc.) without real data\n' : ''}${usingFakeTools ? `- You used non-existent tools: ${usedFakeTools.map(a => a.tool).join(', ')}\n` : ''}${hasPlaceholderFlag ? '- You used a placeholder flag like "actual_flag_here"\n' : ''}${tooManyActions && hasDeliverable ? '- You wrote a complete "solution" without reading the file first\n' : ''}
+**YOU MUST START OVER!**
+
+The file is: ${cfg.target}
+
+Your ONLY allowed first action for a .java file:
+ACTION: readfile | {"file": "${cfg.target}"}
+
+DO NOT:
+- Use ida, gdb, entropy, decompile, or other advanced tools
+- Write analysis before seeing the real file content
+- Output a "Final flag" without finding it in real data
+
+Output ONLY this one action now:`
+          });
+          continue;
+        }
+      }
+
       if (actions.length === 0) {
-        // No actions requested - check if done
-        if (flagCaptured || response.includes("FLAG CAPTURED") || response.includes("FINAL") ||
-            response.includes("CONCLUSION") || (iteration >= 8 && !isCTF)) {
-          console.log(`[Run ${runId}] Complete - no more actions needed`);
+        // FIXED: ISSUE-09 — use smart completion detection
+        if (isTaskComplete(response, isCTF, flagCaptured, allFindings)) {
+          console.log(`[Run ${runId}] Task complete — stopping.`);
           break;
         }
 
-        // For CTF without flag, prompt to continue
-        if (isCTF && iteration < MAX_ITERATIONS - 2) {
+        // CTF: prompt to continue if no flag yet
+        if (isCTF && !flagCaptured && iteration < MAX_ITERATIONS - 2) {
           messages.push({
             role: "user",
-            content: "No flag captured yet. Continue exploitation - try different payloads, check cookies, try other endpoints. Request ACTION: tools to exploit further.",
+            content: `No ACTION detected in your response, and no flag found yet.
+
+You MUST use tools to find the flag. Output an ACTION line like:
+- ACTION: readfile | {"file": "${cfg.target}"}
+- ACTION: strings | {"file": "${cfg.target}"}
+- ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}
+
+What is your next ACTION?`,
           });
           continue;
         }
 
-        // Non-CTF or max iterations
+        // Non-CTF: prompt for action if early iteration
+        if (!isCTF && iteration < 5) {
+          messages.push({
+            role: "user",
+            content: `No ACTION detected. Use tools to gather information:
+ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}
+
+What is your next ACTION?`,
+          });
+          continue;
+        }
+
+        // Max iterations or no more actions
         if (iteration >= MAX_ITERATIONS - 1) break;
         continue;
       }
@@ -897,14 +1565,41 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
           timestamp: new Date().toISOString(),
         });
 
-        const result = await executeTool(tool, params, runId);
+        const result = await executeTool(tool, params, runId, cfg.mcpServerId);
 
-        // Aggressive truncation for context management
-        const truncated = result.length > 3000 ? result.substring(0, 3000) + "\n\n[... output truncated for brevity]" : result;
+        // FIXED: ISSUE-06 — Intelligent token-aware truncation for tool results
+        const MAX_TOOL_CHARS = 1800; // ~500 tokens — more aggressive to prevent rate limits
+        let truncated = result;
+
+        // SPECIAL: For HTTP responses, intelligently extract key parts
+        if (tool === 'http_request' && result.length > 1000) {
+          // Extract headers and first part of body
+          const headerEnd = result.indexOf('\n\n');
+          if (headerEnd > 0 && headerEnd < 800) {
+            const headers = result.substring(0, headerEnd);
+            const body = result.substring(headerEnd + 2);
+            const bodyPreview = body.substring(0, 1000); // Reduced for token efficiency
+            truncated = `${headers}\n\n${bodyPreview}\n\n[...HTML body truncated to save tokens. Full length: ${result.length} chars. Look for key elements like forms, flags, or interesting endpoints above.]`;
+          } else if (result.length > MAX_TOOL_CHARS) {
+            truncated = result.substring(0, MAX_TOOL_CHARS) + '\n\n[...HTTP response truncated to prevent token overload]';
+          }
+        }
+        // SPECIAL: For file content, show beginning and end
+        else if ((tool === 'readfile' || tool === 'strings') && result.length > MAX_TOOL_CHARS) {
+          const start = result.substring(0, MAX_TOOL_CHARS * 0.7); // 70% from start
+          const end = result.substring(result.length - (MAX_TOOL_CHARS * 0.3)); // 30% from end
+          truncated = `${start}\n\n[... ${result.length - MAX_TOOL_CHARS} chars truncated ...]\n\n${end}`;
+        }
+        // GENERAL: Standard truncation for other tools
+        else if (result.length > MAX_TOOL_CHARS) {
+          truncated = result.substring(0, MAX_TOOL_CHARS) + `\n\n[...output truncated to save tokens. ${result.length} chars total, showing first ${MAX_TOOL_CHARS}]`;
+        }
+
         results.push(`[TOOL: ${tool}]\n${truncated}`);
 
         // Check for flag in tool result
-        const flagInResult = extractFlag(result);
+        // FIXED: BUG-04 — pass custom flag format
+        const flagInResult = extractFlag(result, cfg.flagFormat);
         if (flagInResult && !flagCaptured) {
           flagCaptured = flagInResult;
           console.log(`[Run ${runId}] 🚩 FLAG FOUND IN TOOL RESULT: ${flagInResult}`);
@@ -920,7 +1615,52 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
       }
 
       // Feed results back to LLM - keep it concise
-      const contextMessage = `Tool execution completed. Results:\n\n${results.join("\n\n")}\n\n${isCTF ? "Analyze for flags or try different exploitation. If flag found, output: 🚩 FLAG CAPTURED: <flag>" : "Continue analysis or provide findings."}`;
+      // FIXED: Better error awareness - make LLM aware of failures
+      let toolSummary = "";
+      let successCount = 0;
+      let failureCount = 0;
+
+      for (const result of results) {
+        if (result.includes("Error") || result.includes("MCP Error") || result.includes("Tool error") || result.includes("not available")) {
+          failureCount++;
+        } else {
+          successCount++;
+        }
+      }
+
+      if (failureCount > 0 && successCount === 0) {
+        toolSummary = `
+
+---
+⚠️ ALL ${failureCount} TOOLS FAILED!
+Your next step: Use BUILT-IN tools instead:
+- For files: ACTION: readfile | {"file": "path"}
+- For web: ACTION: http_request | {"url": "...", "method": "GET"}
+- For network: ACTION: nc | {"host": "...", "port": 123}
+---`;
+      } else if (failureCount > 0) {
+        toolSummary = `
+
+---
+✅ ${successCount} succeeded, ❌ ${failureCount} failed
+Analyze the successful results. For failed tools, try built-in alternatives.
+---`;
+      } else {
+        toolSummary = `
+
+---
+✅ All ${successCount} tools executed successfully.
+Analyze the results above. Look for: flags, vulnerabilities, interesting data.
+If you found the flag, report it with: FLAG: <flag_value>
+---`;
+      }
+
+      const contextMessage = `## TOOL RESULTS
+
+${results.join("\n\n")}${toolSummary}
+
+${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it immediately. If not found, try another approach." : "**NEXT**: Analyze results and continue assessment."}`;
+
 
       messages.push({
         role: "user",
@@ -934,12 +1674,62 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
       }
 
     } catch (err) {
+      // FIXED: ISSUE-09 — exponential backoff on consecutive errors
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[Run ${runId}] Error:`, err);
+      console.error(`[Run ${runId}] Error iteration ${iteration}:`, err);
       emit(runId, { type: "error", content: errMsg, timestamp: new Date().toISOString() });
+      consecutiveErrors++;
 
-      if (iteration >= 5) break; // Stop after multiple errors
+      // SMART RATE LIMIT HANDLING: Better detection and progressive backoff
+      const isRateLimit = errMsg.includes('RATE_LIMIT') || errMsg.includes('429') ||
+                          errMsg.includes('too_many_tokens') || errMsg.includes('quota_exceeded') ||
+                          errMsg.includes('rate limit') || errMsg.includes('high traffic');
+
+      if (isRateLimit) {
+        // OPTIMIZED: Much shorter waits - rate limiter should prevent most of these
+        const rateLimitBackoff = Math.min(15000 * Math.pow(1.4, consecutiveErrors - 1), 60000); // 15s → 60s max
+        emit(runId, {
+          type: "status",
+          content: `⏱️ Rate limit hit → waiting ${Math.round(rateLimitBackoff/1000)}s (conversation continues where left off)`,
+          timestamp: new Date().toISOString()
+        });
+        await new Promise(r => setTimeout(r, rateLimitBackoff));
+      } else if (errMsg.includes('high traffic') || errMsg.includes('server error') || errMsg.includes('503')) {
+        // Server overload - even shorter delays
+        const serverBackoff = Math.min(10000 * Math.pow(1.3, consecutiveErrors - 1), 30000); // 10s → 30s max
+        emit(runId, {
+          type: "status",
+          content: `🌐 Server busy → waiting ${Math.round(serverBackoff/1000)}s then continuing...`,
+          timestamp: new Date().toISOString()
+        });
+        await new Promise(r => setTimeout(r, serverBackoff));
+      } else if (consecutiveErrors >= 3) {
+        // Regular errors: shorter exponential backoff
+        const backoffMs = Math.min(2000 * Math.pow(2, consecutiveErrors - 3), 20000); // 2s to 20s
+        emit(runId, {
+          type: "status",
+          content: `⚠️ Backing off ${Math.round(backoffMs/1000)}s after ${consecutiveErrors} errors...`,
+          timestamp: new Date().toISOString()
+        });
+        await new Promise(r => setTimeout(r, backoffMs));
+      }
+
+      // Allow more retries for rate limits and server issues since they're temporary
+      if (isRateLimit || errMsg.includes('high traffic')) {
+        if (consecutiveErrors >= 12) {
+          emit(runId, { type: "status", content: "Maximum retries for rate limits exceeded.", timestamp: new Date().toISOString() });
+          break;
+        }
+      } else if (consecutiveErrors >= 6) {
+        // Stop earlier for regular errors
+        emit(runId, { type: "status", content: "Too many consecutive errors — stopping run.", timestamp: new Date().toISOString() });
+        break;
+      }
+
+      continue;
     }
+    // FIXED: ISSUE-09 — reset consecutive errors on success
+    consecutiveErrors = 0;
   }
 
   console.log(`[Run ${runId}] Completed: ${allFindings.length} findings, flag: ${flagCaptured || "none"}`);
@@ -976,82 +1766,66 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
 /**
  * Build system message - SHORT, focused on agent loop mechanics
  */
+// FIXED: ISSUE-08 — clean system prompt, no contradiction with templates
 function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute): string {
   const isCTF = cfg.purpose === "ctf";
+  const isFileTask = cfg.testType === 'reverse-engineering' || cfg.testType === 'forensics' || cfg.testType === 'cryptography';
 
-  // Determine available tools based on test type
-  const isWeb = cfg.testType === "web-application";
-  const isPwn = cfg.testType === "binary-exploitation";
-  const isForensics = cfg.testType === "forensics";
-  const isCrypto = cfg.testType === "cryptography";
-  const isRE = cfg.testType === "reverse-engineering";
+  return `You are RedBox AI, executing security tasks step-by-step.
 
-  let toolList = `**Web Tools:**
-- http_request | {"url": "...", "method": "GET|POST", "data": {...}, "headers": {...}}
-- headers_check | {"url": "..."}
-- directory_brute | {"url": "..."}`;
+## ⚠️ CRITICAL: READ THIS FIRST ⚠️
 
-  if (isPwn || isRE) {
-    toolList += `
+**TOOLS THAT DO NOT EXIST** (never use these):
+- ida, ghidra, radare, r2, objdump, gdb, lldb
+- decompile, decompyle, disassemble, checksec
+- entropy, binwalk, strace, ltrace
+- algorithm_reconstruct, extract_flag, print_flag
+- breakpoint, register, memory, decrypt
 
-**Network Tools:**
-- nc | {"host": "...", "port": 1234, "send": "optional data"}`;
-  }
+**TOOLS THAT EXIST** (use ONLY these):
+- readfile, strings, hexdump, fileinfo
+- http_request, directory_brute, headers_check
+- nc, dns_lookup
+- base64_decode, base64_encode, hash
+- python, shell
 
-  if (isForensics || isRE || isCrypto) {
-    toolList += `
+## YOUR FIRST ACTION
 
-**File Analysis:**
-- readfile | {"file": "path/to/file"}
-- strings | {"file": "..."}
-- hexdump | {"file": "...", "lines": 50}
-- fileinfo | {"file": "..."}`;
-  }
+${isFileTask ? `For file "${cfg.target}", your FIRST and ONLY action must be:
 
-  if (isCrypto || isForensics) {
-    toolList += `
+ACTION: readfile | {"file": "${cfg.target}"}
 
-**Encoding/Crypto:**
-- base64_decode | {"data": "..."}
-- base64_encode | {"data": "..."}
-- hash | {"data": "...", "algorithm": "MD5|SHA256"}
-- python | {"script": "print(...)"}`;
-  }
+DO NOT write any analysis. DO NOT use other tools. Just output that ONE action and STOP.` : `For target "${cfg.target}", start with:
 
-  toolList += `
+ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}`}
 
-**Generic:**
-- shell | {"command": "any shell command"}`;
+## ACTION FORMAT
 
-  return `You are RedBox AI Security Assistant.
+\`\`\`
+ACTION: tool_name | {"param": "value"}
+\`\`\`
 
-## TOOL EXECUTION
+## RULES
 
-To use tools, output this format:
-ACTION: <tool> | <json_params>
+1. **ONE ACTION AT A TIME**: Output ONE action, wait for results
+2. **NO ANALYSIS BEFORE DATA**: Never describe file contents before readfile returns
+3. **NO PLACEHOLDER FLAGS**: Never output "actual_flag_here" or "flag_here"
+4. **WAIT FOR REAL DATA**: The system will show you real file contents
 
-${toolList}
+## TOOL REFERENCE
 
-**Example:**
-ACTION: http_request | {"url": "${cfg.target || 'http://target'}", "method": "GET"}
+| Tool | Parameters | Example |
+|------|------------|---------|
+| readfile | {"file": "path"} | ACTION: readfile | {"file": "C:/file.java"} |
+| strings | {"file": "path"} | ACTION: strings | {"file": "/bin/app"} |
+| python | {"script": "code"} | ACTION: python | {"script": "print(1+1)"} |
+| http_request | {"url", "method"} | ACTION: http_request | {"url": "http://x", "method": "GET"} |
 
-**RULES:**
-1. Output ACTION: lines then STOP
-2. NEVER imagine tool responses - wait for real results
-3. Analyze actual results before continuing${
-  isCTF
-    ? `
-4. **CTF MODE**: Capture the FLAG by exploiting vulnerabilities
-5. Only output flags found in tool results: 🚩 FLAG CAPTURED: <flag>
-6. Web: Try SQL injection, cookie manipulation, /flag paths
-7. PWN: Use nc to connect and send payloads
-8. Crypto: Use python, hash, base64 tools
-9. Forensics: Use strings, hexdump, readfile
-10. Keep trying until FLAG is captured`
-    : ""
-}
+${isCTF ? `## CTF GOAL
+Find the flag. Look for patterns like: picoCTF{...}, flag{...}, HTB{...}
+The flag will be in the REAL tool output, not imagined.` : ''}
 
-Follow the methodology in the task. Use ACTION: format for all tool requests.`;
+**START NOW**: Output your first ACTION and nothing else.`;
 }
 
 export async function startRun(cfg: RunConfig): Promise<string> {

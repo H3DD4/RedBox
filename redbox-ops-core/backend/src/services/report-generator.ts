@@ -69,77 +69,324 @@ export async function generateReport(
 }
 
 function getReportPrompt(type: string, run: RunData, findingsText: string, outputSummary: string): string {
-  const base = `Generate a ${type} security assessment report for:
+  const findingsCount = JSON.parse(run.findings || "[]").length;
+  const findings = JSON.parse(run.findings || "[]");
+
+  // Create severity summary for better context
+  const severityCounts = {
+    critical: findings.filter((f: any) => f.severity === 'critical').length,
+    high: findings.filter((f: any) => f.severity === 'high').length,
+    medium: findings.filter((f: any) => f.severity === 'medium').length,
+    low: findings.filter((f: any) => f.severity === 'low').length,
+    info: findings.filter((f: any) => f.severity === 'info').length,
+  };
+
+  const base = `Generate a professional cybersecurity assessment report for:
+
+**ASSESSMENT DETAILS:**
 - Target: ${run.target}
 - Test Type: ${run.test_type}
 - Purpose: ${run.purpose}
 - Pipeline: ${run.pipeline}
-- Date: ${run.created_at}
+- Assessment Date: ${new Date(run.created_at).toLocaleDateString()}
+- Total Findings: ${findingsCount}
 
-## Findings:
+**SEVERITY BREAKDOWN:**
+- 🔴 Critical: ${severityCounts.critical}
+- 🟠 High: ${severityCounts.high}
+- 🟡 Medium: ${severityCounts.medium}
+- 🔵 Low: ${severityCounts.low}
+- ⚪ Info: ${severityCounts.info}
+
+**DETAILED FINDINGS:**
 ${findingsText}
 
-## Assessment Output:
+**TECHNICAL ASSESSMENT OUTPUT:**
 ${outputSummary}`;
 
   if (type === "executive") {
-    return `${base}\n\nFormat as an EXECUTIVE SUMMARY: brief, non-technical, focus on business impact and risk ratings. Include severity distribution chart (as markdown table), top risks, and recommended actions.`;
+    return `${base}
+
+**REPORT REQUIREMENTS:**
+Create an EXECUTIVE SUMMARY report targeting C-level executives and business stakeholders:
+
+1. **Executive Summary** - High-level overview of security posture
+2. **Risk Assessment** - Business impact and financial implications
+3. **Severity Distribution** - Visual summary (markdown table format)
+4. **Top Critical Issues** - Highlight the most severe findings (Critical & High only)
+5. **Business Impact Analysis** - How vulnerabilities affect business operations
+6. **Regulatory Compliance** - Potential compliance violations
+7. **Recommended Actions** - Prioritized remediation timeline with business justification
+8. **Resource Requirements** - Estimated effort and budget needed
+
+Format: Use clear sections, bullet points, and business language. Avoid technical jargon. Focus on risk, impact, and business value.`;
   }
+
   if (type === "technical") {
-    return `${base}\n\nFormat as a TECHNICAL REPORT: detailed findings with evidence, CWE/CVE mappings, exploitation details, remediation steps, and proof-of-concept references.`;
+    return `${base}
+
+**REPORT REQUIREMENTS:**
+Create a TECHNICAL REPORT targeting security engineers, developers, and IT teams:
+
+1. **Technical Summary** - Overview of assessment methodology and scope
+2. **Vulnerability Analysis** - Detailed breakdown by category (Web App, Network, Infrastructure, etc.)
+3. **Exploitation Details** - Technical evidence and proof-of-concept information
+4. **CWE/CVE Mappings** - Industry standard vulnerability classifications
+5. **Risk Scoring** - CVSS scores and exploitability assessments
+6. **Remediation Guides** - Step-by-step technical fixes for each finding
+7. **Security Recommendations** - Best practices and hardening measures
+8. **Verification Steps** - How to validate that fixes resolve the issues
+
+Format: Use technical language, include code examples, configuration samples, and detailed remediation steps.`;
   }
-  return `${base}\n\nFormat as a FULL REPORT including both executive summary and technical details. Include: executive overview, methodology, detailed findings table, exploitation attempts and outcomes, risk matrix, and remediation roadmap.`;
+
+  return `${base}
+
+**REPORT REQUIREMENTS:**
+Create a COMPREHENSIVE FULL REPORT combining both executive and technical perspectives:
+
+**SECTION 1: EXECUTIVE OVERVIEW**
+- Executive summary and business risk analysis
+- Financial impact assessment and compliance implications
+- Strategic recommendations for leadership
+
+**SECTION 2: TECHNICAL DETAILS**
+- Detailed vulnerability analysis with evidence
+- Exploitation scenarios and attack vectors
+- Technical remediation steps and code fixes
+
+**SECTION 3: IMPLEMENTATION ROADMAP**
+- Prioritized remediation timeline (30/60/90 days)
+- Resource allocation and team assignments
+- Progress tracking and validation methods
+- Long-term security improvements
+
+**SECTION 4: APPENDICES**
+- Methodology and tools used
+- Raw assessment output and logs
+- Reference materials and compliance frameworks
+
+Format: Professional document suitable for both business stakeholders and technical teams. Include executive summary, detailed findings, and actionable roadmap.`;
 }
 
 function generateTemplateReport(type: string, run: RunData, findingsText: string, outputSummary: string): string {
-  const header = `# Security Assessment Report
+  const findings = JSON.parse(run.findings || "[]");
+  const severityCounts = {
+    critical: findings.filter((f: any) => f.severity === 'critical').length,
+    high: findings.filter((f: any) => f.severity === 'high').length,
+    medium: findings.filter((f: any) => f.severity === 'medium').length,
+    low: findings.filter((f: any) => f.severity === 'low').length,
+    info: findings.filter((f: any) => f.severity === 'info').length,
+  };
 
-**Target:** ${run.target}  
-**Type:** ${run.test_type}  
-**Purpose:** ${run.purpose}  
-**Pipeline:** ${run.pipeline}  
-**Date:** ${run.created_at}  
-**Status:** ${run.status}  
+  const totalFindings = findings.length;
+  const criticalAndHigh = severityCounts.critical + severityCounts.high;
+  const riskLevel = criticalAndHigh > 5 ? "HIGH" : criticalAndHigh > 2 ? "MEDIUM" : criticalAndHigh > 0 ? "LOW" : "MINIMAL";
+
+  const header = `# 🔒 RedBox Security Assessment Report
+
+**Target System:** ${run.target}
+**Assessment Type:** ${run.test_type}
+**Business Purpose:** ${run.purpose}
+**Testing Pipeline:** ${run.pipeline}
+**Assessment Date:** ${new Date(run.created_at).toLocaleDateString()}
+**Report Status:** ${run.status.toUpperCase()}
+**Overall Risk Level:** **${riskLevel} RISK**
+
+---
+
+## 📊 Executive Dashboard
+
+| Metric | Count | Status |
+|--------|-------|---------|
+| 🔴 Critical Vulnerabilities | ${severityCounts.critical} | ${severityCounts.critical > 0 ? '⚠️ URGENT' : '✅ Good'} |
+| 🟠 High Risk Issues | ${severityCounts.high} | ${severityCounts.high > 0 ? '🚨 Priority' : '✅ Good'} |
+| 🟡 Medium Risk Issues | ${severityCounts.medium} | ${severityCounts.medium > 0 ? '⚡ Monitor' : '✅ Good'} |
+| 🔵 Low Risk Issues | ${severityCounts.low} | ${severityCounts.low > 0 ? '📋 Review' : '✅ Good'} |
+| ⚪ Informational | ${severityCounts.info} | 📝 Note |
+| **Total Findings** | **${totalFindings}** | ${totalFindings === 0 ? '🎯 Clean' : '📊 Review'} |
 
 ---`;
 
   if (type === "executive") {
     return `${header}
 
-## Executive Summary
+## 🎯 Executive Summary
 
-A ${run.test_type} security assessment was conducted against ${run.target} for the purpose of ${run.purpose}.
+RedBox conducted a comprehensive ${run.test_type} security assessment of **${run.target}** for the purpose of ${run.purpose}. This assessment identified **${totalFindings} security findings** across multiple categories.
 
-## Findings Summary
+### 🔥 Critical Security Issues
+${severityCounts.critical > 0 ?
+  `⚠️ **${severityCounts.critical} CRITICAL vulnerabilities** were discovered that require immediate attention. These issues could lead to complete system compromise if exploited by attackers.` :
+  '✅ **No critical vulnerabilities** were identified in this assessment.'
+}
+
+### ⚡ Risk Assessment
+
+**Overall Security Posture:** ${riskLevel} RISK
+
+- **Immediate Action Required:** ${criticalAndHigh} high-priority vulnerabilities
+- **Business Impact:** ${criticalAndHigh > 3 ? 'Significant risk of data breach and service disruption' : criticalAndHigh > 0 ? 'Moderate risk requiring timely remediation' : 'Low risk with manageable security issues'}
+- **Compliance Implications:** ${criticalAndHigh > 0 ? 'May impact regulatory compliance requirements' : 'No major compliance issues identified'}
+
+### 📋 Security Findings Summary
 
 ${findingsText}
 
-## Risk Rating
+### 🛡️ Recommended Actions
 
-Based on the findings above, the overall risk level should be reviewed by the security team.
+**IMMEDIATE (0-7 days):**
+- Address all critical vulnerabilities immediately
+- Review and validate high-risk findings
+- Implement emergency security patches
 
-## Recommended Actions
+**SHORT TERM (1-4 weeks):**
+- Remediate high and medium severity issues
+- Strengthen security configurations
+- Implement additional monitoring
 
-Review all findings and prioritize remediation based on severity.`;
+**LONG TERM (1-3 months):**
+- Address remaining low-priority issues
+- Conduct follow-up security assessment
+- Enhance security training and processes
+
+### 💰 Resource Investment
+
+Based on the findings, we recommend:
+- **Security Team:** Immediate allocation of ${criticalAndHigh > 5 ? '2-3 security engineers' : criticalAndHigh > 0 ? '1-2 security engineers' : '1 security engineer'}
+- **Timeline:** ${criticalAndHigh > 5 ? '2-4 weeks' : criticalAndHigh > 0 ? '1-2 weeks' : '1 week'} for critical remediations
+- **Budget:** Consider investment in ${criticalAndHigh > 3 ? 'security tools and additional staff' : 'security improvements and training'}
+
+---
+
+*This report was generated by RedBox Security Platform. For questions, contact your security team.*`;
   }
 
-  return `${header}
+  if (type === "technical") {
+    return `${header}
 
-## Methodology
+## 🔬 Technical Assessment Details
 
-Assessment pipeline: ${run.pipeline}
+### 🛠️ Methodology
+**Assessment Pipeline:** ${run.pipeline}
+**Scanning Technologies:** Automated security testing with manual validation
+**Coverage:** ${run.test_type} assessment targeting multiple attack vectors
 
-## Detailed Findings
+### 🎯 Scope and Target Analysis
+**Target System:** ${run.target}
+**Assessment Focus:** ${run.purpose}
+
+### 🔍 Detailed Security Findings
 
 ${findingsText}
 
-## Assessment Output
+### 📊 Vulnerability Breakdown by Category
+
+**Web Application Security:** ${findings.filter((f: any) => f.title.toLowerCase().includes('sql') || f.title.toLowerCase().includes('xss') || f.title.toLowerCase().includes('csrf')).length} findings
+**Network Security:** ${findings.filter((f: any) => f.title.toLowerCase().includes('port') || f.title.toLowerCase().includes('ssl') || f.title.toLowerCase().includes('tls')).length} findings
+**Authentication & Authorization:** ${findings.filter((f: any) => f.title.toLowerCase().includes('auth') || f.title.toLowerCase().includes('login')).length} findings
+**Information Disclosure:** ${findings.filter((f: any) => f.title.toLowerCase().includes('disclosure') || f.title.toLowerCase().includes('leak')).length} findings
+**Configuration Issues:** ${findings.filter((f: any) => f.title.toLowerCase().includes('config') || f.title.toLowerCase().includes('default')).length} findings
+
+### 🔧 Technical Remediation Guide
+
+#### Critical Priority Fixes
+${severityCounts.critical > 0 ?
+  'The following critical vulnerabilities require immediate patching:' :
+  '✅ No critical vulnerabilities require immediate attention.'
+}
+
+#### Security Hardening Recommendations
+1. **Input Validation:** Implement comprehensive input validation and sanitization
+2. **Access Controls:** Review and strengthen authentication mechanisms
+3. **Network Security:** Configure firewalls and network segmentation
+4. **Monitoring:** Implement security logging and alerting
+5. **Patches:** Maintain current security patches and updates
+
+### 🧪 Assessment Technical Output
 
 ${outputSummary}
 
-## Remediation Recommendations
+### ✅ Validation and Testing
 
-Address findings in order of severity, starting with critical and high severity items.`;
+To verify remediation efforts:
+1. Re-run security scans after implementing fixes
+2. Conduct penetration testing for high-risk findings
+3. Validate security configurations against benchmarks
+4. Monitor for any regression in security posture
+
+---
+
+*Technical Report Generated by RedBox Security Platform*`;
+  }
+
+  // Full Report
+  return `${header}
+
+## 🎯 Executive Summary
+
+RedBox conducted a comprehensive security assessment of **${run.target}** identifying **${totalFindings} security findings** with an overall risk rating of **${riskLevel}**.
+
+### Key Findings
+- 🔴 **Critical:** ${severityCounts.critical} vulnerabilities requiring immediate attention
+- 🟠 **High:** ${severityCounts.high} issues needing priority remediation
+- 🟡 **Medium:** ${severityCounts.medium} security improvements recommended
+- 🔵 **Low:** ${severityCounts.low} minor issues for routine maintenance
+
+## 🔬 Technical Analysis
+
+### Methodology
+**Assessment Pipeline:** ${run.pipeline}
+**Testing Approach:** ${run.test_type} assessment
+**Business Context:** ${run.purpose}
+
+### Detailed Security Findings
+
+${findingsText}
+
+## 🛠️ Implementation Roadmap
+
+### Phase 1: Critical Response (0-7 days)
+- [ ] Address all critical vulnerabilities
+- [ ] Implement emergency security patches
+- [ ] Validate critical system integrity
+
+### Phase 2: High Priority (1-4 weeks)
+- [ ] Remediate high-severity findings
+- [ ] Strengthen access controls
+- [ ] Implement security monitoring
+
+### Phase 3: Security Enhancement (1-3 months)
+- [ ] Address medium and low findings
+- [ ] Security training and awareness
+- [ ] Follow-up assessment
+
+### Phase 4: Continuous Improvement (Ongoing)
+- [ ] Regular security assessments
+- [ ] Security metrics and reporting
+- [ ] Threat intelligence integration
+
+## 📋 Assessment Technical Output
+
+${outputSummary}
+
+## 📚 Appendices
+
+### Resources and References
+- OWASP Top 10 Security Risks
+- CWE/CVE vulnerability databases
+- Industry security benchmarks
+- Regulatory compliance frameworks
+
+### Methodology Details
+- Automated vulnerability scanning
+- Manual security testing
+- Configuration review
+- Risk assessment methodology
+
+---
+
+*Comprehensive Security Assessment Report - RedBox Security Platform*`;
 }
 
 export function generatePDF(markdownContent: string): Promise<Buffer> {
