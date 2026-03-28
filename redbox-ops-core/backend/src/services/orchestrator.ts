@@ -65,6 +65,12 @@ interface ContextValidationResult {
   errors: string[];
 }
 
+interface RuntimeToolContext {
+  builtInTools: string[];
+  availableMcpTools: string[];
+  preferredMcpTools: string[];
+}
+
 const MAX_ITERATIONS = 30;
 const TEMPLATE_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 const MAX_TOOL_OUTPUT_SIZE = 50000; // 50KB max output per tool
@@ -544,6 +550,59 @@ function parseActions(text: string): Array<{ tool: string; params: Record<string
     }
   }
 
+  // Backward compatibility for older prompt styles like:
+  // hexstrike__browser_navigate to https://example.com
+  // hexstrike__browser_take_screenshot with filename "shot.png"
+  if (actions.length === 0) {
+    const lines = text.split("\n");
+    for (const rawLine of lines) {
+      const line = rawLine
+        .replace(/^[\s>*`-]+/, "")
+        .replace(/[`]+$/g, "")
+        .trim();
+
+      if (!line) continue;
+
+      const toMatch = line.match(/^(?:[a-zA-Z0-9_-]+__)?([a-zA-Z0-9_-]+)\s+to\s+(\S+)$/i);
+      if (toMatch) {
+        const tool = toMatch[1];
+        const target = toMatch[2];
+        const params = /^https?:\/\//i.test(target)
+          ? { url: target, method: "GET" }
+          : { target };
+        actions.push({ tool, params });
+        continue;
+      }
+
+      const withMatch = line.match(/^(?:[a-zA-Z0-9_-]+__)?([a-zA-Z0-9_-]+)\s+with\s+(.+)$/i);
+      if (withMatch) {
+        const tool = withMatch[1];
+        const argText = withMatch[2].trim();
+        let params: Record<string, unknown> = {};
+
+        if (argText.startsWith("{") && argText.endsWith("}")) {
+          try {
+            params = JSON.parse(argText) as Record<string, unknown>;
+          } catch {
+            params = { input: argText };
+          }
+        } else {
+          const pairPattern = /([a-zA-Z_][\w-]*)\s+"([^"]*)"/g;
+          let pair;
+          while ((pair = pairPattern.exec(argText)) !== null) {
+            params[pair[1]] = pair[2];
+          }
+
+          if (Object.keys(params).length === 0) {
+            params = { input: argText };
+          }
+        }
+
+        actions.push({ tool, params });
+      }
+    }
+  }
+
   return actions;
 }
 
@@ -902,17 +961,85 @@ function loadPromptTemplate(pipeline: string, promptFile: string): string | null
 
     // Load and cache template
     const content = fs.readFileSync(filePath, "utf-8");
+    const resolved = resolveTemplateIncludes(content, path.dirname(filePath), new Set([path.resolve(filePath)]));
     templateCache.set(cacheKey, {
-      content,
+      content: resolved,
       lastModified: Date.now()
     });
 
-    console.log(`[Orchestrator] Loaded and cached template: ${cacheKey} (${content.length} chars)`);
-    return content;
+    console.log(`[Orchestrator] Loaded and cached template: ${cacheKey} (${resolved.length} chars)`);
+    return resolved;
 
   } catch (error) {
     console.error(`[Orchestrator] Error loading template ${filePath}:`, error);
     return null;
+  }
+}
+
+function resolveTemplateIncludes(content: string, currentDir: string, seen: Set<string>): string {
+  const includePattern = /@include\(([^)]+)\)/g;
+
+  return content.replace(includePattern, (_full, rawPath: string) => {
+    const includeRef = rawPath.trim().replace(/^['"]|['"]$/g, "");
+    const candidates = [
+      path.resolve(currentDir, includeRef),
+      path.resolve(config.promptsDir, includeRef),
+    ];
+
+    const includePath = candidates.find((candidate) => fs.existsSync(candidate));
+    if (!includePath) {
+      console.warn(`[Orchestrator] Include not found: ${includeRef}`);
+      return `\n[Include not found: ${includeRef}]\n`;
+    }
+
+    const absPath = path.resolve(includePath);
+    if (seen.has(absPath)) {
+      console.warn(`[Orchestrator] Recursive include blocked: ${absPath}`);
+      return "";
+    }
+
+    try {
+      seen.add(absPath);
+      const includeContent = fs.readFileSync(absPath, "utf-8");
+      const expanded = resolveTemplateIncludes(includeContent, path.dirname(absPath), seen);
+      seen.delete(absPath);
+      return expanded;
+    } catch (err) {
+      console.error(`[Orchestrator] Failed to load include ${absPath}:`, err);
+      return `\n[Include error: ${includeRef}]\n`;
+    }
+  });
+}
+
+function normalizeToolName(name: string): string {
+  return (name || "").toLowerCase().replace(/[_\-\s]+/g, "");
+}
+
+async function buildRuntimeToolContext(cfg: RunConfig, route: TaskRoute): Promise<RuntimeToolContext> {
+  const builtInTools = [
+    "readfile", "strings", "hexdump", "fileinfo",
+    "http_request", "directory_brute", "headers_check",
+    "nc", "dns_lookup",
+    "base64_decode", "base64_encode", "hash",
+    "python", "shell",
+  ];
+
+  try {
+    const client = McpClient.getClient(cfg.mcpServerId);
+    const tools = await client.listTools();
+    const availableMcpTools = Array.from(
+      new Set(tools.map((tool) => tool.name).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b));
+
+    const availableNorm = new Set(availableMcpTools.map(normalizeToolName));
+    const preferredMcpTools = Array.from(
+      new Set((route.mcpTools || []).filter((tool) => availableNorm.has(normalizeToolName(tool))))
+    ).sort((a, b) => a.localeCompare(b));
+
+    return { builtInTools, availableMcpTools, preferredMcpTools };
+  } catch (err) {
+    console.warn("[Orchestrator] Failed to load MCP tools for runtime context:", err);
+    return { builtInTools, availableMcpTools: [], preferredMcpTools: [] };
   }
 }
 
@@ -1279,7 +1406,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   }
 
   // Build messages with enhanced context injection
-  const systemMessage = buildAgentSystemMessage(cfg, route);
+  const runtimeToolContext = await buildRuntimeToolContext(cfg, route);
+  const systemMessage = buildAgentSystemMessage(cfg, route, runtimeToolContext);
   let userPrompt: string;
   let contextValidation: ContextValidationResult | null = null;
 
@@ -1458,11 +1586,14 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
         ];
 
         // Pattern 2: Fake/non-existent tools
-        const fakeTools = ['ida', 'gdb', 'entropy', 'breakpoint', 'register', 'memory',
-                          'algorithm_reconstruct', 'convert_to_python', 'validate_against_binary',
-                          'decrypt', 'extract_flag', 'print_flag', 'decompyle', 'control_flow',
-                          'disassemble', 'decompile', 'checksec', 'objdump', 'radare', 'ghidra',
-                          'angr', 'pwntools', 'ropper', 'rop_gadget'];
+        const fakeTools = [
+          'algorithm_reconstruct',
+          'convert_to_python',
+          'validate_against_binary',
+          'extract_flag',
+          'print_flag',
+          'control_flow',
+        ];
         const usedFakeTools = actions.filter(a => fakeTools.includes(a.tool.toLowerCase()));
 
         // Pattern 3: Too many actions in first iteration (LLM planning entire fake solution)
@@ -1767,27 +1898,31 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
  * Build system message - SHORT, focused on agent loop mechanics
  */
 // FIXED: ISSUE-08 — clean system prompt, no contradiction with templates
-function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute): string {
+function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: RuntimeToolContext): string {
   const isCTF = cfg.purpose === "ctf";
   const isFileTask = cfg.testType === 'reverse-engineering' || cfg.testType === 'forensics' || cfg.testType === 'cryptography';
 
+  const preferred = toolContext.preferredMcpTools.length > 0
+    ? toolContext.preferredMcpTools.join(", ")
+    : "none matched route profile";
+
+  const mcpList = toolContext.availableMcpTools.length > 0
+    ? toolContext.availableMcpTools.join(", ")
+    : "(none detected right now — use built-in tools)";
+
+  const builtInList = toolContext.builtInTools.join(", ");
+
   return `You are RedBox AI, executing security tasks step-by-step.
 
-## ⚠️ CRITICAL: READ THIS FIRST ⚠️
+## TOOLING RULES (CRITICAL)
 
-**TOOLS THAT DO NOT EXIST** (never use these):
-- ida, ghidra, radare, r2, objdump, gdb, lldb
-- decompile, decompyle, disassemble, checksec
-- entropy, binwalk, strace, ltrace
-- algorithm_reconstruct, extract_flag, print_flag
-- breakpoint, register, memory, decrypt
+Use ONLY tools from these runtime-verified sets:
+- Built-in tools: ${builtInList}
+- Preferred MCP tools for this route: ${preferred}
+- Available MCP tools now: ${mcpList}
 
-**TOOLS THAT EXIST** (use ONLY these):
-- readfile, strings, hexdump, fileinfo
-- http_request, directory_brute, headers_check
-- nc, dns_lookup
-- base64_decode, base64_encode, hash
-- python, shell
+If a tool fails or is unavailable, choose another tool from the lists above.
+Never invent tool names.
 
 ## YOUR FIRST ACTION
 
@@ -1883,136 +2018,90 @@ export async function testMcpToolsAvailability(mcpServerId?: string): Promise<{
     availableTools: [],
     missingTools: [],
     toolsStatus: {},
-    error: undefined
+    error: undefined,
   };
 
   try {
-    // Test common security tools that CTF/pentest tasks use
-    const toolsToTest = [
-      // Web tools
-      'http_request', 'curl', 'wget', 'dirb', 'gobuster', 'sqlmap',
-      // Network tools
-      'nmap', 'nc', 'netcat', 'ping', 'nslookup', 'dig',
-      // File analysis tools
-      'strings', 'file', 'hexdump', 'readfile', 'cat',
-      // Crypto tools
-      'python', 'python3', 'openssl', 'base64_decode', 'hash',
-      // Reverse engineering tools
-      'disassemble', 'decompile', 'checksec', 'objdump', 'gdb',
-      // Forensics tools
-      'pcap_analyze', 'wireshark', 'tcpdump', 'volatility',
-      // Shell tools
-      'shell', 'bash', 'sh'
-    ];
+    const client = McpClient.getClient(mcpServerId);
+    const connection = await client.testConnection();
 
-    console.log(`[MCP Test] Testing ${toolsToTest.length} tools availability...`);
-
-    // Test MCP server connection first
-    try {
-      const serverTestResponse = await fetch(`${config.hexstrikeApiUrl}/api/health`, {
-        method: "GET",
-        // Add timeout handling
-        signal: AbortSignal.timeout(5000)
-      });
-
-      if (serverTestResponse.ok) {
-        result.serverStatus = 'connected';
-        console.log(`[MCP Test] ✅ MCP server is connected`);
-      } else {
-        result.serverStatus = 'error';
-        result.error = `MCP server responded with status ${serverTestResponse.status}`;
-        console.log(`[MCP Test] ❌ MCP server error: ${result.error}`);
-      }
-    } catch (err) {
+    if (!connection.connected) {
       result.serverStatus = 'disconnected';
-      result.error = `Cannot connect to MCP server: ${err instanceof Error ? err.message : 'Unknown error'}`;
-      console.log(`[MCP Test] ❌ MCP server disconnected: ${result.error}`);
-    }
-
-    // If server is not connected, mark all tools as missing
-    if (result.serverStatus !== 'connected') {
-      toolsToTest.forEach(tool => {
-        result.toolsStatus[tool] = 'missing';
-        result.missingTools.push(tool);
-      });
+      result.error = connection.error || 'Cannot connect to MCP server';
       return result;
     }
 
-    // Test each tool individually with safe requests
-    for (const tool of toolsToTest) {
+    result.serverStatus = 'connected';
+
+    let serverUrl = config.hexstrikeApiUrl;
+    let authToken: string | null = null;
+
+    if (mcpServerId) {
       try {
-        console.log(`[MCP Test] Testing ${tool}...`);
+        const db = getDb();
+        const server = db.prepare(
+          "SELECT url, auth_token FROM mcp_servers WHERE id = ? AND enabled = 1"
+        ).get(mcpServerId) as { url: string; auth_token: string | null } | undefined;
 
-        // Send a basic test command to check if tool exists
-        const testResponse = await fetch(`${config.hexstrikeApiUrl}/api/command`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            command: tool,
-            // Use safe test parameters that won't cause harm
-            // Just check if command exists, don't execute anything
-            test_mode: true,
-            help: true,
-            version: true
-          }),
-          signal: AbortSignal.timeout(3000) // 3 second timeout per tool
-        });
-
-        if (testResponse.ok) {
-          const responseText = await testResponse.text();
-
-          // Check for "command not found" or error patterns
-          const errorPatterns = [
-            'not found', 'command not recognized', 'is not recognized',
-            'no such file', 'cannot find', 'unknown command',
-            'bash: ', 'sh: ', '/bin/sh: ', 'command not available'
-          ];
-
-          const hasError = errorPatterns.some(pattern =>
-            responseText.toLowerCase().includes(pattern.toLowerCase())
-          );
-
-          if (hasError) {
-            result.toolsStatus[tool] = 'missing';
-            result.missingTools.push(tool);
-            console.log(`[MCP Test] ❌ ${tool}: not available`);
-          } else {
-            result.toolsStatus[tool] = 'available';
-            result.availableTools.push(tool);
-            console.log(`[MCP Test] ✅ ${tool}: available`);
-          }
-        } else {
-          result.toolsStatus[tool] = 'error';
-          result.missingTools.push(tool);
-          console.log(`[MCP Test] ⚠️ ${tool}: error (HTTP ${testResponse.status})`);
+        if (server?.url) {
+          serverUrl = server.url;
+          authToken = server.auth_token;
         }
       } catch (err) {
-        console.warn(`[MCP Test] ⚠️ ${tool}: test failed -`, err);
-        result.toolsStatus[tool] = 'error';
-        result.missingTools.push(tool);
+        console.warn("[MCP Test] Failed to load MCP server from DB, using default URL", err);
       }
-
-      // Small delay to not overwhelm the MCP server
-      await new Promise(resolve => setTimeout(resolve, 50));
     }
 
-    console.log(`[MCP Test] 🎯 Results: ${result.availableTools.length} available, ${result.missingTools.length} missing/error`);
-    console.log(`[MCP Test] 📋 Available tools: ${result.availableTools.slice(0, 10).join(', ')}${result.availableTools.length > 10 ? '...' : ''}`);
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers.Authorization = `Bearer ${authToken}`;
+    }
+
+    const healthResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/health`, {
+      method: "GET",
+      headers,
+      signal: AbortSignal.timeout(8000),
+    });
+
+    if (healthResponse.ok) {
+      const healthData = await healthResponse.json();
+      const toolsStatus = healthData?.tools_status as Record<string, boolean> | undefined;
+
+      if (toolsStatus && typeof toolsStatus === "object") {
+        const sortedEntries = Object.entries(toolsStatus).sort(([a], [b]) =>
+          a.localeCompare(b)
+        );
+
+        for (const [tool, available] of sortedEntries) {
+          if (available) {
+            result.toolsStatus[tool] = 'available';
+            result.availableTools.push(tool);
+          } else {
+            result.toolsStatus[tool] = 'missing';
+            result.missingTools.push(tool);
+          }
+        }
+
+        return result;
+      }
+    }
+
+    // Fallback when health does not expose tools_status
+    const availableFromMcp = await client.listTools();
+    const uniqueNames = Array.from(
+      new Set(availableFromMcp.map((tool) => tool.name).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b));
+
+    result.availableTools = uniqueNames;
+    for (const tool of uniqueNames) {
+      result.toolsStatus[tool] = 'available';
+    }
 
     return result;
-
   } catch (error) {
     console.error(`[MCP Test] 💥 Testing failed:`, error);
     result.serverStatus = 'error';
     result.error = error instanceof Error ? error.message : 'Unknown error during tool testing';
-
-    // Mark all tools as missing if we can't test
-    const allTools = ['http_request', 'curl', 'nmap', 'sqlmap', 'nc', 'python'];
-    allTools.forEach(tool => {
-      result.toolsStatus[tool] = 'missing';
-      result.missingTools.push(tool);
-    });
-
     return result;
   }
 }

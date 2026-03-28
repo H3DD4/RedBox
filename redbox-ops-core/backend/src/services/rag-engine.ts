@@ -204,15 +204,31 @@ export async function queryRAG(
   let answer: string;
   
   if (provider) {
+  try {
     const { chat: llmChat } = await import("./llm-gateway.js");
+    const trimmedContext = topChunks
+      .map((c, i) => `[Source ${i + 1}: ${c.doc_name}]\n${c.content.slice(0, 800)}`)
+      .join("\n\n---\n\n");
     const result = await llmChat([
       { role: "system", content: "You are a security knowledge assistant. Answer questions based on the provided context. Always cite your sources. If the context doesn't contain relevant information, say so." },
-      { role: "user", content: `Context:\n${context}\n\nQuestion: ${question}` },
+      { role: "user", content: `Context:\n${trimmedContext}\n\nQuestion: ${question}` },
     ]);
     answer = result.content;
-  } else {
-    answer = `Based on the indexed documents, here are the most relevant excerpts:\n\n${topChunks.map((c, i) => `**[${c.doc_name}]** (relevance: ${(c.score * 100).toFixed(1)}%)\n${c.content.slice(0, 300)}...`).join("\n\n")}`;
+  } catch (err: any) {
+    // LLM unavailable (rate limit, network, etc.) — fall back to extractive answer
+    answer = `⚠️ LLM unavailable (${err?.message?.includes("RATE_LIMIT") ? "rate limit hit" : "provider error"}).\n\nMost relevant excerpts:\n\n${
+      topChunks.map((c, i) =>
+        `**[${c.doc_name}]** (relevance: ${(c.score * 100).toFixed(1)}%)\n${c.content.slice(0, 300)}...`
+      ).join("\n\n")
+    }`;
   }
+} else {
+  answer = `Based on the indexed documents, here are the most relevant excerpts:\n\n${
+    topChunks.map((c, i) =>
+      `**[${c.doc_name}]** (relevance: ${(c.score * 100).toFixed(1)}%)\n${c.content.slice(0, 300)}...`
+    ).join("\n\n")
+  }`;
+}
   
   const sources = topChunks.map(c => ({
     name: c.doc_name,
