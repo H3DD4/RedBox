@@ -68,7 +68,7 @@ export class McpClient {
    */
   async testConnection(): Promise<{ connected: boolean; error?: string }> {
     try {
-      const response = await fetch(`${this.serverUrl}/api/health`, {
+      const response = await fetch(`${this.serverUrl}/health`, {
         method: "GET",
         signal: AbortSignal.timeout(5000),
       });
@@ -108,6 +108,29 @@ export class McpClient {
       };
       if (this.authToken) {
         headers["Authorization"] = `Bearer ${this.authToken}`;
+      }
+
+      // Preferred: read live availability map from health endpoint
+      // This ensures AI agents only see tools that are actually usable now.
+      const healthResponse = await fetch(`${this.serverUrl}/health`, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (healthResponse.ok) {
+        const healthData = await healthResponse.json();
+        const toolsStatus = healthData?.tools_status as
+          | Record<string, boolean>
+          | undefined;
+
+        if (toolsStatus && typeof toolsStatus === "object") {
+          this.cachedTools = Object.entries(toolsStatus)
+            .filter(([, available]) => available)
+            .map(([name]) => ({ name }));
+          this.lastToolsFetch = Date.now();
+          return this.cachedTools;
+        }
       }
 
       // Try MCP JSON-RPC 2.0 format first
