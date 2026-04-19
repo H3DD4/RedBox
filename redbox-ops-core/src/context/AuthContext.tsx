@@ -40,17 +40,46 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       setIsLoading(false);
       return;
     }
+    setTokenState(stored);
+
     auth
       .me()
       .then(({ user }) => {
         setUser(user);
         setTokenState(stored);
       })
-      .catch(() => {
-        clearToken();
-        setTokenState(null);
+      .catch((error: unknown) => {
+        const apiErr = error as Partial<ApiError>;
+        const isTokenError =
+          apiErr.code === "INVALID_TOKEN" ||
+          apiErr.code === "TOKEN_EXPIRED" ||
+          apiErr.code === "AUTH_REQUIRED";
+
+        if (isTokenError) {
+          clearToken();
+          setTokenState(null);
+          setUser(null);
+          return;
+        }
+
+        // Keep session alive on transient errors (network/back-end restart).
+        setTokenState(stored);
       })
       .finally(() => setIsLoading(false));
+  }, []);
+
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== "redbox_token") return;
+      const nextToken = getToken();
+      setTokenState(nextToken);
+      if (!nextToken) {
+        setUser(null);
+      }
+    };
+
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, []);
 
   const login = useCallback(async (email: string, password: string) => {
@@ -77,7 +106,7 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         user,
         token,
         isLoading,
-        isAuthenticated: !!user,
+        isAuthenticated: !!token,
         login,
         logout,
       }}

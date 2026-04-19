@@ -4,6 +4,7 @@ import fs from "fs";
 import bcryptjs from "bcryptjs";
 import { v4 as uuidv4 } from "uuid";
 import { config } from "./lib/config.js";
+import { runMigration001 } from "./db-migrations/001_experience_memory.js";
 
 let db: Database.Database;
 
@@ -15,6 +16,7 @@ export function getDb(): Database.Database {
     db.pragma("journal_mode = WAL");
     db.pragma("foreign_keys = ON");
     initSchema();
+    try { runMigration001(); } catch (e) { console.warn('[DB] Migration 001:', e); }
 
     // FIXED: DB-02 — periodic WAL checkpoint every 5 minutes
     setInterval(() => {
@@ -177,7 +179,7 @@ function initSchema() {
   if (llmCount.count === 0) {
     db.prepare(
       "INSERT INTO llm_providers (id, type, name, endpoint, model, active, is_default) VALUES (?, ?, ?, ?, ?, 1, 1)"
-    ).run(uuidv4(), "ollama", "Ollama (local)", "http://localhost:11434", "llama3", 1, 1);
+    ).run(uuidv4(), "ollama", "Ollama (local)", "http://localhost:11434", "llama3");
     console.log("  Default LLM provider seeded: Ollama");
   }
 }

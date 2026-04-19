@@ -22,6 +22,7 @@ export interface ChatOptions {
   maxTokens?: number;
   topP?: number;
   stream?: boolean;
+  jsonMode?: boolean;
 }
 
 export interface ChatResult {
@@ -221,12 +222,12 @@ async function chatOllama(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      messages,
+      messages: options.jsonMode ? appendJsonInstruction(messages) : messages,
       stream: false,
       options: {
-        temperature: options.temperature ?? 0.7,
-        num_predict: options.maxTokens ?? 4096,
-        top_p: options.topP ?? 0.9,
+        temperature: options.temperature ?? 0.0,
+        num_predict: options.maxTokens ?? 1024,
+        top_p: options.topP ?? 0.1,
       },
     }),
   });
@@ -259,12 +260,12 @@ async function* streamOllama(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      messages,
+      messages: options.jsonMode ? appendJsonInstruction(messages) : messages,
       stream: true,
       options: {
-        temperature: options.temperature ?? 0.7,
-        num_predict: options.maxTokens ?? 4096,
-        top_p: options.topP ?? 0.9,
+        temperature: options.temperature ?? 0.0,
+        num_predict: options.maxTokens ?? 1024,
+        top_p: options.topP ?? 0.1,
       },
     }),
   });
@@ -314,16 +315,22 @@ async function chatOpenAI(
     ? baseUrl
     : `${baseUrl}/chat/completions`;
 
+  const supportsNativeJsonMode = provider.type === "openai" || provider.type === "custom";
+  const preparedMessages = options.jsonMode && !supportsNativeJsonMode
+    ? appendJsonInstruction(messages)
+    : messages;
+
   const resp = await fetch(chatUrl, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model,
-      messages,
-      temperature: options.temperature ?? 0.7,
-      max_tokens: options.maxTokens ?? 4096,
-      top_p: options.topP ?? 0.9,
+      messages: preparedMessages,
+      temperature: options.temperature ?? 0.0,
+      max_tokens: options.maxTokens ?? 1024,
+      top_p: options.topP ?? 0.1,
       stream: false,
+      ...(options.jsonMode && supportsNativeJsonMode ? { response_format: { type: "json_object" } } : {}),
     }),
   });
 
@@ -377,16 +384,22 @@ async function* streamOpenAI(
     ? baseUrl
     : `${baseUrl}/chat/completions`;
 
+  const supportsNativeJsonMode = provider.type === "openai" || provider.type === "custom";
+  const preparedMessages = options.jsonMode && !supportsNativeJsonMode
+    ? appendJsonInstruction(messages)
+    : messages;
+
   const resp = await fetch(chatUrl, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model,
-      messages,
-      temperature: options.temperature ?? 0.7,
-      max_tokens: options.maxTokens ?? 4096,
-      top_p: options.topP ?? 0.9,
+      messages: preparedMessages,
+      temperature: options.temperature ?? 0.0,
+      max_tokens: options.maxTokens ?? 1024,
+      top_p: options.topP ?? 0.1,
       stream: true,
+      ...(options.jsonMode && supportsNativeJsonMode ? { response_format: { type: "json_object" } } : {}),
     }),
   });
 
@@ -443,14 +456,18 @@ async function chatAnthropic(
   const baseUrl = provider.endpoint.replace(/\/+$/, "");
   const url = baseUrl.endsWith("/messages") ? baseUrl : `${baseUrl}/messages`;
 
+  const anthropicMessages = options.jsonMode ? appendJsonInstruction(nonSystem) : nonSystem;
+
   const resp = await fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model,
-      max_tokens: options.maxTokens ?? 4096,
+      temperature: options.temperature ?? 0.0,
+      top_p: options.topP ?? 0.1,
+      max_tokens: options.maxTokens ?? 1024,
       ...(systemMsg ? { system: systemMsg.content } : {}),
-      messages: nonSystem.map((m) => ({ role: m.role, content: m.content })),
+      messages: anthropicMessages.map((m) => ({ role: m.role, content: m.content })),
     }),
   });
 
@@ -492,15 +509,19 @@ async function* streamAnthropic(
   const baseUrl = provider.endpoint.replace(/\/+$/, "");
   const url = baseUrl.endsWith("/messages") ? baseUrl : `${baseUrl}/messages`;
 
+  const anthropicStreamMessages = options.jsonMode ? appendJsonInstruction(nonSystem) : nonSystem;
+
   const resp = await fetch(url, {
     method: "POST",
     headers,
     body: JSON.stringify({
       model,
-      max_tokens: options.maxTokens ?? 4096,
+      temperature: options.temperature ?? 0.0,
+      top_p: options.topP ?? 0.1,
+      max_tokens: options.maxTokens ?? 1024,
       stream: true,
       ...(systemMsg ? { system: systemMsg.content } : {}),
-      messages: nonSystem.map((m) => ({ role: m.role, content: m.content })),
+      messages: anthropicStreamMessages.map((m) => ({ role: m.role, content: m.content })),
     }),
   });
 
@@ -550,8 +571,9 @@ async function chatGemini(
   // Convert messages to Gemini format
   const systemMsg = messages.find((m) => m.role === "system");
   const nonSystem = messages.filter((m) => m.role !== "system");
+  const geminiMessages = options.jsonMode ? appendJsonInstruction(nonSystem) : nonSystem;
 
-  const contents = nonSystem.map((m) => ({
+  const contents = geminiMessages.map((m) => ({
     role: m.role === "assistant" ? "model" : "user",
     parts: [{ text: m.content }],
   }));
@@ -559,9 +581,10 @@ async function chatGemini(
   const body: Record<string, unknown> = {
     contents,
     generationConfig: {
-      temperature: options.temperature ?? 0.7,
-      maxOutputTokens: options.maxTokens ?? 4096,
-      topP: options.topP ?? 0.9,
+      temperature: options.temperature ?? 0.0,
+      maxOutputTokens: options.maxTokens ?? 1024,
+      topP: options.topP ?? 0.1,
+      ...(options.jsonMode ? { responseMimeType: "application/json" } : {}),
     },
   };
 
@@ -598,4 +621,26 @@ async function chatGemini(
         }
       : undefined,
   };
+}
+
+// ─── JSON Mode Helper ────────────────────────────────────────────────────────
+
+/**
+ * For providers that don't support native JSON mode,
+ * append an instruction to the last user message to force JSON-only output.
+ */
+function appendJsonInstruction<T extends { role: string; content: string }>(messages: T[]): T[] {
+  if (messages.length === 0) return messages;
+  const copy = messages.map((m: T) => ({ ...m }));
+  let lastUserIdx = -1;
+  for (let i = copy.length - 1; i >= 0; i--) {
+    if (copy[i].role === 'user') { lastUserIdx = i; break; }
+  }
+  if (lastUserIdx >= 0) {
+    copy[lastUserIdx] = {
+      ...copy[lastUserIdx],
+      content: copy[lastUserIdx].content + '\n\nIMPORTANT: Respond ONLY with valid JSON. No markdown, no explanation.',
+    };
+  }
+  return copy;
 }

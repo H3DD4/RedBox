@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>RedBox — Functional Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0d1117;
+    color: #c9d1d9;
+    font-family: 'Consolas', 'Courier New', monospace;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 40px 20px 80px;
+  }
+
+  .page {
+    max-width: 960px;
+    margin: 0 auto;
+  }
+
+  h1 {
+    text-align: center;
+    font-size: 18px;
+    font-weight: normal;
+    color: #e6edf3;
+    margin-bottom: 6px;
+    letter-spacing: 1px;
+  }
+
+  .subtitle {
+    text-align: center;
+    font-size: 11px;
+    color: #7d8590;
+    margin-bottom: 40px;
+    letter-spacing: 2px;
+  }
+
+  /* ─── FLOW LAYOUT ─── */
+  .flow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  /* ─── BOX ─── */
+  .box {
+    border: 1px dashed #3d444d;
+    padding: 12px 20px;
+    text-align: center;
+    min-width: 280px;
+    max-width: 520px;
+  }
+
+  .box .t {
+    color: #e6edf3;
+    font-weight: bold;
+    font-size: 13px;
+    margin-bottom: 4px;
+  }
+
+  .box .d {
+    color: #7d8590;
+    font-size: 11px;
+    line-height: 1.6;
+  }
+
+  .box.wide {
+    min-width: 420px;
+    max-width: 620px;
+  }
+
+  .box.narrow {
+    min-width: 140px;
+    max-width: 200px;
+    padding: 10px 14px;
+  }
+
+  .box.narrow .t { font-size: 12px; margin-bottom: 2px; }
+  .box.narrow .d { font-size: 10px; }
+
+  /* ─── CONNECTOR ─── */
+  .v {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .v .line {
+    width: 1px;
+    height: 24px;
+    background: #3d444d;
+  }
+
+  .v .arrow {
+    width: 0; height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 7px solid #3d444d;
+  }
+
+  .v .label {
+    font-size: 10px;
+    color: #484f58;
+    margin: 2px 0;
+    letter-spacing: 0.5px;
+  }
+
+  /* ─── HORIZONTAL ROW ─── */
+  .row {
+    display: flex;
+    justify-content: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+
+  /* ─── BRANCH LINES ─── */
+  .branch-down {
+    display: flex;
+    justify-content: center;
+    position: relative;
+    width: 100%;
+    max-width: 700px;
+    height: 28px;
+  }
+
+  .branch-down .h {
+    position: absolute;
+    top: 0;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: #3d444d;
+  }
+
+  .branch-down .drop {
+    position: absolute;
+    top: 0;
+    width: 1px;
+    height: 28px;
+    background: #3d444d;
+  }
+
+  .branch-down .drop::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: -4px;
+    width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 6px solid #3d444d;
+  }
+
+  /* ─── MERGE LINES ─── */
+  .merge-up {
+    display: flex;
+    justify-content: center;
+    position: relative;
+    width: 100%;
+    max-width: 700px;
+    height: 28px;
+  }
+
+  .merge-up .rise {
+    position: absolute;
+    bottom: 0;
+    width: 1px;
+    height: 28px;
+    background: #3d444d;
+  }
+
+  .merge-up .h {
+    position: absolute;
+    bottom: 0;
+    left: 10%;
+    right: 10%;
+    height: 1px;
+    background: #3d444d;
+  }
+
+  /* ─── LOOP WRAPPER ─── */
+  .loop {
+    position: relative;
+    border: 1px dashed #2a2f38;
+    border-radius: 4px;
+    padding: 20px 30px;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .loop-label {
+    position: absolute;
+    top: -10px;
+    left: 16px;
+    background: #0d1117;
+    padding: 0 10px;
+    font-size: 10px;
+    color: #484f58;
+    letter-spacing: 1px;
+  }
+
+  /* ─── SIDE BY SIDE ─── */
+  .side {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+
+  .panel {
+    border: 1px dashed #3d444d;
+    padding: 14px 18px;
+    min-width: 280px;
+    max-width: 440px;
+    flex: 1;
+  }
+
+  .panel .pt {
+    color: #e6edf3;
+    font-weight: bold;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+
+  .panel .pd {
+    color: #7d8590;
+    font-size: 11px;
+    line-height: 1.7;
+  }
+
+  /* ─── SECTION HEADER ─── */
+  .sh {
+    text-align: center;
+    margin: 40px 0 20px;
+    font-size: 11px;
+    color: #484f58;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+  }
+
+  .sh::before { content: '── '; }
+  .sh::after  { content: ' ──'; }
+
+  /* ─── DOTS ─── */
+  .dots {
+    text-align: center;
+    color: #3d444d;
+    font-size: 16px;
+    letter-spacing: 6px;
+    padding: 4px 0;
+  }
+
+  /* ─── FOOTER ─── */
+  .footer {
+    text-align: center;
+    margin-top: 50px;
+    font-size: 10px;
+    color: #484f58;
+    letter-spacing: 1px;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>RedBox — Functional Architecture</h1>
+<div class="subtitle">AI-Powered Security Orchestration Platform</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">1. User Entry</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+
+  <div class="box">
+    <div class="t">Authentication</div>
+    <div class="d">JWT login, bcrypt hashing<br>Session management</div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box">
+    <div class="t">Dashboard</div>
+    <div class="d">Active runs, findings overview<br>LLM + MCP server status, RAG stats</div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box wide">
+    <div class="t">Assessment Configuration</div>
+    <div class="d">
+      Select: Test Type × Purpose → Task Router (35 routes)<br>
+      9 types: Web · API · RevEng · PWN · Crypto · Forensics · Network · Mobile · OSINT<br>
+      4 purposes: CTF · Pentest · Red Team · Research<br>
+      Set: target, scope, LLM provider, MCP server, file uploads
+    </div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="label">POST /api/orchestrator/run</div><div class="arrow"></div></div>
+
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">2. Orchestration Setup</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+
+  <div class="box">
+    <div class="t">Route Resolution</div>
+    <div class="d">Task Router maps (testType + purpose)<br>→ prompt template + pipeline + MCP tools</div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box wide">
+    <div class="t">Prompt Template Loading</div>
+    <div class="d">
+      Load from prompts/ (ctf · pentesting · shared)<br>
+      Cached with 5-min TTL, @include() resolution<br>
+      webexp.txt · pwn.txt · crypto.txt · forensics.txt · recon.txt · osint.txt ...
+    </div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box wide">
+    <div class="t">Context Injection & Validation</div>
+    <div class="d">
+      Inject 20+ variables: {{TARGET_URL}}, {{BINARY_PATH}}, {{CIPHER_TEXT}} ...<br>
+      Validate missing vars, sanitize inputs<br>
+      Security: path traversal + command injection prevention
+    </div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box">
+    <div class="t">Runtime Tool Discovery</div>
+    <div class="d">MCP Client → listTools() from HexStrike /health<br>Build agent tool context (built-in + MCP)</div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="label">SSE stream begins</div><div class="arrow"></div></div>
+
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">3. AI Agent Loop (Core)</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+
+  <div class="loop">
+    <div class="loop-label">LOOP — max 30 iterations</div>
+
+    <div class="box wide">
+      <div class="t">LLM Chat Completion</div>
+      <div class="d">
+        LLM Gateway → active provider (Ollama, OpenAI,<br>
+        Claude, Gemini, Cerebras, Groq, Together, DeepSeek...)<br>
+        Token-based context trimming (10k budget)<br>
+        Auto-retry: 5 attempts, exponential backoff<br>
+        Rate limiter with circuit breaker
+      </div>
+    </div>
+
+    <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+    <div class="box wide">
+      <div class="t">Response Analysis</div>
+      <div class="d">
+        Parse ACTION: directives from LLM output<br>
+        Anti-hallucination checks<br>
+        Flag extraction (15+ CTF format patterns)<br>
+        Vulnerability detection (NLP-based)
+      </div>
+    </div>
+
+    <div class="v"><div class="line"></div><div class="label">ACTION: tool_name | {params}</div><div class="arrow"></div></div>
+
+    <!-- TOOL BRANCHES -->
+    <div class="branch-down">
+      <div class="h"></div>
+      <div class="drop" style="left: 10%"></div>
+      <div class="drop" style="left: 30%"></div>
+      <div class="drop" style="left: 50%"></div>
+      <div class="drop" style="left: 70%"></div>
+      <div class="drop" style="left: 90%"></div>
+    </div>
+
+    <div class="row">
+      <div class="box narrow">
+        <div class="t">Web Tools</div>
+        <div class="d">curl, headers,<br>dir_brute</div>
+      </div>
+      <div class="box narrow">
+        <div class="t">Network</div>
+        <div class="d">nc, dns_lookup,<br>port_scan</div>
+      </div>
+      <div class="box narrow">
+        <div class="t">File Analysis</div>
+        <div class="d">readfile, strings,<br>hexdump, fileinfo</div>
+      </div>
+      <div class="box narrow">
+        <div class="t">Crypto</div>
+        <div class="d">base64, hash,<br>python scripts</div>
+      </div>
+      <div class="box narrow">
+        <div class="t">MCP / HexStrike</div>
+        <div class="d">150+ tools<br>JSON-RPC + REST</div>
+      </div>
+    </div>
+
+    <div class="merge-up">
+      <div class="h"></div>
+      <div class="rise" style="left: 10%"></div>
+      <div class="rise" style="left: 30%"></div>
+      <div class="rise" style="left: 50%"></div>
+      <div class="rise" style="left: 70%"></div>
+      <div class="rise" style="left: 90%"></div>
+    </div>
+
+    <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+    <div class="box wide">
+      <div class="t">Findings Extraction & Flag Check</div>
+      <div class="d">
+        Parse findings: JSON + NLP<br>
+        (SQLi, XSS, SSTI, RCE, Path Traversal, Auth Bypass ...)<br>
+        Auto-detect vuln type on flag capture<br>
+        Emit SSE events → live stream to frontend<br><br>
+        Break: flag captured (CTF) or ASSESSMENT COMPLETE (pentest)
+      </div>
+    </div>
+
+  </div>
+
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">4. Results & Reporting</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box wide">
+    <div class="t">Results Persistence</div>
+    <div class="d">
+      Store to SQLite: findings[], output[],<br>
+      flag_captured, iteration_count, token_usage
+    </div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <!-- REPORT BRANCHES -->
+  <div class="branch-down" style="max-width: 500px;">
+    <div class="h"></div>
+    <div class="drop" style="left: 15%"></div>
+    <div class="drop" style="left: 50%"></div>
+    <div class="drop" style="left: 85%"></div>
+  </div>
+
+  <div class="row">
+    <div class="box narrow" style="min-width: 160px;">
+      <div class="t">Executive Report</div>
+      <div class="d">C-level audience<br>Risk + business impact<br>Remediation timeline</div>
+    </div>
+    <div class="box narrow" style="min-width: 160px;">
+      <div class="t">Technical Report</div>
+      <div class="d">Security engineers<br>CWE/CVE mappings<br>Code-level fixes</div>
+    </div>
+    <div class="box narrow" style="min-width: 160px;">
+      <div class="t">Full Report</div>
+      <div class="d">Combined audience<br>Exec + Technical<br>30/60/90 day plan</div>
+    </div>
+  </div>
+
+  <div class="merge-up" style="max-width: 500px;">
+    <div class="h"></div>
+    <div class="rise" style="left: 15%"></div>
+    <div class="rise" style="left: 50%"></div>
+    <div class="rise" style="left: 85%"></div>
+  </div>
+
+  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+
+  <div class="box">
+    <div class="t">Export & Download</div>
+    <div class="d">Markdown + PDF generation<br>LLM-powered with template fallback</div>
+  </div>
+
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">5. Parallel Features</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+  <div class="side">
+
+    <div class="panel">
+      <div class="pt">RAG Advisor — Knowledge Base</div>
+      <div class="pd">
+        Upload docs → chunk (512w, 64 overlap)<br>
+        Embed via provider or TF-IDF fallback<br>
+        Query → cosine similarity → top-K<br>
+        → LLM-powered answer with source citations
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">AI Terminal — Interactive Shell</div>
+      <div class="pd">
+        Chat with LLM (streaming responses)<br>
+        Execute shell commands (audit logged)<br>
+        Direct HexStrike MCP connectivity<br>
+        Connection health monitoring
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">6. External Systems</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+  <div class="side">
+
+    <div class="panel">
+      <div class="pt">LLM Providers (10 supported)</div>
+      <div class="pd">
+        LLM Registry → auto-detect API style<br>
+        LLM Gateway → unified chat + streaming<br>
+        Add provider = 1 registry entry<br><br>
+        Ollama (local) · OpenAI · Anthropic Claude<br>
+        Google Gemini · Cerebras · Groq<br>
+        Together AI · DeepSeek · OpenRouter · Custom
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">HexStrike MCP Server v6.0</div>
+      <div class="pd">
+        Python / Flask on 127.0.0.1:8888<br>
+        Intelligent Decision Engine (AI tool selection)<br>
+        Attack Chain Builder (multi-step exploits)<br><br>
+        Network: nmap, masscan, rustscan<br>
+        Web: nuclei, sqlmap, gobuster, ffuf<br>
+        Cloud: prowler, trivy, kube-hunter<br>
+        Binary: ghidra, pwntools, ropper<br>
+        + OSINT, Forensics, Crypto, Mobile
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">7. Data & Security</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+  <div class="side">
+
+    <div class="panel">
+      <div class="pt">SQLite Database (WAL mode)</div>
+      <div class="pd">
+        Tables: users, runs, reports,<br>
+        llm_providers, mcp_servers,<br>
+        rag_documents, rag_chunks,<br>
+        uploads, shell_audit, settings<br><br>
+        Performance indexes, WAL checkpoints,<br>
+        safe ALTER TABLE migrations
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="pt">Security Controls</div>
+      <div class="pd">
+        JWT auth + bcrypt password hashing<br>
+        Command whitelist per category<br>
+        Dangerous pattern blocklist<br>
+        Input sanitization, output limit (50KB)<br>
+        Execution timeout (60s)<br>
+        Shell audit logging, CORS config<br>
+        Rate limiting + circuit breaker
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<!-- ════════════════════════════════════════════ -->
+<div class="sh">Communication Protocols</div>
+<!-- ════════════════════════════════════════════ -->
+
+<div class="flow">
+  <div class="box wide">
+    <div class="d" style="text-align: left;">
+      Frontend  ←→  Backend    :  REST API (JSON) + JWT<br>
+      Backend   →   Frontend   :  SSE (Server-Sent Events) real-time<br>
+      Backend   ←→  LLM        :  HTTP (4 API styles: ollama, openai, anthropic, gemini)<br>
+      Backend   ←→  HexStrike  :  JSON-RPC 2.0 + REST fallback<br>
+      Backend   ←→  SQLite     :  better-sqlite3 (sync)
+    </div>
+  </div>
+</div>
+
+<div class="footer">
+  RedBox — AI-Powered Security Orchestration Platform — H3DD4 — 2026
+</div>
+
+</div>
+</body>
+</html>
