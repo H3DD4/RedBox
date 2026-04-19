@@ -1,7 +1,7 @@
 import { Router, Request, Response } from "express";
 import bcryptjs from "bcryptjs";
 import { getDb } from "../db.js";
-import { generateToken } from "../middleware/auth.js";
+import { generateToken, requireAuth } from "../middleware/auth.js";
 import { AppError } from "../lib/errors.js";
 
 const router = Router();
@@ -41,11 +41,12 @@ router.post("/logout", (_req: Request, res: Response) => {
 });
 
 // GET /api/auth/me
-router.get("/me", (req: Request, res: Response, next) => {
+router.get("/me", requireAuth, (req: Request, res: Response, next) => {
   try {
     if (!req.user) {
       throw new AppError(401, "AUTH_REQUIRED", "Authentication required");
     }
+
     const db = getDb();
     const user = db.prepare("SELECT id, email, created_at FROM users WHERE id = ?").get(req.user.userId) as
       | { id: string; email: string; created_at: string }

@@ -16,6 +16,17 @@ import { useMcp } from "@/context/McpContext";
 
 interface ChatMessage { role: "user" | "assistant"; content: string; timestamp: string; }
 
+interface TerminalSessionState {
+  selectedProvider: string;
+  messages: ChatMessage[];
+  chatInput: string;
+  termLines: TerminalLine[];
+  termInput: string;
+  history: string[];
+  historyIdx: number;
+  showTerminal: boolean;
+}
+
 const detectOS = (): "windows" | "mac" | "linux" => {
   const ua = navigator.userAgent;
   if (/Win/i.test(ua)) return "windows";
@@ -30,29 +41,65 @@ const SHELL_CFG = {
 } as const;
 
 const now = () => new Date().toLocaleTimeString("en-US", { hour12: false });
+const TERMINAL_SESSION_KEY = "redbox_terminal_session_v1";
+
+function loadTerminalSessionState(): TerminalSessionState | null {
+  try {
+    const raw = sessionStorage.getItem(TERMINAL_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<TerminalSessionState>;
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      selectedProvider: typeof parsed.selectedProvider === "string" ? parsed.selectedProvider : "",
+      messages: Array.isArray(parsed.messages) ? parsed.messages as ChatMessage[] : [],
+      chatInput: typeof parsed.chatInput === "string" ? parsed.chatInput : "",
+      termLines: Array.isArray(parsed.termLines) ? parsed.termLines as TerminalLine[] : [],
+      termInput: typeof parsed.termInput === "string" ? parsed.termInput : "",
+      history: Array.isArray(parsed.history)
+        ? parsed.history.filter((item): item is string => typeof item === "string")
+        : [],
+      historyIdx: typeof parsed.historyIdx === "number" ? parsed.historyIdx : -1,
+      showTerminal: typeof parsed.showTerminal === "boolean" ? parsed.showTerminal : true,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveTerminalSessionState(state: TerminalSessionState): void {
+  try {
+    sessionStorage.setItem(TERMINAL_SESSION_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore storage failures.
+  }
+}
 
 const Terminal = () => {
   const { toast } = useToast();
   const os = detectOS();
   const shellCfg = SHELL_CFG[os];
   const { isOnline: isServerOnline, isChecking: isCheckingServer, logs: mcpLogs } = useMcp();
+  const initialSessionRef = useRef<TerminalSessionState | null>(loadTerminalSessionState());
 
   // LLM providers from API
   const [providers,       setProviders]       = useState<LlmProvider[]>([]);
-  const [selectedProvider,setSelectedProvider]= useState<string>("");
+  const [selectedProvider,setSelectedProvider]= useState<string>(initialSessionRef.current?.selectedProvider ?? "");
   const [showModelPicker, setShowModelPicker] = useState(false);
 
   useEffect(() => {
     llmProviders.list().then(({ providers: ps }) => {
       setProviders(ps);
-      const active = ps.find((p) => p.active) || ps[0];
-      if (active) setSelectedProvider(active.id);
+      setSelectedProvider((prev) => {
+        if (prev && ps.some((p) => p.id === prev)) return prev;
+        const active = ps.find((p) => p.active) || ps[0];
+        return active ? active.id : "";
+      });
     }).catch(() => {});
   }, []);
 
   // Chat state
-  const [messages,  setMessages]  = useState<ChatMessage[]>([]);
-  const [chatInput, setChatInput] = useState("");
+  const [messages,  setMessages]  = useState<ChatMessage[]>(initialSessionRef.current?.messages ?? []);
+  const [chatInput, setChatInput] = useState(initialSessionRef.current?.chatInput ?? "");
   const [isSending, setIsSending] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -78,12 +125,25 @@ const Terminal = () => {
   };
 
   // Shell state
-  const [termLines,      setTermLines]      = useState<TerminalLine[]>([]);
-  const [termInput,      setTermInput]      = useState("");
+  const [termLines,      setTermLines]      = useState<TerminalLine[]>(initialSessionRef.current?.termLines ?? []);
+  const [termInput,      setTermInput]      = useState(initialSessionRef.current?.termInput ?? "");
   const [isExecRunning,  setIsExecRunning]  = useState(false);
-  const [history,        setHistory]        = useState<string[]>([]);
-  const [historyIdx,     setHistoryIdx]     = useState(-1);
-  const [showTerminal,   setShowTerminal]   = useState(true);
+  const [history,        setHistory]        = useState<string[]>(initialSessionRef.current?.history ?? []);
+  const [historyIdx,     setHistoryIdx]     = useState(initialSessionRef.current?.historyIdx ?? -1);
+  const [showTerminal,   setShowTerminal]   = useState(initialSessionRef.current?.showTerminal ?? true);
+
+  useEffect(() => {
+    saveTerminalSessionState({
+      selectedProvider,
+      messages: messages.slice(-120),
+      chatInput,
+      termLines: termLines.slice(-500),
+      termInput,
+      history: history.slice(0, 100),
+      historyIdx,
+      showTerminal,
+    });
+  }, [selectedProvider, messages, chatInput, termLines, termInput, history, historyIdx, showTerminal]);
 
   const handleTermSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

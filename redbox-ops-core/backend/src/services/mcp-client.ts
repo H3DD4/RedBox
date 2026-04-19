@@ -6,6 +6,9 @@
 import { config } from "../lib/config.js";
 import { getDb } from "../db.js";
 
+const MCP_HEALTH_TIMEOUT_MS = 12000;
+const MCP_TOOLS_HEALTH_TIMEOUT_MS = 15000;
+
 export interface McpTool {
   name: string;
   description?: string;
@@ -70,7 +73,7 @@ export class McpClient {
     try {
       const response = await fetch(`${this.serverUrl}/health`, {
         method: "GET",
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(MCP_HEALTH_TIMEOUT_MS),
       });
 
       if (response.ok) {
@@ -115,7 +118,7 @@ export class McpClient {
       const healthResponse = await fetch(`${this.serverUrl}/health`, {
         method: "GET",
         headers,
-        signal: AbortSignal.timeout(10000),
+        signal: AbortSignal.timeout(MCP_TOOLS_HEALTH_TIMEOUT_MS),
       });
 
       if (healthResponse.ok) {
@@ -179,6 +182,44 @@ export class McpClient {
       return [];
     } catch (err) {
       console.error("[MCP Client] Error listing tools:", err);
+      return [];
+    }
+  }
+
+  /**
+   * Ask MCP intelligence engine for a compact objective-based tool shortlist.
+   * Falls back to an empty list if endpoint is unavailable.
+   */
+  async selectOptimalTools(
+    target: string,
+    objective: "comprehensive" | "quick" | "stealth" = "quick"
+  ): Promise<string[]> {
+    try {
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+      };
+      if (this.authToken) {
+        headers["Authorization"] = `Bearer ${this.authToken}`;
+      }
+
+      const response = await fetch(`${this.serverUrl}/api/intelligence/select-tools`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ target, objective }),
+        signal: AbortSignal.timeout(12000),
+      });
+
+      if (!response.ok) {
+        return [];
+      }
+
+      const data = await response.json() as { selected_tools?: unknown };
+      if (!Array.isArray(data.selected_tools)) {
+        return [];
+      }
+
+      return [...new Set(data.selected_tools.filter((t): t is string => typeof t === "string" && t.length > 0))];
+    } catch {
       return [];
     }
   }

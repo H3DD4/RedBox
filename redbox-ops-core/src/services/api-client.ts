@@ -166,6 +166,15 @@ export interface Finding {
   evidence?: string;
 }
 
+export interface UserValidatedFindingInput {
+  severity?: string;
+  title: string;
+  cwe?: string;
+  cve?: string;
+  confidence?: string;
+  evidence?: string;
+}
+
 export interface RagDocument {
   id: string;
   name: string;
@@ -444,10 +453,28 @@ export const reports = {
 
   get: (id: string) => request<{ report: Report }>(`/api/reports/${id}`),
 
-  downloadUrl: (id: string, format: "md" | "pdf" = "md") =>
+  downloadUrl: (id: string, format: "html" | "md" | "pdf" = "html") =>
     `${BACKEND_URL}/api/reports/${id}/download?format=${format}`,
 
   delete: (id: string) => json(`/api/reports/${id}`, "DELETE"),
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Experience Memory
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const experiences = {
+  validateRunFinding: (
+    runId: string,
+    finding: UserValidatedFindingInput,
+    status: "validated" | "partial" | "rejected" = "validated"
+  ) => json(`/api/experiences/run/${runId}/findings/validate`, "POST", { finding, status }) as Promise<{
+    success: boolean;
+    experienceId: string;
+    created: boolean;
+    status: "validated" | "partial" | "rejected";
+    findingTitle: string;
+  }>,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

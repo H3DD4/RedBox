@@ -94,12 +94,16 @@ router.post("/:id/test", async (req: Request, res: Response) => {
   const start = Date.now();
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 8000);
-    const resp = await fetch(`${server.url}/health`, {
-      signal: controller.signal,
-      headers: server.auth_token ? { Authorization: `Bearer ${server.auth_token}` } : {},
-    });
-    clearTimeout(timeout);
+    const timeout = setTimeout(() => controller.abort(), 12000);
+    let resp: globalThis.Response;
+    try {
+      resp = await fetch(`${server.url}/health`, {
+        signal: controller.signal,
+        headers: server.auth_token ? { Authorization: `Bearer ${server.auth_token}` } : {},
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     const latency = Date.now() - start;
     res.json({ online: resp.ok, latency_ms: latency, status: resp.status });
   } catch (err) {

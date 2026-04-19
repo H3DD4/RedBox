@@ -23,8 +23,77 @@ const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined)?.re
 type FindingSeverity = "critical" | "high" | "medium" | "low" | "info" | "warning";
 const now = () => new Date().toLocaleTimeString("en-US", { hour12: false });
 
+const ORCHESTRATOR_SESSION_KEY = "redbox_orchestrator_session_v1";
+const DEFAULT_OUTPUT_LINES: TerminalLine[] = [
+  { type: "system", content: "RedBox Orchestrator — ready.", timestamp: now() },
+  { type: "system", content: "Select test type and purpose to see the prompt that will be executed.", timestamp: now() },
+];
+
+interface OrchestratorSessionState {
+  selMcp: string;
+  selProvider: string;
+  testType: string;
+  purpose: string;
+  target: string;
+  scope: string;
+  challengeName: string;
+  flagFormat: string;
+  loginInstructions: string;
+  rulesAvoid: string;
+  rulesFocus: string;
+  isRunning: boolean;
+  runId: string | null;
+  output: TerminalLine[];
+  findings: Finding[];
+  uploadedFiles: { id: string; name: string; path?: string }[];
+  showHistory: boolean;
+}
+
+function loadOrchestratorSessionState(): OrchestratorSessionState | null {
+  try {
+    const raw = sessionStorage.getItem(ORCHESTRATOR_SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<OrchestratorSessionState>;
+    if (!parsed || typeof parsed !== "object") return null;
+    return {
+      selMcp: typeof parsed.selMcp === "string" ? parsed.selMcp : "",
+      selProvider: typeof parsed.selProvider === "string" ? parsed.selProvider : "",
+      testType: typeof parsed.testType === "string" ? parsed.testType : "",
+      purpose: typeof parsed.purpose === "string" ? parsed.purpose : "",
+      target: typeof parsed.target === "string" ? parsed.target : "",
+      scope: typeof parsed.scope === "string" ? parsed.scope : "",
+      challengeName: typeof parsed.challengeName === "string" ? parsed.challengeName : "",
+      flagFormat: typeof parsed.flagFormat === "string" ? parsed.flagFormat : "",
+      loginInstructions: typeof parsed.loginInstructions === "string" ? parsed.loginInstructions : "",
+      rulesAvoid: typeof parsed.rulesAvoid === "string" ? parsed.rulesAvoid : "",
+      rulesFocus: typeof parsed.rulesFocus === "string" ? parsed.rulesFocus : "",
+      isRunning: Boolean(parsed.isRunning),
+      runId: typeof parsed.runId === "string" ? parsed.runId : null,
+      output: Array.isArray(parsed.output) ? parsed.output as TerminalLine[] : DEFAULT_OUTPUT_LINES,
+      findings: Array.isArray(parsed.findings) ? parsed.findings as Finding[] : [],
+      uploadedFiles: Array.isArray(parsed.uploadedFiles)
+        ? parsed.uploadedFiles.filter((f): f is { id: string; name: string; path?: string } =>
+            !!f && typeof f === "object" && typeof (f as { id?: unknown }).id === "string" && typeof (f as { name?: unknown }).name === "string"
+          )
+        : [],
+      showHistory: Boolean(parsed.showHistory),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function saveOrchestratorSessionState(state: OrchestratorSessionState): void {
+  try {
+    sessionStorage.setItem(ORCHESTRATOR_SESSION_KEY, JSON.stringify(state));
+  } catch {
+    // Ignore storage write failures.
+  }
+}
+
 const Orchestrator = () => {
   const { toast } = useToast();
+  const initialSessionRef = useRef<OrchestratorSessionState | null>(loadOrchestratorSessionState());
 
   // ── Config from API ──
   const [testTypes, setTestTypes] = useState<TestTypeOption[]>([]);
@@ -34,37 +103,36 @@ const Orchestrator = () => {
   // ── Selectors ──
   const [mcpList, setMcpList] = useState<McpServer[]>([]);
   const [providerList, setProviderList] = useState<LlmProvider[]>([]);
-  const [selMcp, setSelMcp] = useState("");
-  const [selProvider, setSelProvider] = useState("");
-  const [testType, setTestType] = useState("");
-  const [purpose, setPurpose] = useState("");
-  const [target, setTarget] = useState("");
-  const [scope, setScope] = useState("");
-  const [challengeName, setChallengeName] = useState("");
+  const [selMcp, setSelMcp] = useState(initialSessionRef.current?.selMcp ?? "");
+  const [selProvider, setSelProvider] = useState(initialSessionRef.current?.selProvider ?? "");
+  const [testType, setTestType] = useState(initialSessionRef.current?.testType ?? "");
+  const [purpose, setPurpose] = useState(initialSessionRef.current?.purpose ?? "");
+  const [target, setTarget] = useState(initialSessionRef.current?.target ?? "");
+  const [scope, setScope] = useState(initialSessionRef.current?.scope ?? "");
+  const [challengeName, setChallengeName] = useState(initialSessionRef.current?.challengeName ?? "");
   // FIXED: UI-01, UI-04 — new form state variables
-  const [flagFormat, setFlagFormat] = useState("");
-  const [loginInstructions, setLoginInstructions] = useState("");
-  const [rulesAvoid, setRulesAvoid] = useState("");
-  const [rulesFocus, setRulesFocus] = useState("");
+  const [flagFormat, setFlagFormat] = useState(initialSessionRef.current?.flagFormat ?? "");
+  const [loginInstructions, setLoginInstructions] = useState(initialSessionRef.current?.loginInstructions ?? "");
+  const [rulesAvoid, setRulesAvoid] = useState(initialSessionRef.current?.rulesAvoid ?? "");
+  const [rulesFocus, setRulesFocus] = useState(initialSessionRef.current?.rulesFocus ?? "");
 
   // ── Run state ──
-  const [isRunning, setIsRunning] = useState(false);
-  const [runId, setRunId] = useState<string | null>(null);
-  const [output, setOutput] = useState<TerminalLine[]>([
-    { type: "system", content: "RedBox Orchestrator — ready.", timestamp: now() },
-    { type: "system", content: "Select test type and purpose to see the prompt that will be executed.", timestamp: now() },
-  ]);
-  const [findings, setFindings] = useState<Finding[]>([]);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const [isRunning, setIsRunning] = useState(initialSessionRef.current?.isRunning ?? false);
+  const [runId, setRunId] = useState<string | null>(initialSessionRef.current?.runId ?? null);
+  const [output, setOutput] = useState<TerminalLine[]>(
+    initialSessionRef.current?.output?.length ? initialSessionRef.current.output : DEFAULT_OUTPUT_LINES
+  );
+  const [findings, setFindings] = useState<Finding[]>(initialSessionRef.current?.findings ?? []);
+  const streamAbortRef = useRef<AbortController | null>(null);
 
   // ── Uploads ──
-  const [uploadedFiles, setUploadedFiles] = useState<{ id: string; name: string; path?: string }[]>([]);
+  const [uploadedFiles, setUploadedFiles] = useState<{ id: string; name: string; path?: string }[]>(initialSessionRef.current?.uploadedFiles ?? []);
   const [isUploading, setIsUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // ── Run history ──
   const [runs, setRuns] = useState<Run[]>([]);
-  const [showHistory, setShowHistory] = useState(false);
+  const [showHistory, setShowHistory] = useState(initialSessionRef.current?.showHistory ?? false);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [deletingRunId, setDeletingRunId] = useState<string | null>(null);
 
@@ -209,20 +277,24 @@ const Orchestrator = () => {
     orchestrator.config().then(({ testTypes: tt, purposes: pp }) => {
       setTestTypes(tt);
       setPurposes(pp);
-      if (tt.length > 0) setTestType(tt[0].value);
-      if (pp.length > 0) setPurpose(pp[0].value);
+      setTestType((prev) => prev || tt[0]?.value || "");
+      setPurpose((prev) => prev || pp[0]?.value || "");
     }).catch(() => {});
 
     mcpServers.list().then(({ servers }) => {
       setMcpList(servers);
       const def = servers.find((s) => s.is_default) || servers[0];
-      if (def) setSelMcp(def.id);
+      if (def) {
+        setSelMcp((prev) => prev || def.id);
+      }
     }).catch(() => {});
 
     llmProviders.list().then(({ providers }) => {
       setProviderList(providers);
       const active = providers.find((p) => p.active) || providers[0];
-      if (active) setSelProvider(active.id);
+      if (active) {
+        setSelProvider((prev) => prev || active.id);
+      }
     }).catch(() => {});
 
     refreshRuns();
@@ -238,6 +310,46 @@ const Orchestrator = () => {
       setRouteInfo(route);
     }).catch(() => setRouteInfo(null));
   }, [testType, purpose]);
+
+  useEffect(() => {
+    saveOrchestratorSessionState({
+      selMcp,
+      selProvider,
+      testType,
+      purpose,
+      target,
+      scope,
+      challengeName,
+      flagFormat,
+      loginInstructions,
+      rulesAvoid,
+      rulesFocus,
+      isRunning,
+      runId,
+      output: output.slice(-400),
+      findings: findings.slice(-200),
+      uploadedFiles,
+      showHistory,
+    });
+  }, [
+    selMcp,
+    selProvider,
+    testType,
+    purpose,
+    target,
+    scope,
+    challengeName,
+    flagFormat,
+    loginInstructions,
+    rulesAvoid,
+    rulesFocus,
+    isRunning,
+    runId,
+    output,
+    findings,
+    uploadedFiles,
+    showHistory,
+  ]);
 
   // File upload
   const handleFileSelect = async (files: FileList | null) => {
@@ -266,9 +378,13 @@ const Orchestrator = () => {
 
   // SSE stream handler
   const connectStream = useCallback((id: string) => {
-    if (eventSourceRef.current) eventSourceRef.current.close();
+    if (streamAbortRef.current) {
+      streamAbortRef.current.abort();
+    }
+
     const token = localStorage.getItem("redbox_token") || "";
     const ctrl = new AbortController();
+    streamAbortRef.current = ctrl;
     const url = `${BACKEND_URL}/api/orchestrator/runs/${id}/stream`;
 
     fetch(url, {
@@ -312,20 +428,69 @@ const Orchestrator = () => {
               appendLine({ type: "system", content: "— Run complete —", timestamp: now() });
               setIsRunning(false);
               refreshRuns();
+              streamAbortRef.current = null;
               ctrl.abort();
             }
           } catch { /* skip */ }
         }
       }
     }).catch((err) => {
+      streamAbortRef.current = null;
       if (err.name !== "AbortError") {
         appendLine({ type: "error", content: `Stream error: ${err.message}`, timestamp: now() });
         setIsRunning(false);
       }
     });
-
-    return () => ctrl.abort();
   }, [appendLine]);
+
+  useEffect(() => {
+    if (!runId) return;
+
+    let cancelled = false;
+    orchestrator.getRun(runId)
+      .then(({ run }) => {
+        if (cancelled) return;
+
+        if (Array.isArray(run.findings)) {
+          setFindings(run.findings);
+        }
+
+        if (Array.isArray(run.output) && run.output.length > 0) {
+          setOutput((prev) => {
+            if (prev.length > DEFAULT_OUTPUT_LINES.length) return prev;
+            return run.output.slice(-120).map((entry) => ({
+              type: "output",
+              content: `${entry.step}: ${entry.output}`,
+              timestamp: now(),
+            } as TerminalLine));
+          });
+        }
+
+        const active = run.status === "running" || run.status === "pending";
+        setIsRunning(active);
+        if (active) {
+          connectStream(runId);
+        }
+      })
+      .catch(() => {
+        if (!cancelled && isRunning) {
+          connectStream(runId);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, connectStream]);
+
+  useEffect(() => {
+    return () => {
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+        streamAbortRef.current = null;
+      }
+    };
+  }, []);
 
   const handleRun = async () => {
     // Target is required UNLESS files are uploaded
@@ -389,7 +554,7 @@ const Orchestrator = () => {
     try {
       const { report } = await reports.generate(runId, type);
       toast({ title: "Report ready", description: `${type} report generated (ID: ${report.id.slice(0,8)})` });
-      window.open(reports.downloadUrl(report.id, "md"), "_blank");
+      window.open(reports.downloadUrl(report.id, "html"), "_blank");
     } catch (err) {
       toast({ title: "Report failed", description: (err as {error?:string}).error || "error", variant: "destructive" });
     }
@@ -782,7 +947,7 @@ const Orchestrator = () => {
                     className="w-full flex items-center gap-2 px-3 py-2 text-sm bg-zinc-800/80 border border-zinc-700/50 text-zinc-300 hover:text-red-400 hover:border-red-500/30 font-mono rounded-md transition-all"
                   >
                     <Download className="w-3.5 h-3.5" />
-                    {type.charAt(0).toUpperCase() + type.slice(1)} Report (.md)
+                    {type.charAt(0).toUpperCase() + type.slice(1)} Report (styled)
                   </button>
                 ))}
               </div>

@@ -9040,11 +9040,31 @@ class FileOperationsManager:
 # Global file operations manager
 file_manager = FileOperationsManager()
 
+# Health endpoint cache to avoid expensive full tool scans on every probe.
+HEALTH_CACHE_TTL_SECONDS = 60
+_health_cache_data = None
+_health_cache_expires_at = 0.0
+_health_cache_lock = threading.Lock()
+
 # API Routes
 
 @app.route("/health", methods=["GET"])
 def health_check():
     """Health check endpoint with comprehensive tool detection"""
+
+    global _health_cache_data, _health_cache_expires_at
+
+    now = time.time()
+    with _health_cache_lock:
+        if _health_cache_data is not None and now < _health_cache_expires_at:
+            cached_payload = dict(_health_cache_data)
+            cache_meta = dict(cached_payload.get("health_cache", {}))
+            cache_meta.update({
+                "cached": True,
+                "age_seconds": round(max(0.0, now - cache_meta.get("generated_at", now)), 3)
+            })
+            cached_payload["health_cache"] = cache_meta
+            return jsonify(cached_payload)
 
     essential_tools = [
         "nmap", "gobuster", "dirb", "nikto", "sqlmap", "hydra", "john", "hashcat"
@@ -9141,7 +9161,7 @@ def health_check():
         "additional": {"total": len(additional_tools), "available": sum(1 for tool in additional_tools if tools_status.get(tool, False))}
     }
 
-    return jsonify({
+    payload = {
         "status": "healthy",
         "message": "HexStrike AI Tools API Server is operational",
         "version": "6.0.0",
@@ -9152,8 +9172,19 @@ def health_check():
         "category_stats": category_stats,
         "cache_stats": cache.get_stats(),
         "telemetry": telemetry.get_stats(),
-        "uptime": time.time() - telemetry.stats["start_time"]
-    })
+        "uptime": time.time() - telemetry.stats["start_time"],
+        "health_cache": {
+            "cached": False,
+            "ttl_seconds": HEALTH_CACHE_TTL_SECONDS,
+            "generated_at": now,
+        },
+    }
+
+    with _health_cache_lock:
+        _health_cache_data = payload
+        _health_cache_expires_at = time.time() + HEALTH_CACHE_TTL_SECONDS
+
+    return jsonify(payload)
 
 @app.route("/api/command", methods=["POST"])
 def generic_command():
@@ -13158,7 +13189,7 @@ def httpx():
     """Execute httpx for fast HTTP probing and technology detection"""
     try:
         params = request.json
-        target = params.get("target", "")
+        target = params.get("target", "") or params.get("url", "") or params.get("targets", "")
         probe = params.get("probe", True)
         tech_detect = params.get("tech_detect", False)
         status_code = params.get("status_code", False)
@@ -13172,7 +13203,11 @@ def httpx():
             logger.warning("🌐 httpx called without target parameter")
             return jsonify({"error": "Target parameter is required"}), 400
 
-        command = f"httpx -l {target} -t {threads}"
+        target = str(target).strip()
+        if target.startswith(("http://", "https://")):
+            command = f"httpx -u \"{target}\" -t {threads}"
+        else:
+            command = f"httpx -l \"{target}\" -t {threads}"
 
         if probe:
             command += " -probe"

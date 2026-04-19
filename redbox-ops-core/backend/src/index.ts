@@ -20,6 +20,7 @@ import ragRoutes from "./routes/rag.js";
 import reportRoutes from "./routes/reports.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import chatRoutes from "./routes/chat.js";
+import experienceRouter from "./routes/experience.js";
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 const app = express();
@@ -60,6 +61,7 @@ app.use("/api/rag", requireAuth, ragRoutes);
 app.use("/api/reports", optionalAuth, reportRoutes); // FIXED: Make reports accessible without strict auth
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
 app.use("/api/chat", requireAuth, chatRoutes);
+app.use("/api/experiences", experienceRouter);
 
 // ─── Error handling ──────────────────────────────────────────────────────────
 app.use(notFound);

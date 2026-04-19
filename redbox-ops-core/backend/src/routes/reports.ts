@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { generateReport, generatePDF, listReports, getReport, deleteReport } from "../services/report-generator.js";
+import { generateReport, generatePDF, generateStyledHtmlReport, listReports, getReport, deleteReport } from "../services/report-generator.js";
 import { AppError } from "../lib/errors.js";
 
 const router = Router();
@@ -47,13 +47,18 @@ router.get("/:id/download", async (req: Request, res: Response, next) => {
     if (!report) throw new AppError(404, "NOT_FOUND", "Report not found");
     if (!report.content) throw new AppError(400, "NOT_READY", "Report content not yet generated");
     
-    const format = req.query.format as string || "md";
+    const format = (req.query.format as string || "html").toLowerCase();
     
     if (format === "pdf") {
       const pdf = await generatePDF(report.content);
       res.setHeader("Content-Type", "application/pdf");
       res.setHeader("Content-Disposition", `attachment; filename="report-${report.type}-${report.id.slice(0, 8)}.pdf"`);
       res.send(pdf);
+    } else if (format === "html") {
+      const html = generateStyledHtmlReport(report.id);
+      res.setHeader("Content-Type", "text/html; charset=utf-8");
+      res.setHeader("Content-Disposition", `inline; filename="report-${report.type}-${report.id.slice(0, 8)}.html"`);
+      res.send(html);
     } else {
       res.setHeader("Content-Type", "text/markdown");
       res.setHeader("Content-Disposition", `attachment; filename="report-${report.type}-${report.id.slice(0, 8)}.md"`);

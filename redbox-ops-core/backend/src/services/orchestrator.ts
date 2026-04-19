@@ -10,6 +10,11 @@ import path from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
 import { McpClient } from "./mcp-client.js";
+import { compressOutput, detectDeadEnd, detectSuccess } from './output-compressor.js';
+import { getToolsForPhase, inferPhaseFromStep } from './tool-router.js';
+import { createAttackState, recordResult, detectLoop, advancePhase, type AttackPhase } from './attack-state.js';
+import { findSimilarExperience, saveRawExperience } from './experience-memory.js';
+import { hashParams } from './tool-executor.js';
 
 const execAsync = promisify(exec);
 
@@ -69,6 +74,7 @@ interface RuntimeToolContext {
   builtInTools: string[];
   availableMcpTools: string[];
   preferredMcpTools: string[];
+  suggestedMcpTools: string[];
 }
 
 const MAX_ITERATIONS = 30;
@@ -230,6 +236,44 @@ function validateCommand(command: string, category: string): { isValid: boolean;
   }
 
   return { isValid: true, reason: "Valid" };
+}
+
+function normalizeMcpToolParams(toolName: string, params: Record<string, unknown>): Record<string, unknown> {
+  const normalizedTool = normalizeToolName(toolName);
+  const out: Record<string, unknown> = { ...params };
+
+  if (normalizedTool !== "httpx") {
+    return out;
+  }
+
+  // Accept model-friendly aliases and map to HexStrike HTTPx endpoint contract.
+  if (!out.target && typeof out.url === "string") {
+    out.target = out.url;
+  }
+
+  const options = Array.isArray(out.options)
+    ? out.options.map((v) => String(v).toLowerCase())
+    : [];
+
+  if (options.length > 0) {
+    if (options.some((o) => o.includes("status-code") || o === "-sc")) out.status_code = true;
+    if (options.some((o) => o.includes("title") || o === "-title")) out.title = true;
+    if (options.some((o) => o.includes("tech-detect") || o.includes("tech"))) out.tech_detect = true;
+    if (options.some((o) => o.includes("content-length") || o === "-cl")) out.content_length = true;
+    if (options.some((o) => o.includes("server") || o === "-server")) out.web_server = true;
+
+    const consumed = new Set(["-status-code", "-sc", "-title", "-tech-detect", "-tech", "-content-length", "-cl", "-server"]);
+    const remaining = options.filter((o) => !consumed.has(o));
+    if (remaining.length > 0 && !out.additional_args) {
+      out.additional_args = remaining.join(" ");
+    }
+  }
+
+  if (out.probe === undefined) {
+    out.probe = true;
+  }
+
+  return out;
 }
 
 /**
@@ -436,9 +480,10 @@ async function executeTool(
     console.log(`[Run ${runId}] Attempting MCP tool execution: ${toolName}`);
     try {
       const client = McpClient.getClient(mcpServerId);
+      const mcpParams = normalizeMcpToolParams(toolName, params);
 
       // Try tool execution first
-      const result = await client.executeTool(toolName, params);
+      const result = await client.executeTool(toolName, mcpParams);
 
       if (result.success && result.output) {
         console.log(`[Run ${runId}] MCP tool ${toolName} succeeded`);
@@ -448,7 +493,7 @@ async function executeTool(
       // If tool not found, try as a command
       if (result.error?.includes("not found") || result.error?.includes("not recognized") || result.error?.includes("405")) {
         console.log(`[Run ${runId}] Tool not found or 405, trying as command: ${toolName}`);
-        const cmdResult = await client.executeCommand(toolName, params);
+        const cmdResult = await client.executeCommand(toolName, mcpParams);
         if (cmdResult.success && cmdResult.output) {
           console.log(`[Run ${runId}] MCP command ${toolName} succeeded`);
           return cmdResult.output;
@@ -796,6 +841,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
 function parseFindings(text: string): Finding[] {
   const findings: Finding[] = [];
+  const hasConfirmedContext = hasConfirmedFindingContext(text);
 
   // First, try original JSON parsing
   try {
@@ -818,6 +864,11 @@ function parseFindings(text: string): Finding[] {
     }
   } catch {
     // Not valid JSON, continue with text parsing
+  }
+
+  // Heuristic parsing is only enabled when the response indicates confirmed evidence.
+  if (!hasConfirmedContext) {
+    return dedupeAndSanitizeFindings(findings);
   }
 
   // Enhanced natural language parsing for vulnerabilities
@@ -913,11 +964,7 @@ function parseFindings(text: string): Finding[] {
   }
 
   // Remove duplicates based on title
-  const uniqueFindings = findings.filter((finding, index, self) =>
-    index === self.findIndex(f => f.title === finding.title)
-  );
-
-  return uniqueFindings;
+  return dedupeAndSanitizeFindings(findings);
 }
 
 function normalizeSeverity(s: string): string {
@@ -927,6 +974,140 @@ function normalizeSeverity(s: string): string {
   if (["medium", "med", "moderate", "warning"].includes(lower)) return "medium";
   if (["low", "l"].includes(lower)) return "low";
   return "info";
+}
+
+function countPatternMatches(text: string, pattern: RegExp): number {
+  return text.match(pattern)?.length || 0;
+}
+
+function hasConfirmedFindingContext(text: string): boolean {
+  const normalized = (text || "").toLowerCase();
+  const confirmations = countPatternMatches(
+    normalized,
+    /(vulnerable|vulnerability|confirmed|exploited|successful(?:ly)?|bypass(?:ed)?|captured|retrieved|dumped|extracted|disclosed|proof|evidence|found)/g
+  );
+  const tentative = countPatternMatches(
+    normalized,
+    /(try|trying|test(?:ing)?|check(?:ing)?|attempt(?:ing)?|possible|potential|might|could|maybe|next action|hypothesis)/g
+  );
+
+  if (extractFlag(text) !== null) return true;
+  return confirmations > tentative;
+}
+
+function isSpamFinding(finding: Finding): boolean {
+  const title = (finding.title || "").trim();
+  const evidence = (finding.evidence || "").trim();
+  const combined = `${title} ${evidence}`.toLowerCase();
+
+  if (!title || title === "Unknown") return true;
+  if (title.length < 4 || title.length > 180) return true;
+  if (/placeholder|example|dummy|sample|todo|tbd|lorem ipsum/.test(combined)) return true;
+  if (/[{}]{3,}|\.{3,}/.test(combined)) return true;
+
+  return false;
+}
+
+function dedupeAndSanitizeFindings(findings: Finding[]): Finding[] {
+  const seen = new Set<string>();
+  const cleaned: Finding[] = [];
+
+  for (const raw of findings) {
+    const finding: Finding = {
+      severity: normalizeSeverity(raw.severity || "info"),
+      title: (raw.title || "").trim(),
+      cwe: raw.cwe || undefined,
+      cve: raw.cve || undefined,
+      confidence: raw.confidence || undefined,
+      evidence: raw.evidence || undefined,
+    };
+
+    if (isSpamFinding(finding)) continue;
+
+    const key = `${finding.title.toLowerCase()}|${(finding.cwe || "").toLowerCase()}|${(finding.cve || "").toLowerCase()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    cleaned.push(finding);
+  }
+
+  return cleaned;
+}
+
+function validateExperienceCapture(
+  cfg: RunConfig,
+  tool: string,
+  rawOutput: string,
+  successSignal?: string
+): { valid: boolean; outputSignature?: string; reason?: string } {
+  const output = rawOutput || "";
+  const normalizedTool = normalizeToolName(tool);
+
+  if (!output.trim() || output.trim().length < 12) {
+    return { valid: false, reason: "empty or too-short output" };
+  }
+
+  if (["listtools", "listmcptools", "toolcatalog"].includes(normalizedTool)) {
+    return { valid: false, reason: "tool catalog output is not exploit evidence" };
+  }
+
+  if (/placeholder|example|dummy|sample|your_flag|actual_flag|replace_this/i.test(output)) {
+    return { valid: false, reason: "placeholder output" };
+  }
+
+  const verifiedFlag = extractFlag(output, cfg.flagFormat);
+  if (verifiedFlag) {
+    return { valid: true, outputSignature: `FLAG: ${verifiedFlag}` };
+  }
+
+  // For CTF memory quality, persist only with direct raw-output flag evidence.
+  if (cfg.purpose === "ctf") {
+    return { valid: false, reason: "ctf memory requires raw-output flag evidence" };
+  }
+
+  if (!successSignal) {
+    return { valid: false, reason: "no success signal" };
+  }
+
+  switch (successSignal) {
+    case "LFI_CONFIRMED": {
+      const indicators = [
+        /root:x:0:0:/i,
+        /daemon:x:\d+:\d+:/i,
+        /\/etc\/passwd/i,
+        /\/bin\/(?:bash|sh)/i,
+      ];
+      const score = indicators.filter((re) => re.test(output)).length;
+      if (score >= 2) return { valid: true, outputSignature: successSignal };
+      return { valid: false, reason: "weak LFI evidence" };
+    }
+    case "SQLI_CONFIRMED": {
+      const indicators = [
+        /you have an error in your sql syntax/i,
+        /sqlstate\[[a-z0-9]+\]/i,
+        /\bunion\b\s+\bselect\b/i,
+        /information_schema/i,
+        /sqlite.*(?:error|syntax)/i,
+        /ora-\d{5}/i,
+      ];
+      const score = indicators.filter((re) => re.test(output)).length;
+      if (score >= 2) return { valid: true, outputSignature: successSignal };
+      return { valid: false, reason: "weak SQLi evidence" };
+    }
+    case "RCE_CONFIRMED": {
+      const indicators = [
+        /\buid=\d+\(/i,
+        /\bgid=\d+\(/i,
+        /RCE_CANARY_REDBOX/i,
+        /\/bin\/(?:bash|sh)/i,
+        /windows\\system32/i,
+      ];
+      const score = indicators.filter((re) => re.test(output)).length;
+      if (score >= 1) return { valid: true, outputSignature: successSignal };
+      return { valid: false, reason: "weak RCE evidence" };
+    }
+    default:
+      return { valid: false, reason: `unsupported success signal: ${successSignal}` };
+  }
 }
 
 /**
@@ -1015,13 +1196,46 @@ function normalizeToolName(name: string): string {
   return (name || "").toLowerCase().replace(/[_\-\s]+/g, "");
 }
 
+function summarizeTools(tools: string[], max = 14): string {
+  if (tools.length === 0) return "none";
+  const shown = tools.slice(0, max).join(", ");
+  const remaining = tools.length - max;
+  return remaining > 0 ? `${shown} (+${remaining} more)` : shown;
+}
+
+function getToolObjectiveFromPurpose(purpose: string): "comprehensive" | "quick" | "stealth" {
+  if (purpose === "redteam") return "stealth";
+  if (purpose === "pentest" || purpose === "research") return "comprehensive";
+  return "quick";
+}
+
+function buildToolCatalog(toolContext: RuntimeToolContext): string {
+  const builtIn = [...new Set(toolContext.builtInTools)].sort((a, b) => a.localeCompare(b));
+  const mcp = [...new Set(toolContext.availableMcpTools)].sort((a, b) => a.localeCompare(b));
+
+  return [
+    `BUILT_IN_TOOLS (${builtIn.length}):`,
+    builtIn.join(", ") || "none",
+    "",
+    `MCP_TOOLS_AVAILABLE (${mcp.length}):`,
+    mcp.join(", ") || "none",
+  ].join("\n");
+}
+
 async function buildRuntimeToolContext(cfg: RunConfig, route: TaskRoute): Promise<RuntimeToolContext> {
   const builtInTools = [
-    "readfile", "strings", "hexdump", "fileinfo",
-    "http_request", "directory_brute", "headers_check",
-    "nc", "dns_lookup",
-    "base64_decode", "base64_encode", "hash",
-    "python", "shell",
+    "list_tools",
+    "http_request", "curl", "fetch", "request",
+    "headers_check", "headerscheck",
+    "directory_brute", "directorybrute", "dir_brute", "dirbrute", "pathcheck",
+    "nc", "netcat", "connect",
+    "dns_lookup", "dnslookup", "dig", "dns",
+    "nmap_scan", "nmapscan", "port_scan", "portscan", "portcheck",
+    "readfile", "cat", "type", "strings", "hexdump", "xxd", "fileinfo", "file",
+    "base64_decode", "base64decode", "b64decode", "base64_encode", "base64encode", "b64encode",
+    "hash", "md5", "sha256",
+    "python", "python_script", "pythonscript",
+    "shell", "exec", "command",
   ];
 
   try {
@@ -1032,14 +1246,21 @@ async function buildRuntimeToolContext(cfg: RunConfig, route: TaskRoute): Promis
     ).sort((a, b) => a.localeCompare(b));
 
     const availableNorm = new Set(availableMcpTools.map(normalizeToolName));
+    const suggestedMcpTools = (await client.selectOptimalTools(cfg.target, getToolObjectiveFromPurpose(cfg.purpose)))
+      .filter((tool) => availableNorm.has(normalizeToolName(tool)))
+      .sort((a, b) => a.localeCompare(b));
+
     const preferredMcpTools = Array.from(
-      new Set((route.mcpTools || []).filter((tool) => availableNorm.has(normalizeToolName(tool))))
+      new Set([
+        ...(route.mcpTools || []).filter((tool) => availableNorm.has(normalizeToolName(tool))),
+        ...suggestedMcpTools,
+      ])
     ).sort((a, b) => a.localeCompare(b));
 
-    return { builtInTools, availableMcpTools, preferredMcpTools };
+    return { builtInTools, availableMcpTools, preferredMcpTools, suggestedMcpTools };
   } catch (err) {
     console.warn("[Orchestrator] Failed to load MCP tools for runtime context:", err);
-    return { builtInTools, availableMcpTools: [], preferredMcpTools: [] };
+    return { builtInTools, availableMcpTools: [], preferredMcpTools: [], suggestedMcpTools: [] };
   }
 }
 
@@ -1460,8 +1681,56 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
 
   console.log(`[Run ${runId}] Agent loop starting - ${route.promptFile || "direct"}`);
 
+  // ── Attack State Integration ──────────────────────────────────────────────
+  const stepName_ = route.promptFile?.replace(".txt", "") || "analysis";
+  const attackPhase = inferPhaseFromStep(stepName_) as AttackPhase;
+  const attackState = createAttackState(runId, cfg.target, cfg.testType, attackPhase);
+  const pastExperience = findSimilarExperience({ testType: cfg.testType, phase: attackPhase, targetSignature: cfg.target, triggerCondition: stepName_ });
+  if (pastExperience) {
+    console.log(`[Run ${runId}] Found past experience: ${pastExperience.tool} (q=${pastExperience.q_value})`);
+    emit(runId, { type: "status", content: `📚 Using past experience: ${pastExperience.tool} (confidence: ${pastExperience.q_value.toFixed(2)})`, timestamp: new Date().toISOString() });
+    messages.push({
+      role: "user",
+      content: `Memory hint: previously effective tool was ${pastExperience.tool} (confidence ${pastExperience.q_value.toFixed(2)}).`,
+    });
+  }
+  let availablePhaseTools = getToolsForPhase(
+    attackPhase,
+    cfg.testType,
+    attackState.deadEndTools,
+    runtimeToolContext.availableMcpTools
+  );
+  console.log(`[Run ${runId}] Phase: ${attackPhase}, Available tools: [${availablePhaseTools.join(', ')}]`);
+  if (availablePhaseTools.length > 0) {
+    messages.push({
+      role: "user",
+      content: `Phase ${attackState.phase} preferred tools: ${availablePhaseTools.join(', ')}. Choose one action from this set when possible.`,
+    });
+  }
+  const stepActionLog: string[] = [];
+  let experienceSaved = false;
+
   // AGENT LOOP
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+    // ── Loop Detection ──────────────────────────────────────────────────────
+    if (detectLoop(attackState)) {
+      emit(runId, { type: "status", content: `⚠️ Loop detected at iteration ${iteration} — advancing phase`, timestamp: new Date().toISOString() });
+      advancePhase(attackState);
+      availablePhaseTools = getToolsForPhase(
+        attackState.phase,
+        cfg.testType,
+        attackState.deadEndTools,
+        runtimeToolContext.availableMcpTools
+      );
+      if (availablePhaseTools.length > 0) {
+        messages.push({
+          role: "user",
+          content: `Loop detected. Switch to phase ${attackState.phase}. Prefer: ${availablePhaseTools.join(', ')}`,
+        });
+      }
+      console.log(`[Run ${runId}] Phase advanced to: ${attackState.phase}`);
+    }
+
     if (checkStopped()) {
       emit(runId, { type: "status", content: "Stopped by user", timestamp: new Date().toISOString() });
       db.prepare("UPDATE runs SET status = 'stopped', completed_at = datetime('now') WHERE id = ?").run(runId);
@@ -1537,21 +1806,15 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
       // Stream to client
       emit(runId, { type: "step_output", step: stepName, content: response, timestamp: new Date().toISOString() });
 
-      // Check for flag in response
-      // FIXED: BUG-04 — pass custom flag format
-      const flag = extractFlag(response, cfg.flagFormat);
-      if (flag && !flagCaptured) {
-        flagCaptured = flag;
-        console.log(`[Run ${runId}] 🚩 FLAG FOUND: ${flag}`);
-        emit(runId, { type: "status", content: `🚩 FLAG CAPTURED: ${flag}`, timestamp: new Date().toISOString() });
-
-        // CRITICAL FIX: Automatically detect vulnerability when flag is captured
-        const exploitedVuln = detectVulnerabilityFromResponse(response, flag);
-        if (exploitedVuln && !allFindings.some(f => f.title === exploitedVuln.title)) {
-          allFindings.push(exploitedVuln);
-          emit(runId, { type: "finding", data: exploitedVuln, timestamp: new Date().toISOString() });
-          console.log(`[Run ${runId}] 🔍 AUTO-DETECTED VULNERABILITY: ${exploitedVuln.title}`);
-        }
+      // Do not trust assistant-declared flags until raw tool output confirms them.
+      const mentionedFlag = extractFlag(response, cfg.flagFormat);
+      if (mentionedFlag && !flagCaptured) {
+        console.warn(`[Run ${runId}] Flag mentioned by model but not yet verified by tool output: ${mentionedFlag}`);
+        emit(runId, {
+          type: "status",
+          content: "⚠️ Flag mention detected in model response; waiting for tool-output verification.",
+          timestamp: new Date().toISOString(),
+        });
       }
 
       // Parse findings
@@ -1696,6 +1959,25 @@ What is your next ACTION?`,
           timestamp: new Date().toISOString(),
         });
 
+        emit(runId, {
+          type: "status",
+          content: `[${stepName}:${iteration}] → ${tool}`,
+          timestamp: new Date().toISOString(),
+        });
+
+        const normalizedActionTool = normalizeToolName(tool);
+        if (normalizedActionTool === "listtools" || normalizedActionTool === "listmcptools" || normalizedActionTool === "toolcatalog") {
+          const catalog = buildToolCatalog(runtimeToolContext);
+          results.push(`[TOOL: ${tool}]\n${catalog}`);
+          emit(runId, {
+            type: "tool_result",
+            content: `Listed ${runtimeToolContext.builtInTools.length} built-in aliases and ${runtimeToolContext.availableMcpTools.length} MCP tools`,
+            data: { tool, success: true },
+            timestamp: new Date().toISOString(),
+          });
+          continue;
+        }
+
         const result = await executeTool(tool, params, runId, cfg.mcpServerId);
 
         // FIXED: ISSUE-06 — Intelligent token-aware truncation for tool results
@@ -1727,6 +2009,8 @@ What is your next ACTION?`,
         }
 
         results.push(`[TOOL: ${tool}]\n${truncated}`);
+        const currentAction = `${tool}(${JSON.stringify(params).slice(0,60)})`;
+        stepActionLog.push(currentAction);
 
         // Check for flag in tool result
         // FIXED: BUG-04 — pass custom flag format
@@ -1735,6 +2019,33 @@ What is your next ACTION?`,
           flagCaptured = flagInResult;
           console.log(`[Run ${runId}] 🚩 FLAG FOUND IN TOOL RESULT: ${flagInResult}`);
           emit(runId, { type: "status", content: `🚩 FLAG FOUND: ${flagInResult}`, timestamp: new Date().toISOString() });
+
+          const exploitedVuln = detectVulnerabilityFromResponse(result, flagInResult);
+          if (exploitedVuln && !allFindings.some((f) => f.title === exploitedVuln.title)) {
+            allFindings.push(exploitedVuln);
+            emit(runId, { type: "finding", data: exploitedVuln, timestamp: new Date().toISOString() });
+            console.log(`[Run ${runId}] 🔍 AUTO-DETECTED VULNERABILITY: ${exploitedVuln.title}`);
+          }
+
+          if (!experienceSaved) {
+            const capture = validateExperienceCapture(cfg, tool, result, `FLAG: ${flagInResult}`);
+            if (capture.valid && capture.outputSignature) {
+              saveRawExperience(runId, {
+                testType: cfg.testType,
+                phase: attackState.phase,
+                targetSignature: cfg.target,
+                triggerCondition: stepName_,
+                tool,
+                params,
+                steps: stepActionLog,
+                deadEnds: [...attackState.deadEndTools],
+                outputSignature: capture.outputSignature,
+              });
+              experienceSaved = true;
+            } else {
+              console.warn(`[Run ${runId}] Skipping unverified experience save (flag path): ${capture.reason || "unknown reason"}`);
+            }
+          }
         }
 
         emit(runId, {
@@ -1743,6 +2054,33 @@ What is your next ACTION?`,
           data: { tool, success: !result.startsWith("Error") && !result.includes("Tool error") },
           timestamp: new Date().toISOString(),
         });
+
+        // ── Attack State: record result + detect success/dead-end ────────
+        const compressed = compressOutput(tool, result);
+        const isDeadEnd = detectDeadEnd(compressed);
+        const successResult = detectSuccess(compressed);
+        const paramHash = hashParams(params);
+        recordResult(attackState, tool, paramHash, isDeadEnd, successResult.found, successResult.signal, successResult.found ? successResult.signal : undefined);
+
+        if (successResult.found && !experienceSaved) {
+          const capture = validateExperienceCapture(cfg, tool, result, successResult.signal);
+          if (capture.valid && capture.outputSignature) {
+            emit(runId, { type: "status", content: `🎯 Verified success signal: ${capture.outputSignature}`, timestamp: new Date().toISOString() });
+            saveRawExperience(runId, {
+              testType: cfg.testType, phase: attackState.phase,
+              targetSignature: cfg.target, triggerCondition: stepName_,
+              tool, params, steps: stepActionLog,
+              deadEnds: [...attackState.deadEndTools],
+              outputSignature: capture.outputSignature,
+            });
+            experienceSaved = true;
+          } else {
+            console.warn(`[Run ${runId}] Ignored noisy success signal ${successResult.signal}: ${capture.reason || "unknown reason"}`);
+          }
+        }
+        if (isDeadEnd) {
+          emit(runId, { type: "status", content: `💀 Dead end for ${tool} — will try alternatives`, timestamp: new Date().toISOString() });
+        }
       }
 
       // Feed results back to LLM - keep it concise
@@ -1886,7 +2224,7 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
   emit(runId, {
     type: "step_complete",
     step: stepName,
-    content: `Completed - ${allFindings.length} findings${flagCaptured ? " - FLAG CAPTURED" : ""}`,
+    content: `Completed - ${allFindings.length} findings${flagCaptured ? " - FLAG CAPTURED" : ""} - ${attackState.iterationCount} iterations`,
     timestamp: new Date().toISOString(),
   });
 
@@ -1902,65 +2240,42 @@ function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: 
   const isCTF = cfg.purpose === "ctf";
   const isFileTask = cfg.testType === 'reverse-engineering' || cfg.testType === 'forensics' || cfg.testType === 'cryptography';
 
-  const preferred = toolContext.preferredMcpTools.length > 0
-    ? toolContext.preferredMcpTools.join(", ")
-    : "none matched route profile";
+  const preferredUnion = Array.from(new Set([
+    ...toolContext.preferredMcpTools,
+    ...toolContext.suggestedMcpTools,
+  ]));
 
-  const mcpList = toolContext.availableMcpTools.length > 0
-    ? toolContext.availableMcpTools.join(", ")
-    : "(none detected right now — use built-in tools)";
+  const builtInPreview = summarizeTools(toolContext.builtInTools, 10);
+  const preferredPreview = summarizeTools(preferredUnion, 12);
+  const mcpPreview = summarizeTools(toolContext.availableMcpTools, 18);
 
-  const builtInList = toolContext.builtInTools.join(", ");
+  const firstAction = isFileTask
+    ? `ACTION: readfile | {"file": "${cfg.target}"}`
+    : `ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}`;
 
-  return `You are RedBox AI, executing security tasks step-by-step.
+  const goalLine = isCTF
+    ? "CTF goal: report only real flags found in tool output."
+    : "Goal: continue until assessment objective is complete.";
 
-## TOOLING RULES (CRITICAL)
+  return `You are RedBox AI. Execute one action per turn.
 
-Use ONLY tools from these runtime-verified sets:
-- Built-in tools: ${builtInList}
-- Preferred MCP tools for this route: ${preferred}
-- Available MCP tools now: ${mcpList}
-
-If a tool fails or is unavailable, choose another tool from the lists above.
-Never invent tool names.
-
-## YOUR FIRST ACTION
-
-${isFileTask ? `For file "${cfg.target}", your FIRST and ONLY action must be:
-
-ACTION: readfile | {"file": "${cfg.target}"}
-
-DO NOT write any analysis. DO NOT use other tools. Just output that ONE action and STOP.` : `For target "${cfg.target}", start with:
-
-ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}`}
-
-## ACTION FORMAT
-
-\`\`\`
+Output format:
 ACTION: tool_name | {"param": "value"}
-\`\`\`
 
-## RULES
+Allowed tools:
+- Built-in (${toolContext.builtInTools.length}): ${builtInPreview}
+- MCP preferred (${preferredUnion.length}): ${preferredPreview}
+- MCP available total: ${toolContext.availableMcpTools.length} (${mcpPreview})
 
-1. **ONE ACTION AT A TIME**: Output ONE action, wait for results
-2. **NO ANALYSIS BEFORE DATA**: Never describe file contents before readfile returns
-3. **NO PLACEHOLDER FLAGS**: Never output "actual_flag_here" or "flag_here"
-4. **WAIT FOR REAL DATA**: The system will show you real file contents
+You may use any available MCP tool, even if not shown in previews.
+No live MCP tool is statically blocked.
+Need full catalog now? ACTION: list_tools | {}
+Rules: do not invent tools; avoid repeating failed tool+params; keep output short.
 
-## TOOL REFERENCE
+First action:
+${firstAction}
 
-| Tool | Parameters | Example |
-|------|------------|---------|
-| readfile | {"file": "path"} | ACTION: readfile | {"file": "C:/file.java"} |
-| strings | {"file": "path"} | ACTION: strings | {"file": "/bin/app"} |
-| python | {"script": "code"} | ACTION: python | {"script": "print(1+1)"} |
-| http_request | {"url", "method"} | ACTION: http_request | {"url": "http://x", "method": "GET"} |
-
-${isCTF ? `## CTF GOAL
-Find the flag. Look for patterns like: picoCTF{...}, flag{...}, HTB{...}
-The flag will be in the REAL tool output, not imagined.` : ''}
-
-**START NOW**: Output your first ACTION and nothing else.`;
+${goalLine}`;
 }
 
 export async function startRun(cfg: RunConfig): Promise<string> {
@@ -2060,7 +2375,7 @@ export async function testMcpToolsAvailability(mcpServerId?: string): Promise<{
     const healthResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/health`, {
       method: "GET",
       headers,
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(12000),
     });
 
     if (healthResponse.ok) {

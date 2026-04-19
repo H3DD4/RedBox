@@ -36,14 +36,26 @@ router.get("/stats", async (_req, res) => {
   const activeProvider = db.prepare("SELECT name, model FROM llm_providers WHERE active = 1 LIMIT 1").get() as { name: string; model: string } | undefined;
   
   // MCP status
-  const defaultMcp = db.prepare("SELECT name, url FROM mcp_servers WHERE is_default = 1 LIMIT 1").get() as { name: string; url: string } | undefined;
+  const defaultMcp = db
+    .prepare("SELECT name, url, auth_token FROM mcp_servers WHERE is_default = 1 LIMIT 1")
+    .get() as { name: string; url: string; auth_token: string | null } | undefined;
   let mcpOnline = false;
   if (defaultMcp) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 3000);
-      const resp = await fetch(`${defaultMcp.url}/health`, { signal: controller.signal });
-      clearTimeout(timeout);
+      const timeout = setTimeout(() => controller.abort(), 12000);
+      const headers = defaultMcp.auth_token
+        ? { Authorization: `Bearer ${defaultMcp.auth_token}` }
+        : undefined;
+      let resp: globalThis.Response;
+      try {
+        resp = await fetch(`${defaultMcp.url}/health`, {
+          signal: controller.signal,
+          headers,
+        });
+      } finally {
+        clearTimeout(timeout);
+      }
       mcpOnline = resp.ok;
     } catch { /* offline */ }
   }

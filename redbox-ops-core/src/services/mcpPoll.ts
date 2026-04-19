@@ -7,6 +7,9 @@ const BACKEND_URL: string =
   (typeof import.meta !== "undefined" && (import.meta as { env?: { VITE_BACKEND_URL?: string } }).env?.VITE_BACKEND_URL) ||
   "";
 
+const BACKEND_HEALTH_TIMEOUT_MS = 12000;
+const MAX_CONSECUTIVE_FAILURES = 2;
+
 export interface PollState {
   online: boolean;
   checking: boolean;
@@ -21,6 +24,7 @@ let _checking = true;
 let _firstDone = false;
 let _llmOnline = false;
 let _ragIndexed = false;
+let _consecutiveFailures = 0;
 const _listeners = new Set<Listener>();
 let _started = false;
 
@@ -47,23 +51,35 @@ async function _poll() {
 
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
-    const res = await fetch(`${BACKEND_URL}/api/health`, { signal: controller.signal });
-    clearTimeout(timeout);
-    if (res.ok) {
-      const data = await res.json() as {
-        hexstrike?: { online: boolean };
-        llm?: { online: boolean };
-        rag?: { indexed: boolean };
-      };
-      nextOnline = data.hexstrike?.online ?? false;
-      nextLlm = data.llm?.online ?? false;
-      nextRag = data.rag?.indexed ?? false;
-    } else {
-      nextOnline = false;
+    const timeout = setTimeout(() => controller.abort(), BACKEND_HEALTH_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(`${BACKEND_URL}/api/health`, { signal: controller.signal });
+    } finally {
+      clearTimeout(timeout);
     }
+
+    if (!res.ok) {
+      throw new Error(`Health endpoint returned ${res.status}`);
+    }
+
+    const data = await res.json() as {
+      hexstrike?: { online: boolean };
+      llm?: { online: boolean };
+      rag?: { indexed: boolean };
+    };
+
+    nextOnline = data.hexstrike?.online ?? false;
+    nextLlm = data.llm?.online ?? false;
+    nextRag = data.rag?.indexed ?? false;
+    _consecutiveFailures = 0;
   } catch {
-    nextOnline = false;
+    _consecutiveFailures += 1;
+    if (_consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+      nextOnline = false;
+      nextLlm = false;
+      nextRag = false;
+    }
   }
 
   const changed =

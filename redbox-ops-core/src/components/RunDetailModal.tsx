@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
 import StatusBadge from "@/components/StatusBadge";
-import { orchestrator, reports, type Run, type Finding } from "@/services/api-client";
+import { experiences, orchestrator, reports, type Run, type Finding } from "@/services/api-client";
 import { useToast } from "@/hooks/use-toast";
 
 interface RunDetailModalProps {
@@ -33,6 +33,8 @@ export function RunDetailModal({ runId, open, onClose, onDeleted }: RunDetailMod
   const [deleting, setDeleting] = useState(false);
   const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
   const [expandedFindings, setExpandedFindings] = useState<Set<number>>(new Set());
+  const [savingValidatedFindings, setSavingValidatedFindings] = useState<Set<string>>(new Set());
+  const [savedValidatedFindings, setSavedValidatedFindings] = useState<Set<string>>(new Set());
   const [generatingReport, setGeneratingReport] = useState(false);
   const [copiedFlag, setCopiedFlag] = useState(false);
 
@@ -93,7 +95,7 @@ export function RunDetailModal({ runId, open, onClose, onDeleted }: RunDetailMod
       console.log(`[Report] Generated report ${report.id}, opening download...`);
 
       // Open download in new tab
-      const downloadUrl = reports.downloadUrl(report.id, "md");
+      const downloadUrl = reports.downloadUrl(report.id, "html");
       console.log(`[Report] Download URL: ${downloadUrl}`);
 
       // Try to download the report
@@ -162,6 +164,56 @@ export function RunDetailModal({ runId, open, onClose, onDeleted }: RunDetailMod
     setCopiedFlag(true);
     setTimeout(() => setCopiedFlag(false), 2000);
     toast({ title: "Flag copied!", description: "Flag has been copied to clipboard" });
+  };
+
+  const findingKey = (finding: Finding) =>
+    `${finding.title}|${finding.cwe || ""}|${finding.cve || ""}|${(finding.evidence || "").slice(0, 120)}`;
+
+  const handleValidateFindingToMemory = async (finding: Finding) => {
+    if (!runId) return;
+
+    const key = findingKey(finding);
+    if (savingValidatedFindings.has(key) || savedValidatedFindings.has(key)) return;
+
+    setSavingValidatedFindings((prev) => {
+      const next = new Set(prev);
+      next.add(key);
+      return next;
+    });
+
+    try {
+      const result = await experiences.validateRunFinding(runId, {
+        severity: finding.severity,
+        title: finding.title,
+        cwe: finding.cwe,
+        cve: finding.cve,
+        confidence: finding.confidence,
+        evidence: finding.evidence,
+      }, "validated");
+
+      setSavedValidatedFindings((prev) => {
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+
+      toast({
+        title: result.created ? "Finding saved to experience memory" : "Finding validation updated",
+        description: result.findingTitle,
+      });
+    } catch (err) {
+      toast({
+        title: "Validation failed",
+        description: (err as { error?: string }).error || "Could not persist finding to experience memory",
+        variant: "destructive",
+      });
+    } finally {
+      setSavingValidatedFindings((prev) => {
+        const next = new Set(prev);
+        next.delete(key);
+        return next;
+      });
+    }
   };
 
   // Parse findings to separate flags from vulnerabilities
@@ -760,18 +812,45 @@ export function RunDetailModal({ runId, open, onClose, onDeleted }: RunDetailMod
                                       <h4 className="text-lg font-semibold text-zinc-100 mb-2">{finding.title}</h4>
                                       <p className="text-sm text-zinc-300 leading-relaxed">{explanation.what}</p>
                                     </div>
-                                    <Button
-                                      variant="ghost"
-                                      size="sm"
-                                      onClick={() => toggleFinding(findingIdx)}
-                                      className="text-zinc-500 hover:text-zinc-200 hover:bg-zinc-700/30"
-                                    >
-                                      {isExpanded ? (
-                                        <ChevronUp className="w-5 h-5" />
-                                      ) : (
-                                        <ChevronDown className="w-5 h-5" />
-                                      )}
-                                    </Button>
+                                    <div className="flex items-center gap-2">
+                                      <Button
+                                        size="sm"
+                                        variant="outline"
+                                        onClick={() => handleValidateFindingToMemory(finding)}
+                                        disabled={savingValidatedFindings.has(findingKey(finding)) || savedValidatedFindings.has(findingKey(finding)) || run?.status !== "completed"}
+                                        className="border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+                                      >
+                                        {savingValidatedFindings.has(findingKey(finding)) ? (
+                                          <>
+                                            <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            Saving...
+                                          </>
+                                        ) : savedValidatedFindings.has(findingKey(finding)) ? (
+                                          <>
+                                            <CheckCircle2 className="w-4 h-4 mr-2" />
+                                            Validated
+                                          </>
+                                        ) : (
+                                          <>
+                                            <ShieldCheck className="w-4 h-4 mr-2" />
+                                            Validate to Memory
+                                          </>
+                                        )}
+                                      </Button>
+
+                                      <Button
+                                        variant="ghost"
+                                        size="sm"
+                                        onClick={() => toggleFinding(findingIdx)}
+                                        className="text-zinc-500 hover:text-zinc-200 hover:bg-zinc-700/30"
+                                      >
+                                        {isExpanded ? (
+                                          <ChevronUp className="w-5 h-5" />
+                                        ) : (
+                                          <ChevronDown className="w-5 h-5" />
+                                        )}
+                                      </Button>
+                                    </div>
                                   </div>
 
                                   {/* Risk & Impact Summary */}

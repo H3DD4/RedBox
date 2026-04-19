@@ -166,7 +166,7 @@ class HexStrikeClient:
                 logger.info(f"🔗 Attempting to connect to HexStrike AI API at {server_url} (attempt {i+1}/{MAX_RETRIES})")
                 # First try a direct connection test before using the health endpoint
                 try:
-                    test_response = self.session.get(f"{self.server_url}/health", timeout=5)
+                    test_response = self.session.get(f"{self.server_url}/health", timeout=12)
                     test_response.raise_for_status()
                     health_check = test_response.json()
                     connected = True

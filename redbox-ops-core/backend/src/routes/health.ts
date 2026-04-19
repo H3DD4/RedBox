@@ -4,57 +4,88 @@ import { getDb } from "../db.js";
 
 const router = Router();
 
-// GET /api/health
-router.get("/", async (_req: Request, res: Response) => {
-  // Check HexStrike
-  let hexstrikeOnline = false;
+const HEXSTRIKE_HEALTH_TIMEOUT_MS = 12000;
+const LLM_HEALTH_TIMEOUT_MS = 5000;
+
+async function checkHexstrikeHealth(): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), HEXSTRIKE_HEALTH_TIMEOUT_MS);
+
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 5000);
     const resp = await fetch(`${config.hexstrikeApiUrl}/health`, {
       signal: controller.signal,
     });
-    clearTimeout(timeout);
-    hexstrikeOnline = resp.ok;
+    return resp.ok;
   } catch {
-    hexstrikeOnline = false;
+    return false;
+  } finally {
+    clearTimeout(timeout);
   }
+}
 
-  // Check active LLM provider
-  let llmStatus = { configured: false, name: "", online: false };
+async function checkLlmHealth(): Promise<{ configured: boolean; name: string; online: boolean }> {
+  const llmStatus = { configured: false, name: "", online: false };
+
   try {
     const db = getDb();
     const provider = db
       .prepare("SELECT * FROM llm_providers WHERE active = 1 LIMIT 1")
-      .get() as { id: string; type: string; name: string; endpoint: string; model: string } | undefined;
-
-    if (provider) {
-      llmStatus.configured = true;
-      llmStatus.name = provider.name;
-      try {
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 5000);
-        // Test based on provider type
-        let testUrl = provider.endpoint;
-        const headers: Record<string, string> = {};
-        if (provider.type === "ollama") {
-          testUrl = `${provider.endpoint}/api/tags`;
-        } else {
-          // OpenAI-compatible APIs (openai, cerebras, groq, together, deepseek, custom, etc.)
-          testUrl = `${provider.endpoint}/models`;
-          const apiKey = (provider as { api_key?: string }).api_key;
-          if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+      .get() as
+      | {
+          id: string;
+          type: string;
+          name: string;
+          endpoint: string;
+          model: string;
+          api_key?: string;
         }
-        const resp = await fetch(testUrl, { signal: controller.signal, headers });
-        clearTimeout(timeout);
-        llmStatus.online = resp.ok;
-      } catch {
-        llmStatus.online = false;
+      | undefined;
+
+    if (!provider) {
+      return llmStatus;
+    }
+
+    llmStatus.configured = true;
+    llmStatus.name = provider.name;
+
+    let testUrl = provider.endpoint.replace(/\/$/, "");
+    const headers: Record<string, string> = {};
+    if (provider.type === "ollama") {
+      testUrl = `${testUrl}/api/tags`;
+    } else {
+      testUrl = `${testUrl}/models`;
+      if (provider.api_key) {
+        headers.Authorization = `Bearer ${provider.api_key}`;
       }
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), LLM_HEALTH_TIMEOUT_MS);
+
+    try {
+      const resp = await fetch(testUrl, {
+        signal: controller.signal,
+        headers,
+      });
+      llmStatus.online = resp.ok;
+    } catch {
+      llmStatus.online = false;
+    } finally {
+      clearTimeout(timeout);
     }
   } catch {
     // DB not ready
   }
+
+  return llmStatus;
+}
+
+// GET /api/health
+router.get("/", async (_req: Request, res: Response) => {
+  const [hexstrikeOnline, llmStatus] = await Promise.all([
+    checkHexstrikeHealth(),
+    checkLlmHealth(),
+  ]);
 
   // RAG status
   let ragStatus = { documentCount: 0, chunkCount: 0, indexed: false };
