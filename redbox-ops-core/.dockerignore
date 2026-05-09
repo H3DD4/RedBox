@@ -1,0 +1,14 @@
+node_modules
+dist
+build
+.vite
+coverage
+*.log
+.env
+.env.*
+backend/node_modules
+backend/dist
+backend/uploads
+backend/data
+backend/.env
+backend/.env.*

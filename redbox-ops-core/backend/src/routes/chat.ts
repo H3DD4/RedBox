@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { chatStream, getActiveProvider } from "../services/llm-gateway.js";
+import { chatComplete, chatStream, getActiveProvider } from "../services/llm-gateway.js";
 
 const router = Router();
 
@@ -69,13 +69,8 @@ router.post("/simple", async (req: Request, res: Response) => {
 
     console.log(`[Chat] Using provider: ${provider.name}, model: ${provider.model}`);
 
-    let fullResponse = "";
-    const stream = chatStream(messages, {});
-    for await (const chunk of stream) {
-      fullResponse += chunk;
-    }
-
-    res.json({ response: fullResponse, provider: provider.name, model: provider.model });
+    const response = await chatComplete(messages, {});
+    res.json({ response, provider: provider.name, model: provider.model });
   } catch (err) {
     console.error("[Chat] Error:", err);
     res.status(500).json({ error: err instanceof Error ? err.message : "Unknown error" });
