@@ -2,622 +2,795 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>RedBox — Functional Architecture</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RedBox - System Architecture and Functional Pipeline</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
+  :root {
+    --bg: #0a0e17;
+    --bg-card: rgba(15, 20, 32, 0.85);
+    --bg-card-hover: rgba(20, 28, 46, 0.95);
+    --red-primary: #dc2626;
+    --red-bright: #ef4444;
+    --red-glow: rgba(220, 38, 38, 0.35);
+    --red-dim: #991b1b;
+    --red-gradient: linear-gradient(135deg, #dc2626, #ef4444);
+    --border: rgba(220, 38, 38, 0.25);
+    --border-bright: rgba(220, 38, 38, 0.5);
+    --border-dashed: rgba(220, 38, 38, 0.35);
+    --text: #e2e8f0;
+    --text-dim: #94a3b8;
+    --text-bright: #f8fafc;
+    --cyan: #22d3ee;
+    --green: #22c55e;
+    --amber: #f59e0b;
+    --purple: #a78bfa;
+    --blue: #60a5fa;
+  }
+
   * { margin: 0; padding: 0; box-sizing: border-box; }
 
   body {
-    background: #0d1117;
-    color: #c9d1d9;
-    font-family: 'Consolas', 'Courier New', monospace;
-    font-size: 13px;
-    line-height: 1.5;
-    padding: 40px 20px 80px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
   }
 
-  .page {
-    max-width: 960px;
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% -10%, rgba(220,38,38,0.12), transparent),
+      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(220,38,38,0.06), transparent),
+      linear-gradient(rgba(220,38,38,0.02) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(220,38,38,0.02) 1px, transparent 1px);
+    background-size: 100% 100%, 100% 100%, 40px 40px, 40px 40px;
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    position: relative;
+    z-index: 1;
+    max-width: 1400px;
     margin: 0 auto;
+    padding: 40px 30px 80px;
   }
 
-  h1 {
+  .header {
     text-align: center;
-    font-size: 18px;
-    font-weight: normal;
-    color: #e6edf3;
-    margin-bottom: 6px;
-    letter-spacing: 1px;
+    margin-bottom: 50px;
   }
 
-  .subtitle {
-    text-align: center;
-    font-size: 11px;
-    color: #7d8590;
-    margin-bottom: 40px;
+  .header h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 2.6rem;
+    font-weight: 800;
+    background: var(--red-gradient);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -1px;
+    margin-bottom: 8px;
+  }
+
+  .header .subtitle {
+    font-size: 1.05rem;
+    color: var(--text-dim);
+    font-weight: 400;
     letter-spacing: 2px;
+    text-transform: uppercase;
   }
 
-  /* ─── FLOW LAYOUT ─── */
+  .header .version {
+    display: inline-block;
+    margin-top: 12px;
+    padding: 4px 16px;
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--red-bright);
+    background: rgba(220,38,38,0.06);
+  }
+
+  .section-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.1rem;
+    font-weight: 600;
+    color: var(--red-bright);
+    text-transform: uppercase;
+    letter-spacing: 3px;
+    text-align: center;
+    margin: 50px 0 30px;
+    position: relative;
+  }
+
+  .section-title::before,
+  .section-title::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    width: 80px;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--border-bright), transparent);
+  }
+
+  .section-title::before { right: calc(50% + 140px); }
+  .section-title::after { left: calc(50% + 140px); }
+
   .flow {
     display: flex;
     flex-direction: column;
     align-items: center;
+    gap: 0;
   }
 
-  /* ─── BOX ─── */
-  .box {
-    border: 1px dashed #3d444d;
-    padding: 12px 20px;
-    text-align: center;
-    min-width: 280px;
-    max-width: 520px;
-  }
-
-  .box .t {
-    color: #e6edf3;
-    font-weight: bold;
-    font-size: 13px;
-    margin-bottom: 4px;
-  }
-
-  .box .d {
-    color: #7d8590;
-    font-size: 11px;
-    line-height: 1.6;
-  }
-
-  .box.wide {
-    min-width: 420px;
-    max-width: 620px;
-  }
-
-  .box.narrow {
-    min-width: 140px;
-    max-width: 200px;
-    padding: 10px 14px;
-  }
-
-  .box.narrow .t { font-size: 12px; margin-bottom: 2px; }
-  .box.narrow .d { font-size: 10px; }
-
-  /* ─── CONNECTOR ─── */
-  .v {
+  .arrow {
     display: flex;
     flex-direction: column;
     align-items: center;
+    padding: 4px 0;
   }
 
-  .v .line {
-    width: 1px;
-    height: 24px;
-    background: #3d444d;
+  .arrow .line {
+    width: 2px;
+    height: 28px;
+    background: linear-gradient(180deg, var(--red-primary), var(--red-bright));
+    opacity: 0.6;
   }
 
-  .v .arrow {
-    width: 0; height: 0;
-    border-left: 5px solid transparent;
-    border-right: 5px solid transparent;
-    border-top: 7px solid #3d444d;
+  .arrow .head {
+    width: 0;
+    height: 0;
+    border-left: 7px solid transparent;
+    border-right: 7px solid transparent;
+    border-top: 10px solid var(--red-bright);
+    opacity: 0.7;
   }
 
-  .v .label {
-    font-size: 10px;
-    color: #484f58;
+  .arrow-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.65rem;
+    color: var(--text-dim);
+    letter-spacing: 1px;
     margin: 2px 0;
-    letter-spacing: 0.5px;
   }
 
-  /* ─── HORIZONTAL ROW ─── */
-  .row {
+  .node {
+    border: 1.5px dashed var(--border-dashed);
+    border-radius: 10px;
+    padding: 18px 28px;
+    background: var(--bg-card);
+    backdrop-filter: blur(8px);
+    text-align: center;
+    min-width: 260px;
+    max-width: 440px;
+    position: relative;
+    transition: all 0.3s ease;
+  }
+
+  .node:hover {
+    border-color: var(--red-bright);
+    background: var(--bg-card-hover);
+    box-shadow: 0 0 25px var(--red-glow);
+    transform: translateY(-2px);
+  }
+
+  .node .title {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: var(--text-bright);
+    margin-bottom: 6px;
+  }
+
+  .node .desc {
+    font-size: 0.78rem;
+    color: var(--text-dim);
+    line-height: 1.5;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .node .desc .tool { color: var(--cyan); font-weight: 500; }
+  .node .desc .service { color: var(--amber); font-weight: 500; }
+  .node .desc .action { color: var(--green); font-weight: 500; }
+  .node .desc .data { color: var(--purple); font-weight: 500; }
+
+  .node.primary {
+    border: 2px solid var(--red-primary);
+    background: linear-gradient(135deg, rgba(220,38,38,0.08), rgba(15,20,32,0.9));
+    box-shadow: 0 0 30px var(--red-glow);
+  }
+
+  .node.primary .title {
+    color: var(--red-bright);
+    font-size: 1.05rem;
+  }
+
+  .node.small {
+    min-width: 160px;
+    max-width: 240px;
+    padding: 12px 18px;
+  }
+
+  .node.small .title { font-size: 0.82rem; }
+  .node.small .desc { font-size: 0.72rem; }
+
+  .branch-row {
     display: flex;
     justify-content: center;
-    gap: 14px;
+    gap: 18px;
+    flex-wrap: wrap;
+    width: 100%;
+    max-width: 1200px;
+  }
+
+  .side-by-side {
+    display: flex;
+    gap: 30px;
+    justify-content: center;
+    align-items: flex-start;
+    width: 100%;
+    max-width: 1200px;
     flex-wrap: wrap;
   }
 
-  /* ─── BRANCH LINES ─── */
-  .branch-down {
+  .column-panel {
+    flex: 1;
+    min-width: 320px;
+    max-width: 550px;
+    border: 1.5px dashed var(--border-dashed);
+    border-radius: 12px;
+    padding: 22px 26px;
+    background: var(--bg-card);
+  }
+
+  .column-panel .panel-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--red-bright);
+    margin-bottom: 14px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  .column-panel .items {
     display: flex;
-    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .column-panel .item {
+    padding: 5px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--text);
+    background: rgba(220,38,38,0.04);
+    transition: all 0.2s;
+  }
+
+  .column-panel .item:hover {
+    border-color: var(--red-bright);
+    background: rgba(220,38,38,0.1);
+    color: var(--text-bright);
+  }
+
+  .column-panel .item.cyan { color: var(--cyan); border-color: rgba(34,211,238,0.2); }
+  .column-panel .item.green { color: var(--green); border-color: rgba(34,197,94,0.2); }
+  .column-panel .item.amber { color: var(--amber); border-color: rgba(245,158,11,0.2); }
+  .column-panel .item.purple { color: var(--purple); border-color: rgba(167,139,250,0.2); }
+  .column-panel .item.blue { color: var(--blue); border-color: rgba(96,165,250,0.2); }
+
+  .loop-wrapper {
     position: relative;
+    padding: 15px 0 15px 0;
     width: 100%;
-    max-width: 700px;
-    height: 28px;
-  }
-
-  .branch-down .h {
-    position: absolute;
-    top: 0;
-    left: 10%;
-    right: 10%;
-    height: 1px;
-    background: #3d444d;
-  }
-
-  .branch-down .drop {
-    position: absolute;
-    top: 0;
-    width: 1px;
-    height: 28px;
-    background: #3d444d;
-  }
-
-  .branch-down .drop::after {
-    content: '';
-    position: absolute;
-    bottom: 0;
-    left: -4px;
-    width: 0; height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 6px solid #3d444d;
-  }
-
-  /* ─── MERGE LINES ─── */
-  .merge-up {
-    display: flex;
-    justify-content: center;
-    position: relative;
-    width: 100%;
-    max-width: 700px;
-    height: 28px;
-  }
-
-  .merge-up .rise {
-    position: absolute;
-    bottom: 0;
-    width: 1px;
-    height: 28px;
-    background: #3d444d;
-  }
-
-  .merge-up .h {
-    position: absolute;
-    bottom: 0;
-    left: 10%;
-    right: 10%;
-    height: 1px;
-    background: #3d444d;
-  }
-
-  /* ─── LOOP WRAPPER ─── */
-  .loop {
-    position: relative;
-    border: 1px dashed #2a2f38;
-    border-radius: 4px;
-    padding: 20px 30px;
-    margin: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
+  }
+
+  .loop-wrapper::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: calc(50% - 250px);
+    right: calc(50% - 250px);
+    border: 2px dashed rgba(220,38,38,0.18);
+    border-radius: 16px;
+    pointer-events: none;
   }
 
   .loop-label {
     position: absolute;
-    top: -10px;
-    left: 16px;
-    background: #0d1117;
-    padding: 0 10px;
-    font-size: 10px;
-    color: #484f58;
+    top: -12px;
+    left: calc(50% - 250px + 15px);
+    background: var(--bg);
+    padding: 2px 14px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    color: var(--red-bright);
+    letter-spacing: 1px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+
+  .loop-back-arrow {
+    position: absolute;
+    right: calc(50% - 260px);
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .loop-back-arrow .curved {
+    width: 30px;
+    height: 80px;
+    border-right: 2px dashed rgba(220,38,38,0.3);
+    border-top: 2px dashed rgba(220,38,38,0.3);
+    border-bottom: 2px dashed rgba(220,38,38,0.3);
+    border-radius: 0 12px 12px 0;
+  }
+
+  .loop-back-arrow .label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    color: var(--text-dim);
+    writing-mode: vertical-rl;
     letter-spacing: 1px;
   }
 
-  /* ─── SIDE BY SIDE ─── */
-  .side {
-    display: flex;
-    gap: 20px;
-    justify-content: center;
-    flex-wrap: wrap;
-  }
-
-  .panel {
-    border: 1px dashed #3d444d;
-    padding: 14px 18px;
-    min-width: 280px;
-    max-width: 440px;
-    flex: 1;
-  }
-
-  .panel .pt {
-    color: #e6edf3;
-    font-weight: bold;
-    font-size: 12px;
-    margin-bottom: 8px;
-  }
-
-  .panel .pd {
-    color: #7d8590;
-    font-size: 11px;
-    line-height: 1.7;
-  }
-
-  /* ─── SECTION HEADER ─── */
-  .sh {
-    text-align: center;
-    margin: 40px 0 20px;
-    font-size: 11px;
-    color: #484f58;
-    letter-spacing: 3px;
-    text-transform: uppercase;
-  }
-
-  .sh::before { content: '── '; }
-  .sh::after  { content: ' ──'; }
-
-  /* ─── DOTS ─── */
-  .dots {
-    text-align: center;
-    color: #3d444d;
-    font-size: 16px;
-    letter-spacing: 6px;
-    padding: 4px 0;
-  }
-
-  /* ─── FOOTER ─── */
   .footer {
     text-align: center;
-    margin-top: 50px;
-    font-size: 10px;
-    color: #484f58;
+    margin-top: 60px;
+    padding-top: 30px;
+    border-top: 1px solid rgba(220,38,38,0.1);
+  }
+
+  .footer p {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--text-dim);
     letter-spacing: 1px;
+  }
+
+  .footer .brand { color: var(--red-bright); font-weight: 700; }
+
+  .legend {
+    display: flex;
+    justify-content: center;
+    gap: 24px;
+    flex-wrap: wrap;
+    margin: 30px 0;
+    padding: 14px 20px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: rgba(10,14,23,0.8);
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+
+  @media (max-width: 768px) {
+    .header h1 { font-size: 1.8rem; }
+    .branch-row { flex-direction: column; align-items: center; }
+    .side-by-side { flex-direction: column; align-items: center; }
+    .loop-wrapper::before { left: 10px; right: 10px; }
   }
 </style>
 </head>
 <body>
-<div class="page">
+<div class="container">
 
-<h1>RedBox — Functional Architecture</h1>
-<div class="subtitle">AI-Powered Security Orchestration Platform</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">1. User Entry</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-
-  <div class="box">
-    <div class="t">Authentication</div>
-    <div class="d">JWT login, bcrypt hashing<br>Session management</div>
+  <div class="header">
+    <h1>RedBox</h1>
+    <div class="subtitle">AI-Powered Security Orchestration Platform</div>
+    <div class="version">System Architecture and Functional Pipeline - v1.1</div>
   </div>
 
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-  <div class="box">
-    <div class="t">Dashboard</div>
-    <div class="d">Active runs, findings overview<br>LLM + MCP server status, RAG stats</div>
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background: var(--cyan)"></div><span style="color:var(--cyan)">Tools</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--amber)"></div><span style="color:var(--amber)">Services</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--green)"></div><span style="color:var(--green)">Actions</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--purple)"></div><span style="color:var(--purple)">Data</span></div>
+    <div class="legend-item"><div class="legend-dot" style="background: var(--red-bright)"></div><span style="color:var(--red-bright)">Core Engine</span></div>
   </div>
 
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+  <div class="section-title">1 - User Entry and Configuration</div>
 
-  <div class="box wide">
-    <div class="t">Assessment Configuration</div>
-    <div class="d">
-      Select: Test Type × Purpose → Task Router (35 routes)<br>
-      9 types: Web · API · RevEng · PWN · Crypto · Forensics · Network · Mobile · OSINT<br>
-      4 purposes: CTF · Pentest · Red Team · Research<br>
-      Set: target, scope, LLM provider, MCP server, file uploads
-    </div>
-  </div>
-
-  <div class="v"><div class="line"></div><div class="label">POST /api/orchestrator/run</div><div class="arrow"></div></div>
-
-</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">2. Orchestration Setup</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-
-  <div class="box">
-    <div class="t">Route Resolution</div>
-    <div class="d">Task Router maps (testType + purpose)<br>→ prompt template + pipeline + MCP tools</div>
-  </div>
-
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-  <div class="box wide">
-    <div class="t">Prompt Template Loading</div>
-    <div class="d">
-      Load from prompts/ (ctf · pentesting · shared)<br>
-      Cached with 5-min TTL, @include() resolution<br>
-      webexp.txt · pwn.txt · crypto.txt · forensics.txt · recon.txt · osint.txt ...
-    </div>
-  </div>
-
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-  <div class="box wide">
-    <div class="t">Context Injection & Validation</div>
-    <div class="d">
-      Inject 20+ variables: {{TARGET_URL}}, {{BINARY_PATH}}, {{CIPHER_TEXT}} ...<br>
-      Validate missing vars, sanitize inputs<br>
-      Security: path traversal + command injection prevention
-    </div>
-  </div>
-
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-  <div class="box">
-    <div class="t">Runtime Tool Discovery</div>
-    <div class="d">MCP Client → listTools() from HexStrike /health<br>Build agent tool context (built-in + MCP)</div>
-  </div>
-
-  <div class="v"><div class="line"></div><div class="label">SSE stream begins</div><div class="arrow"></div></div>
-
-</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">3. AI Agent Loop (Core)</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-
-  <div class="loop">
-    <div class="loop-label">LOOP — max 30 iterations</div>
-
-    <div class="box wide">
-      <div class="t">LLM Chat Completion</div>
-      <div class="d">
-        LLM Gateway → active provider (Ollama, OpenAI,<br>
-        Claude, Gemini, Cerebras, Groq, Together, DeepSeek...)<br>
-        Token-based context trimming (10k budget)<br>
-        Auto-retry: 5 attempts, exponential backoff<br>
-        Rate limiter with circuit breaker
+  <div class="flow">
+    <div class="node primary" style="min-width: 380px;">
+      <div class="title">Authentication and Login</div>
+      <div class="desc">
+        <span class="service">JWT Auth</span> +
+        <span class="tool">bcrypt</span> password hashing<br>
+        Default: admin@redbox.io
       </div>
     </div>
 
-    <div class="v"><div class="line"></div><div class="arrow"></div></div>
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
 
-    <div class="box wide">
-      <div class="t">Response Analysis</div>
-      <div class="d">
-        Parse ACTION: directives from LLM output<br>
-        Anti-hallucination checks<br>
-        Flag extraction (15+ CTF format patterns)<br>
-        Vulnerability detection (NLP-based)
+    <div class="node" style="min-width: 380px;">
+      <div class="title">Dashboard - System Overview</div>
+      <div class="desc">
+        <span class="data">Active runs</span>,
+        <span class="data">findings by severity</span><br>
+        <span class="service">LLM Provider</span> status +
+        <span class="service">MCP Server</span> status<br>
+        <span class="data">RAG index</span> statistics
       </div>
     </div>
 
-    <div class="v"><div class="line"></div><div class="label">ACTION: tool_name | {params}</div><div class="arrow"></div></div>
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
 
-    <!-- TOOL BRANCHES -->
-    <div class="branch-down">
-      <div class="h"></div>
-      <div class="drop" style="left: 10%"></div>
-      <div class="drop" style="left: 30%"></div>
-      <div class="drop" style="left: 50%"></div>
-      <div class="drop" style="left: 70%"></div>
-      <div class="drop" style="left: 90%"></div>
-    </div>
-
-    <div class="row">
-      <div class="box narrow">
-        <div class="t">Web Tools</div>
-        <div class="d">curl, headers,<br>dir_brute</div>
-      </div>
-      <div class="box narrow">
-        <div class="t">Network</div>
-        <div class="d">nc, dns_lookup,<br>port_scan</div>
-      </div>
-      <div class="box narrow">
-        <div class="t">File Analysis</div>
-        <div class="d">readfile, strings,<br>hexdump, fileinfo</div>
-      </div>
-      <div class="box narrow">
-        <div class="t">Crypto</div>
-        <div class="d">base64, hash,<br>python scripts</div>
-      </div>
-      <div class="box narrow">
-        <div class="t">MCP / HexStrike</div>
-        <div class="d">150+ tools<br>JSON-RPC + REST</div>
+    <div class="node primary" style="min-width: 520px;">
+      <div class="title">Assessment Configuration</div>
+      <div class="desc">
+        Select: <span class="action">Test Type</span> x <span class="action">Purpose</span> to <span class="service">Task Router</span><br><br>
+        <span class="data">Test Types</span>: Web App, API, Rev Eng, PWN, Crypto, Forensics, Network, Mobile, OSINT<br>
+        <span class="data">Purposes</span>: CTF, Pentest, Red Team, Research<br><br>
+        Configure: <span class="data">Target</span> | <span class="data">Scope</span> | <span class="service">LLM Provider</span> | <span class="service">MCP Server</span> | <span class="data">Uploads</span>
       </div>
     </div>
 
-    <div class="merge-up">
-      <div class="h"></div>
-      <div class="rise" style="left: 10%"></div>
-      <div class="rise" style="left: 30%"></div>
-      <div class="rise" style="left: 50%"></div>
-      <div class="rise" style="left: 70%"></div>
-      <div class="rise" style="left: 90%"></div>
-    </div>
-
-    <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-    <div class="box wide">
-      <div class="t">Findings Extraction & Flag Check</div>
-      <div class="d">
-        Parse findings: JSON + NLP<br>
-        (SQLi, XSS, SSTI, RCE, Path Traversal, Auth Bypass ...)<br>
-        Auto-detect vuln type on flag capture<br>
-        Emit SSE events → live stream to frontend<br><br>
-        Break: flag captured (CTF) or ASSESSMENT COMPLETE (pentest)
-      </div>
-    </div>
-
-  </div>
-
-</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">4. Results & Reporting</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-  <div class="box wide">
-    <div class="t">Results Persistence</div>
-    <div class="d">
-      Store to SQLite: findings[], output[],<br>
-      flag_captured, iteration_count, token_usage
+    <div class="arrow">
+      <div class="line"></div>
+      <span class="arrow-label">POST /api/orchestrator/run</span>
+      <div class="head"></div>
     </div>
   </div>
 
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
+  <div class="section-title">2 - Orchestration Engine</div>
 
-  <!-- REPORT BRANCHES -->
-  <div class="branch-down" style="max-width: 500px;">
-    <div class="h"></div>
-    <div class="drop" style="left: 15%"></div>
-    <div class="drop" style="left: 50%"></div>
-    <div class="drop" style="left: 85%"></div>
-  </div>
-
-  <div class="row">
-    <div class="box narrow" style="min-width: 160px;">
-      <div class="t">Executive Report</div>
-      <div class="d">C-level audience<br>Risk + business impact<br>Remediation timeline</div>
-    </div>
-    <div class="box narrow" style="min-width: 160px;">
-      <div class="t">Technical Report</div>
-      <div class="d">Security engineers<br>CWE/CVE mappings<br>Code-level fixes</div>
-    </div>
-    <div class="box narrow" style="min-width: 160px;">
-      <div class="t">Full Report</div>
-      <div class="d">Combined audience<br>Exec + Technical<br>30/60/90 day plan</div>
-    </div>
-  </div>
-
-  <div class="merge-up" style="max-width: 500px;">
-    <div class="h"></div>
-    <div class="rise" style="left: 15%"></div>
-    <div class="rise" style="left: 50%"></div>
-    <div class="rise" style="left: 85%"></div>
-  </div>
-
-  <div class="v"><div class="line"></div><div class="arrow"></div></div>
-
-  <div class="box">
-    <div class="t">Export & Download</div>
-    <div class="d">Markdown + PDF generation<br>LLM-powered with template fallback</div>
-  </div>
-
-</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">5. Parallel Features</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-  <div class="side">
-
-    <div class="panel">
-      <div class="pt">RAG Advisor — Knowledge Base</div>
-      <div class="pd">
-        Upload docs → chunk (512w, 64 overlap)<br>
-        Embed via provider or TF-IDF fallback<br>
-        Query → cosine similarity → top-K<br>
-        → LLM-powered answer with source citations
+  <div class="flow">
+    <div class="node" style="min-width: 460px;">
+      <div class="title">Route Resolution</div>
+      <div class="desc">
+        <span class="service">Task Router</span> maps testType + purpose to <span class="data">TaskRoute</span><br>
+        Selects: <span class="data">prompt template</span> + <span class="data">pipeline</span> + <span class="tool">MCP tools list</span>
       </div>
     </div>
 
-    <div class="panel">
-      <div class="pt">AI Terminal — Interactive Shell</div>
-      <div class="pd">
-        Chat with LLM (streaming responses)<br>
-        Execute shell commands (audit logged)<br>
-        Direct HexStrike MCP connectivity<br>
-        Connection health monitoring
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+    <div class="node" style="min-width: 460px;">
+      <div class="title">Prompt Template Loading</div>
+      <div class="desc">
+        <span class="action">Load</span> from <span class="data">prompts/</span> (ctf solving, real pentesting, shared)<br>
+        <span class="service">Template Cache</span> (5-min TTL) + <span class="action">@include()</span> resolution
       </div>
     </div>
 
-  </div>
-</div>
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
 
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">6. External Systems</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-  <div class="side">
-
-    <div class="panel">
-      <div class="pt">LLM Providers (10 supported)</div>
-      <div class="pd">
-        LLM Registry → auto-detect API style<br>
-        LLM Gateway → unified chat + streaming<br>
-        Add provider = 1 registry entry<br><br>
-        Ollama (local) · OpenAI · Anthropic Claude<br>
-        Google Gemini · Cerebras · Groq<br>
-        Together AI · DeepSeek · OpenRouter · Custom
+    <div class="node" style="min-width: 460px;">
+      <div class="title">Context Injection and Validation</div>
+      <div class="desc">
+        <span class="action">Inject</span> 20+ variables: <span class="data">TARGET_URL</span> | <span class="data">BINARY_PATH</span> | <span class="data">CIPHER_TEXT</span> ...<br>
+        <span class="action">Validate</span> missing variables + <span class="action">sanitize</span> inputs<br>
+        <span class="action">Security</span>: path traversal detection and command injection prevention
       </div>
     </div>
 
-    <div class="panel">
-      <div class="pt">HexStrike MCP Server v6.0</div>
-      <div class="pd">
-        Python / Flask on 127.0.0.1:8888<br>
-        Intelligent Decision Engine (AI tool selection)<br>
-        Attack Chain Builder (multi-step exploits)<br><br>
-        Network: nmap, masscan, rustscan<br>
-        Web: nuclei, sqlmap, gobuster, ffuf<br>
-        Cloud: prowler, trivy, kube-hunter<br>
-        Binary: ghidra, pwntools, ropper<br>
-        + OSINT, Forensics, Crypto, Mobile
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+    <div class="node" style="min-width: 460px;">
+      <div class="title">Runtime Tool Discovery</div>
+      <div class="desc">
+        <span class="service">MCP Client</span> reads <span class="tool">/health</span> and <span class="tool">tools/list</span><br>
+        Cache tools (5-min TTL) + merge with built-in tools for agent context
       </div>
     </div>
 
-  </div>
-</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">7. Data & Security</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-  <div class="side">
-
-    <div class="panel">
-      <div class="pt">SQLite Database (WAL mode)</div>
-      <div class="pd">
-        Tables: users, runs, reports,<br>
-        llm_providers, mcp_servers,<br>
-        rag_documents, rag_chunks,<br>
-        uploads, shell_audit, settings<br><br>
-        Performance indexes, WAL checkpoints,<br>
-        safe ALTER TABLE migrations
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="pt">Security Controls</div>
-      <div class="pd">
-        JWT auth + bcrypt password hashing<br>
-        Command whitelist per category<br>
-        Dangerous pattern blocklist<br>
-        Input sanitization, output limit (50KB)<br>
-        Execution timeout (60s)<br>
-        Shell audit logging, CORS config<br>
-        Rate limiting + circuit breaker
-      </div>
-    </div>
-
-  </div>
-</div>
-
-<!-- ════════════════════════════════════════════ -->
-<div class="sh">Communication Protocols</div>
-<!-- ════════════════════════════════════════════ -->
-
-<div class="flow">
-  <div class="box wide">
-    <div class="d" style="text-align: left;">
-      Frontend  ←→  Backend    :  REST API (JSON) + JWT<br>
-      Backend   →   Frontend   :  SSE (Server-Sent Events) real-time<br>
-      Backend   ←→  LLM        :  HTTP (4 API styles: ollama, openai, anthropic, gemini)<br>
-      Backend   ←→  HexStrike  :  JSON-RPC 2.0 + REST fallback<br>
-      Backend   ←→  SQLite     :  better-sqlite3 (sync)
+    <div class="arrow">
+      <div class="line"></div>
+      <span class="arrow-label">SSE stream begins</span>
+      <div class="head"></div>
     </div>
   </div>
-</div>
 
-<div class="footer">
-  RedBox — AI-Powered Security Orchestration Platform — H3DD4 — 2026
-</div>
+  <div class="section-title">3 - AI Agent Loop (Core)</div>
+
+  <div class="flow">
+    <div class="loop-wrapper">
+      <div class="loop-label">AGENT LOOP - Max 30 Iterations</div>
+
+      <div class="node primary" style="min-width: 500px;">
+        <div class="title">LLM Chat Completion</div>
+        <div class="desc">
+          <span class="service">LLM Gateway</span> routes to active provider<br>
+          <span class="action">Token-aware trimming</span> (10k budget) + <span class="action">phase-based maxTokens</span><br>
+          <span class="action">Auto-retry</span> with progressive backoff for rate limits<br>
+          <span class="service">Rate Limiter</span> with circuit breaker and provider switch recommendation<br><br>
+          Supports: <span class="tool">Ollama</span> | <span class="tool">OpenAI</span> | <span class="tool">Claude</span> | <span class="tool">Gemini</span> | <span class="tool">Cerebras</span> | <span class="tool">Groq</span> | <span class="tool">Together</span> | <span class="tool">DeepSeek</span> | <span class="tool">OpenRouter</span>
+        </div>
+      </div>
+
+      <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+      <div class="node" style="min-width: 500px;">
+        <div class="title">Response Analysis and Guardrails</div>
+        <div class="desc">
+          <span class="action">Parse</span> ACTION directives from model output<br>
+          <span class="action">Anti-hallucination</span> checks and placeholder flag filtering<br>
+          <span class="action">Findings extraction</span> (SQLi, XSS, SSTI, RCE, LFI) + <span class="action">flag validation</span>
+        </div>
+      </div>
+
+      <div class="arrow">
+        <div class="line"></div>
+        <span class="arrow-label">ACTION: tool_name | {params}</span>
+        <div class="head"></div>
+      </div>
+
+      <div class="branch-row">
+        <div class="node small">
+          <div class="title">Web Tools</div>
+          <div class="desc">
+            <span class="tool">http_request</span> | <span class="tool">headers_check</span><br>
+            <span class="tool">directory_brute</span>
+          </div>
+        </div>
+        <div class="node small">
+          <div class="title">Network Tools</div>
+          <div class="desc">
+            <span class="tool">nc</span> | <span class="tool">dns_lookup</span><br>
+            <span class="tool">port_scan</span>
+          </div>
+        </div>
+        <div class="node small">
+          <div class="title">File Analysis</div>
+          <div class="desc">
+            <span class="tool">readfile</span> | <span class="tool">strings</span><br>
+            <span class="tool">hexdump</span> | <span class="tool">fileinfo</span>
+          </div>
+        </div>
+        <div class="node small">
+          <div class="title">Crypto and Scripts</div>
+          <div class="desc">
+            <span class="tool">base64</span> | <span class="tool">hash</span><br>
+            <span class="tool">python</span>
+          </div>
+        </div>
+        <div class="node small" style="border-color: rgba(220,38,38,0.5);">
+          <div class="title" style="color: var(--red-bright);">MCP / HexStrike</div>
+          <div class="desc">
+            <span class="tool">150+ security tools</span><br>
+            <span class="service">JSON-RPC 2.0</span> + <span class="service">REST</span> fallback
+          </div>
+        </div>
+      </div>
+
+      <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+      <div class="node" style="min-width: 500px;">
+        <div class="title">Attack State Graph and Memory</div>
+        <div class="desc">
+          <span class="action">Attack phases</span>: recon -> enumerate -> analyze -> exploit -> post<br>
+          <span class="action">Loop detection</span> + <span class="action">dead-end tracking</span> + <span class="action">phase advancement</span><br>
+          <span class="service">Experience Memory</span> boosts proven tools for similar targets
+        </div>
+      </div>
+
+      <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+      <div class="node" style="min-width: 500px;">
+        <div class="title">Tool Output Compression</div>
+        <div class="desc">
+          <span class="action">Summarize</span> outputs by tool type + detect dead ends<br>
+          <span class="action">Token-aware truncation</span> (headers + body preview for HTTP, start/end for files)
+        </div>
+      </div>
+
+      <div class="loop-back-arrow">
+        <div class="curved"></div>
+        <div class="label">ITERATE</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">4 - Results and Reporting</div>
+
+  <div class="flow">
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+    <div class="node" style="min-width: 460px;">
+      <div class="title">Results Persistence</div>
+      <div class="desc">
+        <span class="action">Store</span> to <span class="service">SQLite</span>:
+        <span class="data">findings[]</span> | <span class="data">output[]</span> | <span class="data">flag_captured</span> | <span class="data">iteration_count</span> | <span class="data">token_usage</span>
+      </div>
+    </div>
+
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+    <div class="branch-row">
+      <div class="node small">
+        <div class="title">Executive Report</div>
+        <div class="desc">
+          C-level summary<br>
+          <span class="data">Risk assessment</span><br>
+          <span class="action">Remediation timeline</span>
+        </div>
+      </div>
+      <div class="node small">
+        <div class="title">Technical Report</div>
+        <div class="desc">
+          Security engineers<br>
+          <span class="data">CWE/CVE mappings</span><br>
+          <span class="action">PoC details</span>
+        </div>
+      </div>
+      <div class="node small">
+        <div class="title">Full Report</div>
+        <div class="desc">
+          Combined audience<br>
+          <span class="data">Exec + Technical</span><br>
+          <span class="action">30/60/90 day plan</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="arrow"><div class="line"></div><div class="head"></div></div>
+
+    <div class="node" style="min-width: 360px;">
+      <div class="title">Export and Download</div>
+      <div class="desc">
+        <span class="action">Markdown</span> + <span class="action">PDF</span> generation<br>
+        <span class="service">LLM-powered</span> with template fallback
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">5 - Parallel Feature Modules</div>
+
+  <div class="flow">
+    <div class="side-by-side">
+      <div class="column-panel">
+        <div class="panel-title">RAG Advisor - Knowledge Base</div>
+        <div class="desc" style="font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; color: var(--text-dim); margin-bottom: 14px; line-height: 1.7;">
+          <span class="action">Upload</span> security documents -> <span class="action">chunk</span> (512w / 64 overlap)<br>
+          <span class="action">Embed</span> via <span class="service">provider</span> or <span class="service">TF-IDF</span> fallback<br>
+          <span class="action">Query</span> -> cosine similarity -> top-K -> <span class="service">LLM answer</span>
+        </div>
+        <div class="items">
+          <div class="item cyan">Document Ingestion</div>
+          <div class="item green">Semantic Search</div>
+          <div class="item purple">TF-IDF Embeddings</div>
+          <div class="item amber">AI-Powered Q and A</div>
+          <div class="item">Source Citations</div>
+        </div>
+      </div>
+
+      <div class="column-panel">
+        <div class="panel-title">AI Terminal - Interactive Shell</div>
+        <div class="desc" style="font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; color: var(--text-dim); margin-bottom: 14px; line-height: 1.7;">
+          <span class="action">Chat</span> with LLM for ad-hoc security queries<br>
+          <span class="action">Execute</span> shell commands with <span class="data">audit logging</span><br>
+          <span class="action">Connect</span> to <span class="service">HexStrike MCP</span> directly
+        </div>
+        <div class="items">
+          <div class="item cyan">LLM Streaming Chat</div>
+          <div class="item green">Shell Execution</div>
+          <div class="item purple">MCP Integration</div>
+          <div class="item amber">Command Audit</div>
+          <div class="item">Health Monitoring</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">6 - External Systems and Integrations</div>
+
+  <div class="flow">
+    <div class="side-by-side">
+      <div class="column-panel">
+        <div class="panel-title">LLM Providers (Multi-Provider)</div>
+        <div class="desc" style="font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; color: var(--text-dim); margin-bottom: 14px; line-height: 1.7;">
+          <span class="service">LLM Registry</span> -> auto-detect API style<br>
+          <span class="service">LLM Gateway</span> -> unified chat + streaming interface<br>
+          Add provider = <span class="action">registry entry</span> (no code change)
+        </div>
+        <div class="items">
+          <div class="item cyan">Ollama (local)</div>
+          <div class="item amber">OpenAI</div>
+          <div class="item purple">Anthropic Claude</div>
+          <div class="item green">Google Gemini</div>
+          <div class="item blue">Cerebras</div>
+          <div class="item cyan">Groq</div>
+          <div class="item amber">Together AI</div>
+          <div class="item purple">DeepSeek</div>
+          <div class="item green">OpenRouter</div>
+          <div class="item">Custom Endpoint</div>
+        </div>
+      </div>
+
+      <div class="column-panel" style="border-color: rgba(220,38,38,0.4);">
+        <div class="panel-title">HexStrike MCP Server</div>
+        <div class="desc" style="font-family: 'JetBrains Mono', monospace; font-size: 0.78rem; color: var(--text-dim); margin-bottom: 14px; line-height: 1.7;">
+          <span class="service">Python / Flask</span> on <span class="data">127.0.0.1:8888</span><br>
+          <span class="service">Tool availability</span> published via <span class="tool">/health</span><br>
+          <span class="service">JSON-RPC 2.0</span> first, <span class="service">REST</span> fallback
+        </div>
+        <div class="items">
+          <div class="item cyan">Network - nmap, masscan, rustscan</div>
+          <div class="item amber">Web - nuclei, sqlmap, gobuster, ffuf</div>
+          <div class="item green">Cloud - prowler, trivy, kube-hunter</div>
+          <div class="item purple">Binary - ghidra, pwntools, ropper</div>
+          <div class="item blue">OSINT - amass, subfinder</div>
+          <div class="item">Forensics, Crypto, Mobile</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-title">7 - Data and Security Layer</div>
+
+  <div class="flow">
+    <div class="side-by-side">
+      <div class="column-panel">
+        <div class="panel-title">SQLite Database (WAL Mode)</div>
+        <div class="items">
+          <div class="item purple">users</div>
+          <div class="item purple">runs</div>
+          <div class="item purple">reports</div>
+          <div class="item purple">llm_providers</div>
+          <div class="item purple">mcp_servers</div>
+          <div class="item purple">rag_documents</div>
+          <div class="item purple">rag_chunks</div>
+          <div class="item purple">uploads</div>
+          <div class="item purple">shell_audit</div>
+          <div class="item purple">experiences</div>
+          <div class="item purple">settings</div>
+        </div>
+      </div>
+
+      <div class="column-panel">
+        <div class="panel-title">Security Controls</div>
+        <div class="items">
+          <div class="item green">JWT Authentication</div>
+          <div class="item green">bcrypt Password Hashing</div>
+          <div class="item amber">Command Whitelist</div>
+          <div class="item amber">Dangerous Pattern Blocklist</div>
+          <div class="item cyan">Input Sanitization</div>
+          <div class="item cyan">Output Size Limits (50KB)</div>
+          <div class="item blue">Execution Timeout (60s)</div>
+          <div class="item blue">SSE Streaming</div>
+          <div class="item purple">Rate Limiting + Circuit Breaker</div>
+          <div class="item purple">CORS Configuration</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p>
+      <span class="brand">RedBox</span> - AI-Powered Security Orchestration Platform | 
+      Architecture by <span class="brand">H3DD4</span> | 
+      React + Express.js + Python | 2026
+    </p>
+  </div>
 
 </div>
 </body>
