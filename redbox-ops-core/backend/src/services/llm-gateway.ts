@@ -183,29 +183,77 @@ export async function* chatStream(
 
   const model = options.modelOverride || provider.model;
 
+  // SMART RATE LIMITING: Apply to streaming as well
+  const rateLimiter = getRateLimiter(provider.type);
+
+  if (rateLimiter.shouldRecommendProviderSwitch()) {
+    console.warn(`[LLM] ⚠️  RECOMMENDATION: Consider switching from ${provider.name} to Groq or OpenAI for better performance due to frequent rate limits.`);
+  }
+
+  const estimatedPromptTokens = rateLimiter.estimateTokens(messages);
+  const status = rateLimiter.getStatus();
+  console.log(`[LLM] ${provider.name} (stream): ${status.tokensUsed}/${status.tokensLimit} tokens, ${status.requestsUsed}/${status.requestsLimit} requests, est: +${estimatedPromptTokens}`);
+
+  if (status.circuitBreakerActive) {
+    console.warn(`[LLM] 🚨 Circuit breaker active for ${provider.name} - waiting for recovery`);
+  }
+
+  try {
+    await rateLimiter.waitForSlot(estimatedPromptTokens);
+  } catch (err) {
+    console.error("[LLM] Rate limiter failed (stream):", err);
+  }
+
   // Use apiStyle from registry to determine which handler to use
   const apiStyle = getApiStyle(provider.type);
 
+  let stream: AsyncGenerator<string>;
   switch (apiStyle) {
     case "ollama":
-      yield* streamOllama(provider, model, messages, options);
-      return;
+      stream = streamOllama(provider, model, messages, options);
+      break;
     case "openai":
       // Handles: openai, cerebras, groq, together, deepseek, openrouter, custom, and any future OpenAI-compatible
-      yield* streamOpenAI(provider, model, messages, options);
-      return;
+      stream = streamOpenAI(provider, model, messages, options);
+      break;
     case "anthropic":
-      yield* streamAnthropic(provider, model, messages, options);
-      return;
+      stream = streamAnthropic(provider, model, messages, options);
+      break;
     case "gemini":
       // Gemini streaming is complex; fall back to non-streaming
-      const result = await chatGemini(provider, model, messages, options);
-      yield result.content;
-      return;
+      stream = (async function* () {
+        const result = await chatGemini(provider, model, messages, options);
+        yield result.content;
+      })();
+      break;
     default:
       // Fallback to OpenAI-compatible for unknown providers
-      yield* streamOpenAI(provider, model, messages, options);
-      return;
+      stream = streamOpenAI(provider, model, messages, options);
+      break;
+  }
+
+  let outputChars = 0;
+  try {
+    for await (const chunk of stream) {
+      outputChars += chunk.length;
+      yield chunk;
+    }
+
+    const estimatedCompletionTokens = Math.ceil(outputChars / 3.5);
+    rateLimiter.recordUsage(estimatedPromptTokens, estimatedCompletionTokens);
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error);
+
+    if (errorMessage.includes("RATE_LIMIT") || errorMessage.includes("429")) {
+      console.warn(`[LLM] 🚨 Rate limit hit for ${provider.name}: ${errorMessage}`);
+      rateLimiter.markRateLimited();
+
+      if (rateLimiter.shouldRecommendProviderSwitch()) {
+        throw new Error(`${errorMessage}\n\n💡 TIP: This provider (${provider.name}) has very restrictive rate limits. Consider switching to Groq or OpenAI in Settings for much faster execution.`);
+      }
+    }
+
+    throw error;
   }
 }
 
@@ -403,8 +451,26 @@ async function* streamOpenAI(
     }),
   });
 
-  if (!resp.ok || !resp.body) {
-    throw new Error(`OpenAI stream error: ${resp.status}`);
+  if (!resp.ok) {
+    const text = await resp.text();
+
+    if (resp.status === 429) {
+      let errorDetail = text;
+      try {
+        const errorJson = JSON.parse(text);
+        errorDetail = errorJson.message || errorJson.error?.message || text;
+      } catch {
+        // plain text error
+      }
+
+      throw new Error(`RATE_LIMIT: ${errorDetail}  [Provider: ${provider.name}, Model: ${model}]`);
+    }
+
+    throw new Error(`OpenAI stream error (${resp.status}): ${text}`);
+  }
+
+  if (!resp.body) {
+    throw new Error(`OpenAI stream error: empty response body`);
   }
 
   const reader = resp.body.getReader();

@@ -1,0 +1,43 @@
+services:
+  backend:
+    build:
+      context: ./redbox-ops-core/backend
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      PORT: "3001"
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:5173}
+      HEXSTRIKE_API_URL: ${HEXSTRIKE_API_URL:-http://hexstrike:8888}
+      JWT_SECRET: ${JWT_SECRET:-change-me}
+      DB_PATH: /app/data/redbox.db
+      UPLOADS_DIR: /app/uploads
+      PROMPTS_DIR: /app/prompts
+    volumes:
+      - backend-data:/app/data
+      - backend-uploads:/app/uploads
+
+  frontend:
+    build:
+      context: ./redbox-ops-core
+      dockerfile: Dockerfile
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+  hexstrike:
+    profiles:
+      - hexstrike
+    build:
+      context: ./hexstrike/hexstrike-ai
+      dockerfile: Dockerfile
+    ports:
+      - "8888:8888"
+    environment:
+      HEXSTRIKE_HOST: "0.0.0.0"
+      HEXSTRIKE_PORT: "8888"
+
+volumes:
+  backend-data:
+  backend-uploads:

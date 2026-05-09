@@ -143,6 +143,28 @@ http://localhost:5173
 
 ---
 
+## 🐳 Docker Compose (Recommended)
+
+Run the full stack with Docker:
+
+```bash
+docker compose up --build
+```
+
+Optional HexStrike MCP server (heavier build):
+
+```bash
+docker compose --profile hexstrike up --build
+```
+
+**Notes:**
+- Frontend: `http://localhost:5173`
+- Backend: `http://localhost:3001`
+- HexStrike (optional): `http://localhost:8888`
+- To point the backend at a host-run HexStrike, set `HEXSTRIKE_API_URL` in a root `.env` file.
+
+---
+
 ## 💡 Usage
 
 ### 1. **Configure LLM Provider**
