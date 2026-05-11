@@ -2,14 +2,11 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-ENV VIRTUAL_ENV=/opt/venv
-ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /app
 
 RUN apt-get update \
   && apt-get install -y build-essential git curl \
-  && python -m venv "$VIRTUAL_ENV" \
   && pip install --no-cache-dir --upgrade pip \
   && rm -rf /var/lib/apt/lists/*
 
@@ -19,4 +16,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8888
-CMD ["python", "hexstrike_server.py"]
+CMD ["sh", "-lc", "if [ -d myvenv ]; then . myvenv/bin/activate; elif [ -d .venv ]; then . .venv/bin/activate; elif [ -d hexstrike-venv ]; then . hexstrike-venv/bin/activate; fi; python hexstrike_server.py"]
