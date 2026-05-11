@@ -27,8 +27,6 @@ services:
       - backend
 
   hexstrike:
-    profiles:
-      - hexstrike
     build:
       context: ./hexstrike/hexstrike-ai
       dockerfile: Dockerfile

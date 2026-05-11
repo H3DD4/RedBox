@@ -16,4 +16,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 EXPOSE 8888
-CMD ["sh", "-lc", "if [ -d myvenv ]; then . myvenv/bin/activate; elif [ -d .venv ]; then . .venv/bin/activate; elif [ -d hexstrike-venv ]; then . hexstrike-venv/bin/activate; fi; python hexstrike_server.py"]
+CMD ["sh", "-lc", ". myvenv/bin/activate && python hexstrike_server.py"]
