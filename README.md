@@ -110,6 +110,16 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+Optional helper scripts (create .venv and install deps):
+
+```bash
+# Windows PowerShell
+./scripts/setup-venv.ps1
+
+# Linux/Mac
+./scripts/setup-venv.sh
+```
+
 #### 5. Start the Platform
 
 **Terminal 1 - Backend:**

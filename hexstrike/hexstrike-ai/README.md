@@ -127,6 +127,16 @@ pip3 install -r requirements.txt
 
 ```
 
+Optional quick setup scripts (creates/uses .venv and installs deps):
+
+```bash
+# Linux/Mac
+./scripts/setup-venv.sh
+
+# Windows PowerShell
+./scripts/setup-venv.ps1
+```
+
 ### Installation and Setting Up Guide for various AI Clients:
 
 #### Installation & Demo Video
