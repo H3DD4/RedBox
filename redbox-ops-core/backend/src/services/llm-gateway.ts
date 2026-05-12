@@ -348,12 +348,18 @@ async function* streamOllama(
 
 // ─── OpenAI-compatible ───────────────────────────────────────────────────────
 
+function normalizeOpenCodeModel(providerType: string, model: string): string {
+  if (providerType !== "opencode-zen") return model;
+  return model.startsWith("opencode/") ? model.slice("opencode/".length) : model;
+}
+
 async function chatOpenAI(
   provider: ProviderRow,
   model: string,
   messages: ChatMessage[],
   options: ChatOptions
 ): Promise<ChatResult> {
+  const normalizedModel = normalizeOpenCodeModel(provider.type, model);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
@@ -372,7 +378,7 @@ async function chatOpenAI(
     method: "POST",
     headers,
     body: JSON.stringify({
-      model,
+      model: normalizedModel,
       messages: preparedMessages,
       temperature: options.temperature ?? 0.0,
       max_tokens: options.maxTokens ?? 1024,
@@ -410,7 +416,7 @@ async function chatOpenAI(
 
   return {
     content: data.choices?.[0]?.message?.content || "",
-    model,
+    model: normalizedModel,
     provider: provider.name,
     usage: data.usage
       ? { promptTokens: data.usage.prompt_tokens, completionTokens: data.usage.completion_tokens }
@@ -424,6 +430,7 @@ async function* streamOpenAI(
   messages: ChatMessage[],
   options: ChatOptions
 ): AsyncGenerator<string> {
+  const normalizedModel = normalizeOpenCodeModel(provider.type, model);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
@@ -441,7 +448,7 @@ async function* streamOpenAI(
     method: "POST",
     headers,
     body: JSON.stringify({
-      model,
+      model: normalizedModel,
       messages: preparedMessages,
       temperature: options.temperature ?? 0.0,
       max_tokens: options.maxTokens ?? 1024,

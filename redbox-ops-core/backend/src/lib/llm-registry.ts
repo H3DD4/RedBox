@@ -83,10 +83,10 @@ export const PROVIDER_REGISTRY: Record<string, ProviderConfig> = {
   groq: {
     label: "Groq",
     defaultEndpoint: "https://api.groq.com/openai/v1",
-    defaultModel: "llama-3.3-70b-versatile",
+    defaultModel: "qwen/qwen3-32b",
     requiresApiKey: true,
     apiStyle: "openai", // Groq uses OpenAI-compatible API
-    availableModels: ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+    availableModels: ["qwen/qwen3-32b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
     description: "Fast inference with Groq LPU",
   },
 
@@ -110,6 +110,16 @@ export const PROVIDER_REGISTRY: Record<string, ProviderConfig> = {
     requiresApiKey: true,
     apiStyle: "openai", // OpenRouter uses OpenAI-compatible API
     description: "Access multiple providers through one API",
+  },
+
+  "opencode-zen": {
+    label: "OpenCode Zen",
+    defaultEndpoint: "https://opencode.ai/zen/v1",
+    defaultModel: "big-pickle",
+    requiresApiKey: true,
+    apiStyle: "openai", // OpenCode Zen provides OpenAI-compatible chat/completions
+    availableModels: ["big-pickle", "opencode/big-pickle"],
+    description: "OpenCode Zen gateway (OpenAI-compatible)",
   },
 
   deepseek: {

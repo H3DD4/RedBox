@@ -1059,13 +1059,14 @@ function validateExperienceCapture(
     return { valid: true, outputSignature: `FLAG: ${verifiedFlag}` };
   }
 
-  // For CTF memory quality, persist only with direct raw-output flag evidence.
-  if (cfg.purpose === "ctf") {
-    return { valid: false, reason: "ctf memory requires raw-output flag evidence" };
-  }
-
+  // For CTF memory quality, require either a real flag OR a verified success signal.
   if (!successSignal) {
-    return { valid: false, reason: "no success signal" };
+    return {
+      valid: false,
+      reason: cfg.purpose === "ctf"
+        ? "ctf memory requires flag or verified success signal"
+        : "no success signal",
+    };
   }
 
   switch (successSignal) {
@@ -1676,6 +1677,7 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let allFindings: Finding[] = [];
   let flagCaptured: string | null = null;
   const isCTF = cfg.purpose === "ctf";
+  const isFileTask = cfg.testType === "reverse-engineering" || cfg.testType === "forensics" || cfg.testType === "cryptography";
   // FIXED: ISSUE-09 — track consecutive errors for backoff
   let consecutiveErrors = 0;
 
@@ -1886,20 +1888,25 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
             console.log(`[Run ${runId}] Cleared placeholder flag`);
           }
 
+          const restartAction = isFileTask
+            ? `ACTION: readfile | {"file": "${cfg.target}"}`
+            : `ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}`;
+          const restartTarget = isFileTask ? `The file is: ${cfg.target}` : `The target is: ${cfg.target}`;
+
           messages.push({
             role: "user",
             content: `❌ REJECTED! Your response was blocked because:
 ${looksLikeHallucination ? '- You fabricated analysis (assembly, entropy, etc.) without real data\n' : ''}${usingFakeTools ? `- You used non-existent tools: ${usedFakeTools.map(a => a.tool).join(', ')}\n` : ''}${hasPlaceholderFlag ? '- You used a placeholder flag like "actual_flag_here"\n' : ''}${tooManyActions && hasDeliverable ? '- You wrote a complete "solution" without reading the file first\n' : ''}
 **YOU MUST START OVER!**
 
-The file is: ${cfg.target}
+${restartTarget}
 
-Your ONLY allowed first action for a .java file:
-ACTION: readfile | {"file": "${cfg.target}"}
+Your ONLY allowed first action:
+${restartAction}
 
 DO NOT:
 - Use ida, gdb, entropy, decompile, or other advanced tools
-- Write analysis before seeing the real file content
+- Write analysis before seeing the real content
 - Output a "Final flag" without finding it in real data
 
 Output ONLY this one action now:`
@@ -2135,6 +2142,14 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
         role: "user",
         content: contextMessage,
       });
+
+      // Persist incremental findings and iteration progress for long-running runs
+      try {
+        db.prepare("UPDATE runs SET findings = ?, iteration_count = ? WHERE id = ?")
+          .run(JSON.stringify(allFindings), iteration, runId);
+      } catch (persistErr) {
+        console.warn(`[Run ${runId}] Failed to persist findings during iteration ${iteration}:`, persistErr);
+      }
 
       // If flag captured, we're done
       if (flagCaptured) {

@@ -34,7 +34,7 @@ const RECOMMENDED_PROVIDERS = [
     type: 'groq',
     name: 'Groq Cloud',
     endpoint: 'https://api.groq.com/openai/v1',
-    model: 'llama-3.3-70b-versatile',
+    model: 'qwen/qwen3-32b',
     description: '🚀 Also excellent: 30+ req/min, 100k tokens/min, very fast, free tier',
     signupUrl: 'https://console.groq.com/keys',
     apiKeyNote: 'Get free API key from Groq Console'
