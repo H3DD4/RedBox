@@ -36,6 +36,7 @@ const PROVIDER_TYPES = [
   { value: "together",   label: "Together AI" },                   // ADDED
   { value: "deepseek",   label: "DeepSeek" },                      // ADDED
   { value: "openrouter", label: "OpenRouter" },                    // ADDED
+  { value: "opencode-zen", label: "OpenCode Zen" },
   { value: "custom",     label: "Custom (OpenAI-compatible)" },
 ];
 
@@ -49,6 +50,7 @@ const DEFAULT_ENDPOINTS: Record<string, string> = {
   together:   "https://api.together.xyz/v1",          // ADDED
   deepseek:   "https://api.deepseek.com/v1",          // ADDED
   openrouter: "https://openrouter.ai/api/v1",         // ADDED
+  "opencode-zen": "https://opencode.ai/zen/v1",
   custom:     "",
 };
 
@@ -58,20 +60,22 @@ const DEFAULT_MODELS: Record<string, string> = {
   anthropic:  "claude-3-5-sonnet-20241022",
   gemini:     "gemini-1.5-flash",
   cerebras:   "qwen-3-235b-a22b-instruct-2507",               // FIXED: Correct model ID
-  groq:       "llama-3.3-70b-versatile",                          // ADDED
+  groq:       "qwen/qwen3-32b",
   together:   "meta-llama/Llama-3.3-70B-Instruct-Turbo",          // ADDED
   deepseek:   "deepseek-chat",                                    // ADDED
   openrouter: "anthropic/claude-3.5-sonnet",                      // ADDED
+  "opencode-zen": "big-pickle",
   custom:     "model-name",
 };
 
 // Available models per provider (for dropdown)
 const AVAILABLE_MODELS: Record<string, string[]> = {
   cerebras:  ["qwen-3-235b-a22b-instruct-2507", "llama3.1-8b"],  // FIXED: Correct Qwen model ID
-  groq:      ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
+  groq:      ["qwen/qwen3-32b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant", "mixtral-8x7b-32768"],
   openai:    ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
   anthropic: ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"],
   gemini:    ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
+  "opencode-zen": ["big-pickle", "opencode/big-pickle"],
 };
 
 const SettingsPage = () => {
@@ -424,6 +428,31 @@ const SettingsPage = () => {
                       <div>
                         <label className="text-[10px] font-mono text-red-400/70 uppercase tracking-[0.2em] mb-1 block">// API Key</label>
                         <Input type="password" value={newProv.apiKey} onChange={(e) => setNewProv({ ...newProv, apiKey: e.target.value })} placeholder="sk-…" className="bg-black/60 border-zinc-700 text-zinc-100 font-mono text-sm" />
+                        {newProv.type === "groq" && (
+                          <div className="mt-2 rounded-md border border-zinc-700/60 bg-black/50 p-2">
+                            <p className="text-[10px] text-zinc-400 font-mono mb-1">Groq Python SDK example</p>
+                            <pre className="text-[10px] text-zinc-300 font-mono whitespace-pre-wrap leading-relaxed">{`from groq import Groq
+
+client = Groq()
+completion = client.chat.completions.create(
+    model="llama-3.3-70b-versatile",
+    messages=[
+      {
+        "role": "user",
+        "content": ""
+      }
+    ],
+    temperature=1,
+    max_completion_tokens=1024,
+    top_p=1,
+    stream=True,
+    stop=None
+)
+
+for chunk in completion:
+    print(chunk.choices[0].delta.content or "", end="")`}</pre>
+                          </div>
+                        )}
                       </div>
                     )}
                     <div className="flex gap-2 justify-end">
