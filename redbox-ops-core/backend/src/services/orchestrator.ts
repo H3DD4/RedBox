@@ -102,7 +102,12 @@ const ALLOWED_COMMANDS: Record<string, string[]> = {
   network: ["ping", "nslookup", "telnet", "nc", "nmap", "dig", "powershell"],
   file: ["file", "strings", "hexdump", "head", "tail", "cat", "ls", "xxd", "type", "powershell"],
   crypto: ["openssl", "python", "node", "python3", "powershell"],
-  system: ["whoami", "id", "uname", "ps", "curl", "wget", "nc", "nmap", "ping", "powershell", "echo"]
+  system: ["whoami", "id", "uname", "ps", "curl", "wget", "nc", "nmap", "ping", "powershell", "echo"],
+  // Pentesting recon tools — used by built-in local aliases
+  pentesting: ["curl", "wget", "nc", "nslookup", "dig", "nmap", "whatweb", "subfinder", "httpx",
+    "nuclei", "gobuster", "ffuf", "cat", "ls", "find", "mkdir", "echo", "head", "tail",
+    "grep", "wc", "sort", "cut", "tr", "sed", "awk", "python", "python3", "node",
+    "file", "strings", "xxd", "base64", "cp", "mv", "chmod", "touch", "tee"],
 };
 
 const runEmitters = new Map<string, EventEmitter>();
@@ -166,7 +171,7 @@ async function executeShellCommand(command: string, categoryOrTimeout?: string |
     // Truncate large outputs
     if (output.length > MAX_TOOL_OUTPUT_SIZE) {
       output = output.substring(0, MAX_TOOL_OUTPUT_SIZE) +
-               `\n\n[OUTPUT TRUNCATED - Size: ${output.length} bytes, showing first ${MAX_TOOL_OUTPUT_SIZE} bytes]`;
+        `\n\n[OUTPUT TRUNCATED - Size: ${output.length} bytes, showing first ${MAX_TOOL_OUTPUT_SIZE} bytes]`;
     }
 
     return output;
@@ -336,7 +341,7 @@ async function executeTool(
         try {
           const code = await executeShellCommand(`curl -s -o /dev/null -w "%{http_code}" --max-time 5 "${baseUrl}${p}"`, "web", 6000);
           if (code.trim() && !["404", "000"].includes(code.trim())) output += `[${code.trim()}] ${p}\n`;
-        } catch {}
+        } catch { }
       }
       return output.trim() || "No interesting paths found";
     }
@@ -380,7 +385,7 @@ async function executeTool(
         try {
           const result = await executeShellCommand(`curl -s --max-time 2 http://${target}:${port} 2>&1`, "network", 3000);
           if (!result.includes("Failed") && !result.includes("refused")) output += `Port ${port}: OPEN\n`;
-        } catch {}
+        } catch { }
       }
       return output || `Ports filtered/closed on ${target}`;
     }
@@ -473,6 +478,176 @@ async function executeTool(
       if (!cmd) return "Error: command required";
       console.log(`[Run ${runId}] Shell: ${cmd.substring(0, 100)}`);
       return await executeShellCommand(cmd, 30000);
+    }
+
+    // ===== PENTESTING LOCAL TOOL ALIASES (run locally, fall through to MCP if not installed) =====
+
+    // bash / sh — generic shell command
+    if (tool === "bash" || tool === "sh") {
+      const cmd = (params.command || params.cmd) as string | undefined;
+      if (!cmd) return "Error: command parameter required";
+      console.log(`[Run ${runId}] Bash: ${cmd.substring(0, 100)}`);
+      return await executeShellCommand(cmd, "pentesting", 30000);
+    }
+
+    // nmap — local-first, falls through to MCP if binary not found
+    if (tool === "nmap") {
+      const target = (params.target || params.host) as string | undefined;
+      if (!target) return "Error: nmap requires a target";
+      const ports = (params.ports || "") as string;
+      const extraArgs = Array.isArray(params.args) ? (params.args as string[]).join(" ") : ((params.args || "") as string);
+      const portsArg = ports ? `-p ${ports}` : "--top-ports 100";
+      const localResult = await executeShellCommand(
+        `nmap -T4 ${portsArg} -sV --open ${extraArgs} "${target}"`,
+        "pentesting", 120000
+      );
+      if (!localResult.includes("command not found") && !localResult.includes("not recognized") && !localResult.startsWith("Error: ")) {
+        return localResult;
+      }
+      console.log(`[Run ${runId}] nmap not found locally — falling through to MCP`);
+    }
+
+    // subfinder — subdomain enumeration, local-first
+    if (tool === "subfinder") {
+      const domain = (params.domain || params.target) as string | undefined;
+      if (!domain) return "Error: subfinder requires a domain";
+      const extraArgs = Array.isArray(params.args) ? (params.args as string[]).join(" ") : "";
+      const localResult = await executeShellCommand(
+        `subfinder -d "${domain}" ${extraArgs} -silent`,
+        "pentesting", 60000
+      );
+      if (!localResult.includes("command not found") && !localResult.includes("not recognized") && !localResult.startsWith("Error: ")) {
+        return localResult;
+      }
+      console.log(`[Run ${runId}] subfinder not found locally — falling through to MCP`);
+    }
+
+    // httpx — HTTP probing, local-first
+    if (tool === "httpx") {
+      const targets = params.targets || params.target || params.url;
+      const targetStr = Array.isArray(targets) ? (targets as string[]).join("\n") : String(targets ?? "");
+      if (!targetStr) return "Error: httpx requires targets";
+      const extraArgs = Array.isArray(params.args) ? (params.args as string[]).join(" ") : "";
+      const localResult = await executeShellCommand(
+        `echo "${targetStr.replace(/"/g, "'")}" | httpx -silent -status-code -tech-detect -title ${extraArgs}`,
+        "pentesting", 120000
+      );
+      if (!localResult.includes("command not found") && !localResult.includes("not recognized") && !localResult.startsWith("Error: ")) {
+        return localResult;
+      }
+      console.log(`[Run ${runId}] httpx not found locally — falling through to MCP`);
+    }
+
+    // whatweb — tech fingerprinting, local-first
+    if (tool === "whatweb") {
+      const url = (params.url || params.target) as string | undefined;
+      if (!url) return "Error: whatweb requires a url";
+      const localResult = await executeShellCommand(
+        `whatweb "${url}" -a 3`,
+        "pentesting", 30000
+      );
+      if (!localResult.includes("command not found") && !localResult.includes("not recognized") && !localResult.startsWith("Error: ")) {
+        return localResult;
+      }
+      console.log(`[Run ${runId}] whatweb not found locally — falling through to MCP`);
+    }
+
+    // writefile / write_file / savefile — saves text output to a deliverable file
+    if (tool === "writefile" || tool === "write_file" || tool === "savefile" || tool === "save_file") {
+      const filePath = (params.file || params.path) as string | undefined;
+      const content  = (params.content || params.data) as string | undefined;
+      if (!filePath || content === undefined) return "Error: writefile requires 'file' and 'content' parameters";
+      try {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, content, "utf-8");
+        console.log(`[Run ${runId}] ✅ writefile → ${filePath} (${content.length} chars)`);
+        return `✅ File saved: ${filePath} (${content.length} chars)`;
+      } catch (e) {
+        return `Error writing file: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
+    // save_deliverable — pipeline tool: saves a typed deliverable to disk so the next phase can read it
+    // Compatible with all existing prompts using: save_deliverable { deliverable_type, content }
+    if (tool === "save_deliverable" || tool === "savedeliverable") {
+      const deliverableType = ((params.deliverable_type || params.type) as string | undefined)?.toUpperCase();
+      const content = params.content !== undefined ? params.content : params.data;
+      if (!deliverableType) return "Error: save_deliverable requires 'deliverable_type' parameter (e.g. \"RECON\", \"PRE_RECON\", \"AUTH_ANALYSIS\")";
+      if (content === undefined) return "Error: save_deliverable requires 'content' parameter";
+
+      const typeToFile: Record<string, string> = {
+        PRE_RECON: "pre_recon_deliverable.md",
+        CODE_ANALYSIS: "pre_recon_deliverable.md",
+        RECON: "recon_deliverable.md",
+        AUTH_ANALYSIS: "vuln_auth_deliverable.md",
+        AUTH_QUEUE: "auth_queue.json",
+        AUTHZ_ANALYSIS: "vuln_authz_deliverable.md",
+        AUTHZ_QUEUE: "authz_queue.json",
+        INJECTION_ANALYSIS: "vuln_injection_deliverable.md",
+        INJECTION_QUEUE: "injection_queue.json",
+        XSS_ANALYSIS: "vuln_xss_deliverable.md",
+        XSS_QUEUE: "xss_queue.json",
+        SSRF_ANALYSIS: "vuln_ssrf_deliverable.md",
+        SSRF_QUEUE: "ssrf_queue.json",
+        EXECUTIVE_REPORT: "executive_report.md",
+        REPORT: "executive_report.md",
+      };
+
+      const fileName = typeToFile[deliverableType] ?? `${deliverableType.toLowerCase()}_deliverable.md`;
+      const deliverablesDir = path.join(path.dirname(config.promptsDir), "deliverables");
+      const filePath = path.join(deliverablesDir, fileName);
+
+      try {
+        fs.mkdirSync(deliverablesDir, { recursive: true });
+        const finalContent = typeof content === "object"
+          ? JSON.stringify(content, null, 2)
+          : String(content);
+        fs.writeFileSync(filePath, finalContent, "utf-8");
+        console.log(`[Run ${runId}] 💾 save_deliverable → ${fileName} (${finalContent.length} chars)`);
+        emit(runId, { type: "status", content: `💾 Deliverable saved: ${fileName}`, timestamp: new Date().toISOString() });
+        return `{ "status": "success", "filepath": "${filePath.replace(/\\/g, "/")}", "type": "${deliverableType}", "size": ${finalContent.length} }`;
+      } catch (e) {
+        return `{ "status": "error", "message": "${e instanceof Error ? e.message : String(e)}" }`;
+      }
+    }
+
+    // read_deliverable — pipeline tool: reads a previously saved deliverable by type
+    // Compatible with all existing prompts expecting: deliverables/pre_recon_deliverable.md etc.
+    if (tool === "read_deliverable" || tool === "readdeliverable") {
+      const deliverableType = ((params.deliverable_type || params.type) as string | undefined)?.toUpperCase();
+      if (!deliverableType) return "Error: read_deliverable requires 'deliverable_type' parameter";
+
+      const typeToFile: Record<string, string> = {
+        PRE_RECON: "pre_recon_deliverable.md",
+        CODE_ANALYSIS: "pre_recon_deliverable.md",
+        RECON: "recon_deliverable.md",
+        AUTH_ANALYSIS: "vuln_auth_deliverable.md",
+        AUTH_QUEUE: "auth_queue.json",
+        AUTHZ_ANALYSIS: "vuln_authz_deliverable.md",
+        AUTHZ_QUEUE: "authz_queue.json",
+        INJECTION_ANALYSIS: "vuln_injection_deliverable.md",
+        INJECTION_QUEUE: "injection_queue.json",
+        XSS_ANALYSIS: "vuln_xss_deliverable.md",
+        XSS_QUEUE: "xss_queue.json",
+        SSRF_ANALYSIS: "vuln_ssrf_deliverable.md",
+        SSRF_QUEUE: "ssrf_queue.json",
+        EXECUTIVE_REPORT: "executive_report.md",
+        REPORT: "executive_report.md",
+      };
+
+      const fileName = typeToFile[deliverableType] ?? `${deliverableType.toLowerCase()}_deliverable.md`;
+      const filePath = path.join(path.dirname(config.promptsDir), "deliverables", fileName);
+
+      try {
+        if (!fs.existsSync(filePath)) {
+          return `[read_deliverable] ⚠️ No deliverable found for type "${deliverableType}" (looked for: ${fileName}). The prior phase may not have run yet. Continue with your own analysis.`;
+        }
+        const data = fs.readFileSync(filePath, "utf-8");
+        console.log(`[Run ${runId}] 📖 read_deliverable ← ${fileName} (${data.length} chars)`);
+        return `[DELIVERABLE: ${deliverableType}]\n${data}`;
+      } catch (e) {
+        return `Error reading deliverable: ${e instanceof Error ? e.message : String(e)}`;
+      }
     }
 
     // ===== MCP FALLBACK (HexStrike or custom MCP servers) =====
@@ -683,7 +858,7 @@ function extractFlag(text: string, customFormat?: string): string | null {
   // Add custom format pattern if provided
   if (customFormat) {
     const escaped = customFormat.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\\\{[^}]*\\\}/, '\\{[^}]+\\}');
-    try { patterns.unshift(new RegExp(escaped, 'gi')); } catch {}
+    try { patterns.unshift(new RegExp(escaped, 'gi')); } catch { }
   }
 
   for (const pattern of patterns) {
@@ -694,33 +869,33 @@ function extractFlag(text: string, customFormat?: string): string | null {
         // ANTI-FALSE-POSITIVE: Filter out obvious code/non-flags
         // Skip if it contains code-like patterns
         if (m.includes('.length()') ||
-            m.includes('userInput') ||
-            m.includes('System.') ||
-            m.includes('scanner.') ||
-            m.includes('Scanner(') ||
-            m.includes('println(') ||
-            m.includes('import ') ||
-            m.includes(' args[') ||
-            m.includes('class ') ||
-            m.includes('public ') ||
-            m.includes('private ') ||
-            m.match(/\{[^}]*\([^)]*\)/)) { // Contains function calls like {foo()}
+          m.includes('userInput') ||
+          m.includes('System.') ||
+          m.includes('scanner.') ||
+          m.includes('Scanner(') ||
+          m.includes('println(') ||
+          m.includes('import ') ||
+          m.includes(' args[') ||
+          m.includes('class ') ||
+          m.includes('public ') ||
+          m.includes('private ') ||
+          m.match(/\{[^}]*\([^)]*\)/)) { // Contains function calls like {foo()}
           continue; // Skip this match
         }
 
         // ANTI-HALLUCINATION: Skip placeholder/example flags
         const lowerFlag = m.toLowerCase();
         if (lowerFlag.includes('actual_flag') ||
-            lowerFlag.includes('flag_here') ||
-            lowerFlag.includes('your_flag') ||
-            lowerFlag.includes('example_flag') ||
-            lowerFlag.includes('placeholder') ||
-            lowerFlag.includes('xxx') ||
-            lowerFlag.includes('replace_this') ||
-            lowerFlag.includes('insert_flag') ||
-            m.includes('...') ||
-            m.includes('<flag>') ||
-            m.includes('[flag]')) {
+          lowerFlag.includes('flag_here') ||
+          lowerFlag.includes('your_flag') ||
+          lowerFlag.includes('example_flag') ||
+          lowerFlag.includes('placeholder') ||
+          lowerFlag.includes('xxx') ||
+          lowerFlag.includes('replace_this') ||
+          lowerFlag.includes('insert_flag') ||
+          m.includes('...') ||
+          m.includes('<flag>') ||
+          m.includes('[flag]')) {
           console.log(`[extractFlag] Skipping placeholder flag: ${m}`);
           continue; // Skip placeholder flags
         }
@@ -747,7 +922,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // SSTI (Server-Side Template Injection) Detection
   if (lowResponse.includes('template') || lowResponse.includes('jinja') || lowResponse.includes('{{') ||
-      lowResponse.includes('render') || lowResponse.includes('ssti') || lowResponse.includes('{{7*7}}')) {
+    lowResponse.includes('render') || lowResponse.includes('ssti') || lowResponse.includes('{{7*7}}')) {
     return {
       severity: "high",
       title: "Server-Side Template Injection (SSTI)",
@@ -759,7 +934,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // SQL Injection Detection
   if (lowResponse.includes('union') || lowResponse.includes('select') || lowResponse.includes('sql') ||
-      lowResponse.includes('injection') || lowResponse.includes('sqlmap') || lowResponse.includes('database')) {
+    lowResponse.includes('injection') || lowResponse.includes('sqlmap') || lowResponse.includes('database')) {
     return {
       severity: "high",
       title: "SQL Injection",
@@ -771,7 +946,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // Command Injection Detection
   if (lowResponse.includes('command') || lowResponse.includes('shell') || lowResponse.includes('exec') ||
-      lowResponse.includes('system') || lowResponse.includes('bash') || lowResponse.includes('cmd')) {
+    lowResponse.includes('system') || lowResponse.includes('bash') || lowResponse.includes('cmd')) {
     return {
       severity: "critical",
       title: "Command Injection",
@@ -783,7 +958,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // XSS Detection
   if (lowResponse.includes('xss') || lowResponse.includes('<script>') || lowResponse.includes('javascript:') ||
-      lowResponse.includes('alert(') || lowResponse.includes('document.cookie')) {
+    lowResponse.includes('alert(') || lowResponse.includes('document.cookie')) {
     return {
       severity: "medium",
       title: "Cross-Site Scripting (XSS)",
@@ -795,7 +970,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // Path Traversal Detection
   if (lowResponse.includes('../') || lowResponse.includes('..\\') || lowResponse.includes('directory') ||
-      lowResponse.includes('traversal') || lowResponse.includes('path') || lowResponse.includes('/etc/passwd')) {
+    lowResponse.includes('traversal') || lowResponse.includes('path') || lowResponse.includes('/etc/passwd')) {
     return {
       severity: "high",
       title: "Path Traversal",
@@ -807,7 +982,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // File Upload Vulnerability
   if (lowResponse.includes('upload') || lowResponse.includes('file') || lowResponse.includes('webshell') ||
-      lowResponse.includes('.php') || lowResponse.includes('.jsp') || lowResponse.includes('reverse shell')) {
+    lowResponse.includes('.php') || lowResponse.includes('.jsp') || lowResponse.includes('reverse shell')) {
     return {
       severity: "critical",
       title: "Unrestricted File Upload",
@@ -819,7 +994,7 @@ function detectVulnerabilityFromResponse(response: string, flag: string): Findin
 
   // Authentication Bypass
   if (lowResponse.includes('bypass') || lowResponse.includes('authentication') || lowResponse.includes('login') ||
-      lowResponse.includes('session') || lowResponse.includes('cookie') || lowResponse.includes('jwt')) {
+    lowResponse.includes('session') || lowResponse.includes('cookie') || lowResponse.includes('jwt')) {
     return {
       severity: "high",
       title: "Authentication Bypass",
@@ -876,8 +1051,8 @@ function parseFindings(text: string): Finding[] {
 
   // SQL Injection detection (more comprehensive)
   if (lowText.includes('sql injection') || lowText.includes('sql vulnerability') ||
-      (lowText.includes('union') && lowText.includes('select')) ||
-      lowText.includes('sqlmap') || lowText.includes('or 1=1')) {
+    (lowText.includes('union') && lowText.includes('select')) ||
+    lowText.includes('sqlmap') || lowText.includes('or 1=1')) {
     findings.push({
       severity: "high",
       title: "SQL Injection Vulnerability",
@@ -889,8 +1064,8 @@ function parseFindings(text: string): Finding[] {
 
   // SSTI detection (more comprehensive)
   if (lowText.includes('template injection') || lowText.includes('ssti') ||
-      lowText.includes('jinja') || lowText.includes('{{7*7}}') ||
-      lowText.includes('{{') || lowText.includes('render')) {
+    lowText.includes('jinja') || lowText.includes('{{7*7}}') ||
+    lowText.includes('{{') || lowText.includes('render')) {
     findings.push({
       severity: "high",
       title: "Server-Side Template Injection (SSTI)",
@@ -902,8 +1077,8 @@ function parseFindings(text: string): Finding[] {
 
   // XSS detection
   if (lowText.includes('xss') || lowText.includes('cross-site scripting') ||
-      lowText.includes('<script>') || lowText.includes('javascript:') ||
-      lowText.includes('alert(') || lowText.includes('document.cookie')) {
+    lowText.includes('<script>') || lowText.includes('javascript:') ||
+    lowText.includes('alert(') || lowText.includes('document.cookie')) {
     findings.push({
       severity: "medium",
       title: "Cross-Site Scripting (XSS)",
@@ -915,8 +1090,8 @@ function parseFindings(text: string): Finding[] {
 
   // Command Injection detection
   if (lowText.includes('command injection') || lowText.includes('code execution') ||
-      lowText.includes('rce') || lowText.includes('remote code execution') ||
-      (lowText.includes('shell') && lowText.includes('exec'))) {
+    lowText.includes('rce') || lowText.includes('remote code execution') ||
+    (lowText.includes('shell') && lowText.includes('exec'))) {
     findings.push({
       severity: "critical",
       title: "Command Injection / RCE",
@@ -928,8 +1103,8 @@ function parseFindings(text: string): Finding[] {
 
   // Path Traversal detection
   if (lowText.includes('path traversal') || lowText.includes('../') ||
-      lowText.includes('/etc/passwd') || lowText.includes('directory traversal') ||
-      lowText.includes('..\\') || lowText.includes('local file inclusion')) {
+    lowText.includes('/etc/passwd') || lowText.includes('directory traversal') ||
+    lowText.includes('..\\') || lowText.includes('local file inclusion')) {
     findings.push({
       severity: "high",
       title: "Path Traversal / LFI",
@@ -941,7 +1116,7 @@ function parseFindings(text: string): Finding[] {
 
   // File Upload Vulnerability
   if (lowText.includes('file upload') || lowText.includes('unrestricted upload') ||
-      lowText.includes('webshell') || lowText.includes('malicious file')) {
+    lowText.includes('webshell') || lowText.includes('malicious file')) {
     findings.push({
       severity: "critical",
       title: "Unrestricted File Upload",
@@ -953,7 +1128,7 @@ function parseFindings(text: string): Finding[] {
 
   // Authentication/Authorization Issues
   if (lowText.includes('authentication bypass') || lowText.includes('authorization bypass') ||
-      lowText.includes('privilege escalation') || lowText.includes('access control')) {
+    lowText.includes('privilege escalation') || lowText.includes('access control')) {
     findings.push({
       severity: "high",
       title: "Authentication/Authorization Bypass",
@@ -1237,6 +1412,12 @@ async function buildRuntimeToolContext(cfg: RunConfig, route: TaskRoute): Promis
     "hash", "md5", "sha256",
     "python", "python_script", "pythonscript",
     "shell", "exec", "command",
+    // Pentesting local aliases
+    "bash", "sh",
+    "nmap", "subfinder", "httpx", "whatweb",
+    "writefile", "write_file", "savefile", "save_file",
+    "save_deliverable", "savedeliverable",
+    "read_deliverable", "readdeliverable",
   ];
 
   try {
@@ -1293,7 +1474,7 @@ function injectContext(template: string, cfg: RunConfig): { result: string; vali
     // FIXED: BUG-02 — resolve MCP server name from ID
     "MCP_SERVER": cfg.mcpServerId ? (() => {
       const db = getDb();
-      const server = db.prepare("SELECT name FROM mcp_servers WHERE id = ?").get(cfg.mcpServerId) as {name:string}|undefined;
+      const server = db.prepare("SELECT name FROM mcp_servers WHERE id = ?").get(cfg.mcpServerId) as { name: string } | undefined;
       return server?.name || "hexstrike";
     })() : "hexstrike",
     // FIXED: BUG-05 — resolve real file paths from upload IDs
@@ -1488,8 +1669,8 @@ function isValidUrl(url: string): boolean {
     // Prevent localhost/internal IPs for external requests
     const hostname = parsed.hostname.toLowerCase();
     if (hostname === 'localhost' || hostname === '127.0.0.1' ||
-        hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
-        hostname.startsWith('172.16.') || hostname === '0.0.0.0') {
+      hostname.startsWith('192.168.') || hostname.startsWith('10.') ||
+      hostname.startsWith('172.16.') || hostname === '0.0.0.0') {
       console.warn(`[Security] Internal IP detected: ${hostname}`);
       // Allow but warn - might be intentional for testing
     }
@@ -1522,7 +1703,7 @@ function resolveUploadPaths(uploadIds: string[]): string {
  * Keep: system, initial user prompt, last N exchanges
  */
 // FIXED: ISSUE-06 — token-estimated trimming instead of message count
-const MAX_CONTEXT_TOKENS = 10000; // conservative for weak LLMs
+const MAX_CONTEXT_TOKENS = 16000; // increased to give recon more headroom
 
 function estimateTokens(text: string): number {
   return Math.ceil(text.length / 3.5);
@@ -1554,7 +1735,7 @@ function trimMessages(messages: ChatMessage[], maxTokens = MAX_CONTEXT_TOKENS): 
 function getMaxTokens(promptFile: string | null, testType: string): number {
   if (!promptFile) return 3072;
   if (promptFile.includes('report')) return 4096;
-  if (promptFile.includes('recon')) return 3072;
+  if (promptFile.includes('recon')) return 4096;
   if (promptFile.includes('exploit')) return 4096;
   if (promptFile.includes('pre-recon')) return 2048;
   if (testType === 'cryptography' || testType === 'binary-exploitation') return 4096;
@@ -1770,8 +1951,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
           // Check if it's a rate limit error
           if (errorMsg.includes('RATE_LIMIT') || errorMsg.includes('429')) {
             const waitTime = Math.min(60000, 10000 * Math.pow(2, retryCount)); // 10s, 20s, 40s, 60s max
-            console.warn(`[Run ${runId}] ⚠️ Rate limit hit, retrying in ${Math.round(waitTime/1000)}s (attempt ${retryCount}/${MAX_RETRIES})`);
-            emit(runId, { type: "status", content: `⏳ Rate limit - waiting ${Math.round(waitTime/1000)}s then retrying (${retryCount}/${MAX_RETRIES})...`, timestamp: new Date().toISOString() });
+            console.warn(`[Run ${runId}] ⚠️ Rate limit hit, retrying in ${Math.round(waitTime / 1000)}s (attempt ${retryCount}/${MAX_RETRIES})`);
+            emit(runId, { type: "status", content: `⏳ Rate limit - waiting ${Math.round(waitTime / 1000)}s then retrying (${retryCount}/${MAX_RETRIES})...`, timestamp: new Date().toISOString() });
             await new Promise(resolve => setTimeout(resolve, waitTime));
           } else {
             // Non-rate-limit error - still retry but with shorter wait
@@ -1955,72 +2136,127 @@ What is your next ACTION?`,
         continue;
       }
 
-      // Execute all actions
+      // ── Smart prompt compression: after iteration 3 the initial template wastes tokens ──
+      if (iteration === 3 && messages.length >= 2 && messages[1].content.length > 5000) {
+        const compressedPrompt = [
+          `[COMPRESSED CONTEXT — iteration ${iteration}]`,
+          `Target: ${cfg.target} | Phase: ${attackState.phase} | Test: ${cfg.testType}`,
+          `Built-in tools: ${runtimeToolContext.builtInTools.slice(0, 12).join(", ")} …`,
+          `MCP tools: ${runtimeToolContext.availableMcpTools.slice(0, 8).join(", ")} …`,
+          `Continue reconnaissance. Save your final report with:`,
+          `ACTION: writefile | {"file": "deliverables/recon_deliverable.md", "content": "YOUR FULL REPORT"}`,
+          `Then announce: RECONNAISSANCE COMPLETE`,
+        ].join("\n");
+        messages[1] = { ...messages[1], content: compressedPrompt };
+        console.log(`[Run ${runId}] ⚡ Compressed system prompt to ${compressedPrompt.length} chars at iteration 3`);
+        emit(runId, { type: "status", content: "⚡ Context compressed at iteration 3 to free token budget", timestamp: new Date().toISOString() });
+      }
+
+      // ── Action deduplication + capping (operates on actions already parsed above) ──
+      const actionCap = isCTF ? 5 : 3;
+      const seen = new Set<string>();
+      const dedupedActions = actions.filter(a => {
+        const key = `${a.tool}|${JSON.stringify(a.params)}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      });
+      const cappedActions = dedupedActions.slice(0, actionCap);
+      if (cappedActions.length < actions.length) {
+        const removed = actions.length - cappedActions.length;
+        console.log(`[Run ${runId}] ⚡ Capped ${removed} duplicate/excess actions (limit: ${actionCap})`);
+        emit(runId, { type: "status", content: `⚡ Capped to ${actionCap} actions per turn for focus`, timestamp: new Date().toISOString() });
+      }
+      // ── Execute all actions in PARALLEL, process results sequentially ──
       const results: string[] = [];
 
-      for (const { tool, params } of actions) {
+      // Emit tool_call events upfront (so UI shows all tools starting)
+      for (const { tool, params } of cappedActions) {
         emit(runId, {
           type: "tool_call",
           content: `${tool} → ${JSON.stringify(params).substring(0, 80)}...`,
           data: { tool, params },
           timestamp: new Date().toISOString(),
         });
-
         emit(runId, {
           type: "status",
           content: `[${stepName}:${iteration}] → ${tool}`,
           timestamp: new Date().toISOString(),
         });
+      }
 
+      // Build promises — listtools is instant, others are async tool calls
+      const toolPromises = cappedActions.map(async ({ tool, params }) => {
         const normalizedActionTool = normalizeToolName(tool);
         if (normalizedActionTool === "listtools" || normalizedActionTool === "listmcptools" || normalizedActionTool === "toolcatalog") {
-          const catalog = buildToolCatalog(runtimeToolContext);
-          results.push(`[TOOL: ${tool}]\n${catalog}`);
+          return { tool, params, result: `[TOOL: ${tool}]\n${buildToolCatalog(runtimeToolContext)}`, isCatalog: true };
+        }
+        const result = await executeTool(tool, params, runId, cfg.mcpServerId);
+        return { tool, params, result, isCatalog: false };
+      });
+
+      const settled = await Promise.allSettled(toolPromises);
+
+      // Process results sequentially — preserves state machine correctness
+      for (const outcome of settled) {
+        if (outcome.status === "rejected") {
+          results.push(`[TOOL ERROR] ${String(outcome.reason)}`);
+          continue;
+        }
+
+        const { tool, params, result, isCatalog } = outcome.value;
+
+        if (isCatalog) {
+          results.push(result);
           emit(runId, {
             type: "tool_result",
-            content: `Listed ${runtimeToolContext.builtInTools.length} built-in aliases and ${runtimeToolContext.availableMcpTools.length} MCP tools`,
+            content: `Listed ${runtimeToolContext.builtInTools.length} built-in and ${runtimeToolContext.availableMcpTools.length} MCP tools`,
             data: { tool, success: true },
             timestamp: new Date().toISOString(),
           });
           continue;
         }
 
-        const result = await executeTool(tool, params, runId, cfg.mcpServerId);
-
-        // FIXED: ISSUE-06 — Intelligent token-aware truncation for tool results
-        const MAX_TOOL_CHARS = 1800; // ~500 tokens — more aggressive to prevent rate limits
-        let truncated = result;
-
-        // SPECIAL: For HTTP responses, intelligently extract key parts
-        if (tool === 'http_request' && result.length > 1000) {
-          // Extract headers and first part of body
-          const headerEnd = result.indexOf('\n\n');
-          if (headerEnd > 0 && headerEnd < 800) {
-            const headers = result.substring(0, headerEnd);
-            const body = result.substring(headerEnd + 2);
-            const bodyPreview = body.substring(0, 1000); // Reduced for token efficiency
-            truncated = `${headers}\n\n${bodyPreview}\n\n[...HTML body truncated to save tokens. Full length: ${result.length} chars. Look for key elements like forms, flags, or interesting endpoints above.]`;
-          } else if (result.length > MAX_TOOL_CHARS) {
-            truncated = result.substring(0, MAX_TOOL_CHARS) + '\n\n[...HTTP response truncated to prevent token overload]';
+        // ── Repeated-failure injection ──
+        const failSignals = ["No such file", "not found", "TIMEOUT", "command not found", "not available", "aborted"];
+        if (failSignals.some(s => result.includes(s))) {
+          const sig = `${tool}|${JSON.stringify(params).substring(0, 80)}`;
+          attackState.repeatedFailures[sig] = (attackState.repeatedFailures[sig] || 0) + 1;
+          const failCount = attackState.repeatedFailures[sig];
+          if (failCount >= 2) {
+            const warning = `[SYSTEM] ⛔ "${tool}" has failed ${failCount} times with these params. DO NOT retry this exact call. Switch to a different tool or approach.`;
+            results.push(warning);
+            console.warn(`[Run ${runId}] Repeated failure (${failCount}x) for ${tool}`);
+            emit(runId, { type: "status", content: `⛔ Repeated failure detected for ${tool} — injecting block signal`, timestamp: new Date().toISOString() });
+            continue;
           }
         }
-        // SPECIAL: For file content, show beginning and end
-        else if ((tool === 'readfile' || tool === 'strings') && result.length > MAX_TOOL_CHARS) {
-          const start = result.substring(0, MAX_TOOL_CHARS * 0.7); // 70% from start
-          const end = result.substring(result.length - (MAX_TOOL_CHARS * 0.3)); // 30% from end
+
+        // ── Intelligent token-aware truncation ──
+        const MAX_TOOL_CHARS = 1800;
+        let truncated = result;
+
+        if (tool === "http_request" && result.length > 1000) {
+          const headerEnd = result.indexOf("\n\n");
+          if (headerEnd > 0 && headerEnd < 800) {
+            const headers = result.substring(0, headerEnd);
+            const bodyPreview = result.substring(headerEnd + 2, headerEnd + 2 + 1000);
+            truncated = `${headers}\n\n${bodyPreview}\n\n[...HTML body truncated. Full length: ${result.length} chars.]`;
+          } else if (result.length > MAX_TOOL_CHARS) {
+            truncated = result.substring(0, MAX_TOOL_CHARS) + "\n\n[...HTTP response truncated]";
+          }
+        } else if ((tool === "readfile" || tool === "strings") && result.length > MAX_TOOL_CHARS) {
+          const start = result.substring(0, Math.floor(MAX_TOOL_CHARS * 0.7));
+          const end   = result.substring(result.length - Math.floor(MAX_TOOL_CHARS * 0.3));
           truncated = `${start}\n\n[... ${result.length - MAX_TOOL_CHARS} chars truncated ...]\n\n${end}`;
-        }
-        // GENERAL: Standard truncation for other tools
-        else if (result.length > MAX_TOOL_CHARS) {
-          truncated = result.substring(0, MAX_TOOL_CHARS) + `\n\n[...output truncated to save tokens. ${result.length} chars total, showing first ${MAX_TOOL_CHARS}]`;
+        } else if (result.length > MAX_TOOL_CHARS) {
+          truncated = result.substring(0, MAX_TOOL_CHARS) + `\n\n[...output truncated. ${result.length} chars total]`;
         }
 
         results.push(`[TOOL: ${tool}]\n${truncated}`);
-        const currentAction = `${tool}(${JSON.stringify(params).slice(0,60)})`;
-        stepActionLog.push(currentAction);
+        stepActionLog.push(`${tool}(${JSON.stringify(params).slice(0, 60)})`);
 
-        // Check for flag in tool result
-        // FIXED: BUG-04 — pass custom flag format
+        // ── Flag detection ──
         const flagInResult = extractFlag(result, cfg.flagFormat);
         if (flagInResult && !flagCaptured) {
           flagCaptured = flagInResult;
@@ -2038,13 +2274,9 @@ What is your next ACTION?`,
             const capture = validateExperienceCapture(cfg, tool, result, `FLAG: ${flagInResult}`);
             if (capture.valid && capture.outputSignature) {
               saveRawExperience(runId, {
-                testType: cfg.testType,
-                phase: attackState.phase,
-                targetSignature: cfg.target,
-                triggerCondition: stepName_,
-                tool,
-                params,
-                steps: stepActionLog,
+                testType: cfg.testType, phase: attackState.phase,
+                targetSignature: cfg.target, triggerCondition: stepName_,
+                tool, params, steps: stepActionLog,
                 deadEnds: [...attackState.deadEndTools],
                 outputSignature: capture.outputSignature,
               });
@@ -2062,7 +2294,7 @@ What is your next ACTION?`,
           timestamp: new Date().toISOString(),
         });
 
-        // ── Attack State: record result + detect success/dead-end ────────
+        // ── Attack State: record result + detect success/dead-end ──
         const compressed = compressOutput(tool, result);
         const isDeadEnd = detectDeadEnd(compressed);
         const successResult = detectSuccess(compressed);
@@ -2166,15 +2398,15 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
 
       // SMART RATE LIMIT HANDLING: Better detection and progressive backoff
       const isRateLimit = errMsg.includes('RATE_LIMIT') || errMsg.includes('429') ||
-                          errMsg.includes('too_many_tokens') || errMsg.includes('quota_exceeded') ||
-                          errMsg.includes('rate limit') || errMsg.includes('high traffic');
+        errMsg.includes('too_many_tokens') || errMsg.includes('quota_exceeded') ||
+        errMsg.includes('rate limit') || errMsg.includes('high traffic');
 
       if (isRateLimit) {
         // OPTIMIZED: Much shorter waits - rate limiter should prevent most of these
         const rateLimitBackoff = Math.min(15000 * Math.pow(1.4, consecutiveErrors - 1), 60000); // 15s → 60s max
         emit(runId, {
           type: "status",
-          content: `⏱️ Rate limit hit → waiting ${Math.round(rateLimitBackoff/1000)}s (conversation continues where left off)`,
+          content: `⏱️ Rate limit hit → waiting ${Math.round(rateLimitBackoff / 1000)}s (conversation continues where left off)`,
           timestamp: new Date().toISOString()
         });
         await new Promise(r => setTimeout(r, rateLimitBackoff));
@@ -2183,7 +2415,7 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
         const serverBackoff = Math.min(10000 * Math.pow(1.3, consecutiveErrors - 1), 30000); // 10s → 30s max
         emit(runId, {
           type: "status",
-          content: `🌐 Server busy → waiting ${Math.round(serverBackoff/1000)}s then continuing...`,
+          content: `🌐 Server busy → waiting ${Math.round(serverBackoff / 1000)}s then continuing...`,
           timestamp: new Date().toISOString()
         });
         await new Promise(r => setTimeout(r, serverBackoff));
@@ -2192,7 +2424,7 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
         const backoffMs = Math.min(2000 * Math.pow(2, consecutiveErrors - 3), 20000); // 2s to 20s
         emit(runId, {
           type: "status",
-          content: `⚠️ Backing off ${Math.round(backoffMs/1000)}s after ${consecutiveErrors} errors...`,
+          content: `⚠️ Backing off ${Math.round(backoffMs / 1000)}s after ${consecutiveErrors} errors...`,
           timestamp: new Date().toISOString()
         });
         await new Promise(r => setTimeout(r, backoffMs));

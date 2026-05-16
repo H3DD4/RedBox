@@ -9,6 +9,20 @@ import { getDb } from "../db.js";
 const MCP_HEALTH_TIMEOUT_MS = 12000;
 const MCP_TOOLS_HEALTH_TIMEOUT_MS = 15000;
 
+// ── Adaptive health-polling constants ───────────────────────────────────────
+const MAX_TOOL_WAIT_MS        = 600_000; // 10 min absolute ceiling
+const HEALTH_POLL_INITIAL_MS  =   5_000; // first poll after 5 s
+const HEALTH_POLL_MAX_MS      =  15_000; // max interval between polls
+const HEALTH_POLL_BACKOFF     =     1.5; // exponential backoff factor
+const HEALTH_CHECK_TIMEOUT_MS =   4_000; // health request must respond in 4 s
+const HEALTH_POLL_GRACE_MS    =  15_000; // don't start polling until 15 s in
+
+export interface ToolHealthStatus {
+  serverAlive: boolean;
+  toolAvailable: boolean | null; // null = unknown (no tools_status key for this tool)
+  errorSignal: string | null;
+}
+
 export interface McpTool {
   name: string;
   description?: string;
@@ -35,6 +49,8 @@ export class McpClient {
   private cachedTools: McpTool[] | null = null;
   private lastToolsFetch: number = 0;
   private readonly TOOLS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+  // Cached successful protocol so we skip the failing one on future calls
+  private protocolPreference: 'jsonrpc' | 'rest' | null = null;
 
   constructor(serverUrl: string, authToken: string | null = null) {
     this.serverUrl = serverUrl.replace(/\/$/, ""); // Remove trailing slash
@@ -224,116 +240,208 @@ export class McpClient {
     }
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // Private helpers: health check + protocol-specific fetch methods
+  // ─────────────────────────────────────────────────────────────────────────
+
   /**
-   * Execute a tool on the MCP server
-   * Tries multiple formats for maximum compatibility
+   * Lightweight health check — asks /health whether the server + tool are OK.
+   * Non-blocking, fast (4 s timeout). Does NOT hammer bandwidth.
+   */
+  private async checkToolHealth(toolName: string): Promise<ToolHealthStatus> {
+    try {
+      const headers: Record<string, string> = {};
+      if (this.authToken) headers["Authorization"] = `Bearer ${this.authToken}`;
+
+      const resp = await fetch(`${this.serverUrl}/health`, {
+        method: "GET",
+        headers,
+        signal: AbortSignal.timeout(HEALTH_CHECK_TIMEOUT_MS),
+      });
+
+      if (!resp.ok) {
+        return { serverAlive: false, toolAvailable: null, errorSignal: `http_${resp.status}` };
+      }
+
+      const data = await resp.json();
+      const toolsStatus = data?.tools_status as Record<string, boolean> | undefined;
+
+      if (toolsStatus && typeof toolsStatus === "object") {
+        const norm = toolName.toLowerCase();
+        const key = Object.keys(toolsStatus).find(
+          k => k.toLowerCase() === norm || k.toLowerCase().includes(norm)
+        );
+        if (key !== undefined) {
+          return {
+            serverAlive: true,
+            toolAvailable: toolsStatus[key],
+            errorSignal: toolsStatus[key] ? null : "tool_unavailable",
+          };
+        }
+      }
+      // Server alive but tool not listed — we don't know, assume fine
+      return { serverAlive: true, toolAvailable: null, errorSignal: null };
+    } catch {
+      return { serverAlive: false, toolAvailable: null, errorSignal: "unreachable" };
+    }
+  }
+
+  /** JSON-RPC 2.0 protocol attempt */
+  private async _tryJsonRpc(
+    toolName: string,
+    params: Record<string, unknown>,
+    headers: Record<string, string>,
+    signal: AbortSignal,
+  ): Promise<McpToolResult> {
+    const resp = await fetch(`${this.serverUrl}/mcp/rpc`, {
+      method: "POST", headers, signal,
+      body: JSON.stringify({
+        jsonrpc: "2.0", id: Date.now(),
+        method: "tools/call",
+        params: { name: toolName, arguments: params },
+      }),
+    });
+    if (!resp.ok) return { success: false, error: `JSON-RPC HTTP ${resp.status}` };
+    const data = await resp.json();
+    if (data.error)  return { success: false, error: data.error.message ?? String(data.error) };
+    if (data.result) return { success: true, output: this.extractOutput(data.result), content: data.result.content };
+    return { success: false, error: "JSON-RPC: no result" };
+  }
+
+  /** REST API (HexStrike-style) attempt */
+  private async _tryRest(
+    toolName: string,
+    params: Record<string, unknown>,
+    headers: Record<string, string>,
+    signal: AbortSignal,
+  ): Promise<McpToolResult> {
+    const resp = await fetch(`${this.serverUrl}/api/tools/${toolName}`, {
+      method: "POST", headers, signal,
+      body: JSON.stringify(params),
+    });
+    if (!resp.ok) {
+      if (resp.status === 404 || resp.status === 405) return await this.executeCommand(toolName, params);
+      return { success: false, error: `MCP server returned HTTP ${resp.status}. Try built-in tools instead.` };
+    }
+    const data = await resp.json();
+    if (data.error)           return { success: false, error: data.error };
+    if (data.success === false) return { success: false, error: data.message ?? data.error ?? "Tool execution failed" };
+    return { success: true, output: this.extractOutput(data), content: data.content };
+  }
+
+  /**
+   * Protocol-aware dispatcher.
+   * Tries the cached preferred protocol first; falls back and caches the winner.
+   */
+  private async _executeToolRequest(
+    toolName: string,
+    params: Record<string, unknown>,
+    signal: AbortSignal,
+  ): Promise<McpToolResult> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.authToken) headers["Authorization"] = `Bearer ${this.authToken}`;
+
+    if (this.protocolPreference === "jsonrpc") return this._tryJsonRpc(toolName, params, headers, signal);
+    if (this.protocolPreference === "rest")    return this._tryRest(toolName, params, headers, signal);
+
+    // Unknown — try JSON-RPC first
+    try {
+      const rpc = await this._tryJsonRpc(toolName, params, headers, signal);
+      if (rpc.success) { this.protocolPreference = "jsonrpc"; return rpc; }
+      // If error looks like a real RPC error (not 404/405), cache and return
+      if (rpc.error && !rpc.error.includes("404") && !rpc.error.includes("405")) {
+        this.protocolPreference = "jsonrpc";
+        return rpc;
+      }
+    } catch (err) {
+      if (signal.aborted) throw err; // propagate abort
+    }
+
+    const rest = await this._tryRest(toolName, params, headers, signal);
+    if (rest.success) this.protocolPreference = "rest";
+    return rest;
+  }
+
+  // ─────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Execute a tool on the MCP server.
+   * Uses adaptive health-polling so heavy tools (nmap, ffuf …) can run freely
+   * while genuinely stuck/dead tools are aborted quickly.
    */
   async executeTool(
     toolName: string,
-    params: Record<string, unknown>
+    params: Record<string, unknown>,
   ): Promise<McpToolResult> {
-    console.log(`[MCP Client] Executing tool: ${toolName} with params:`, JSON.stringify(params).substring(0, 100));
+    console.log(`[MCP Client] Executing tool: ${toolName}`, JSON.stringify(params).substring(0, 100));
+
+    const ac = new AbortController();
+    const { signal } = ac;
+    let pollTimer: ReturnType<typeof setTimeout> | null = null;
+    let pollCount = 0;
+    let consecutiveFails = 0;
+
+    // Recursive health poller — runs every 5-15 s after grace period
+    const poll = async () => {
+      if (signal.aborted) return;
+      pollCount++;
+
+      const health = await this.checkToolHealth(toolName);
+
+      if (!health.serverAlive) {
+        consecutiveFails++;
+        console.warn(`[MCP Health] ${toolName}: server unreachable (${consecutiveFails}/3)`);
+        if (consecutiveFails >= 3) {
+          console.error(`[MCP Health] ${toolName}: aborting — server dead`);
+          ac.abort(new Error("MCP server unreachable after 3 consecutive health checks"));
+          return;
+        }
+      } else {
+        consecutiveFails = 0;
+      }
+
+      if (health.toolAvailable === false) {
+        console.error(`[MCP Health] ${toolName}: tool unavailable — aborting`);
+        ac.abort(new Error(`Tool "${toolName}" reported unavailable by MCP server`));
+        return;
+      }
+
+      if (!signal.aborted) {
+        const next = Math.min(HEALTH_POLL_INITIAL_MS * Math.pow(HEALTH_POLL_BACKOFF, pollCount), HEALTH_POLL_MAX_MS);
+        pollTimer = setTimeout(poll, next);
+      }
+    };
+
+    // Start polling after grace period (give the tool time to respond normally)
+    const graceTimer = setTimeout(() => {
+      console.log(`[MCP Health] ${toolName}: grace period elapsed — starting health monitoring`);
+      poll();
+    }, HEALTH_POLL_GRACE_MS);
+
+    // Absolute ceiling — even if server looks healthy, don't wait forever
+    const ceilingTimer = setTimeout(() => {
+      ac.abort(new Error(`Tool exceeded absolute maximum wait of ${MAX_TOOL_WAIT_MS / 1000}s`));
+    }, MAX_TOOL_WAIT_MS);
 
     try {
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json",
-      };
-      if (this.authToken) {
-        headers["Authorization"] = `Bearer ${this.authToken}`;
-      }
-
-      // Try Method 1: MCP JSON-RPC 2.0 format (most standard)
-      console.log(`[MCP Client] Trying JSON-RPC endpoint: ${this.serverUrl}/mcp/rpc`);
-      try {
-        const rpcResponse = await fetch(`${this.serverUrl}/mcp/rpc`, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({
-            jsonrpc: "2.0",
-            id: Date.now(),
-            method: "tools/call",
-            params: {
-              name: toolName,
-              arguments: params,
-            },
-          }),
-          signal: AbortSignal.timeout(60000),
-        });
-
-        if (rpcResponse.ok) {
-          const data = await rpcResponse.json();
-          if (data.error) {
-            console.log(`[MCP Client] JSON-RPC error:`, data.error);
-            return { success: false, error: data.error.message || data.error };
-          }
-          if (data.result) {
-            console.log(`[MCP Client] JSON-RPC success`);
-            return {
-              success: true,
-              output: this.extractOutput(data.result),
-              content: data.result.content,
-            };
-          }
-        }
-        console.log(`[MCP Client] JSON-RPC endpoint returned ${rpcResponse.status}, trying fallback`);
-      } catch (rpcErr) {
-        console.log(`[MCP Client] JSON-RPC failed:`, rpcErr instanceof Error ? rpcErr.message : String(rpcErr));
-      }
-
-      // Try Method 2: REST API (HexStrike style)
-      console.log(`[MCP Client] Trying REST endpoint: ${this.serverUrl}/api/tools/${toolName}`);
-      const restResponse = await fetch(
-        `${this.serverUrl}/api/tools/${toolName}`,
-        {
-          method: "POST",
-          headers,
-          body: JSON.stringify(params),
-          signal: AbortSignal.timeout(60000),
-        }
-      );
-
-      if (!restResponse.ok) {
-        const errorText = await restResponse.text().catch(() => "Unknown error");
-        console.error(`[MCP Client] REST API error ${restResponse.status}:`, errorText.substring(0, 200));
-
-        // If 404 or 405, means the endpoint doesn't exist - try command endpoint
-        if (restResponse.status === 404 || restResponse.status === 405) {
-          console.log(`[MCP Client] Tool endpoint not found (${restResponse.status}), trying command endpoint`);
-          return await this.executeCommand(toolName, params);
-        }
-
-        return {
-          success: false,
-          error: `MCP server returned HTTP ${restResponse.status}. Tool "${toolName}" may not be available. Try built-in tools instead.`,
-        };
-      }
-
-      const data = await restResponse.json();
-
-      // Handle various response formats
-      if (data.error) {
-        console.log(`[MCP Client] REST API returned error:`, data.error);
-        return { success: false, error: data.error };
-      }
-
-      if (data.success === false) {
-        console.log(`[MCP Client] REST API returned success=false:`, data.message || data.error);
-        return { success: false, error: data.message || data.error || "Tool execution failed" };
-      }
-
-      console.log(`[MCP Client] REST API success`);
-      return {
-        success: true,
-        output: this.extractOutput(data),
-        content: data.content,
-      };
+      const result = await this._executeToolRequest(toolName, params, signal);
+      return result;
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[MCP Client] Fatal error executing ${toolName}:`, errMsg);
+      if (signal.aborted) {
+        return {
+          success: false,
+          error: `⚠️ Tool "${toolName}" aborted: ${errMsg}\n💡 MCP health check detected an issue. Try a built-in tool instead.`,
+        };
+      }
       return {
         success: false,
         error: `MCP execution failed: ${errMsg}. HexStrike may not be running. Use built-in tools instead.`,
       };
+    } finally {
+      clearTimeout(graceTimer);
+      clearTimeout(ceilingTimer);
+      if (pollTimer) clearTimeout(pollTimer);
     }
   }
 
