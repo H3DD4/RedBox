@@ -3,9 +3,9 @@ export type AttackPhase = 'recon' | 'enumerate' | 'analyze' | 'exploit' | 'post'
 const PHASE_TOOLS: Record<AttackPhase, string[]> = {
   recon:     ['curl', 'headers_check', 'dns_lookup', 'whois', 'nmap_light'],
   enumerate: ['gobuster', 'ffuf', 'port_scan', 'nc', 'directory_brute'],
-  analyze:   ['readfile', 'strings', 'hexdump', 'fileinfo', 'python'],
-  exploit:   ['sqlmap', 'nuclei', 'python', 'nc', 'curl'],
-  post:      ['readfile', 'python', 'nc', 'curl'],
+  analyze:   ['readfile', 'strings', 'hexdump', 'fileinfo', 'python', 'create_tmp_file'],
+  exploit:   ['sqlmap', 'nuclei', 'python', 'nc', 'curl', 'create_tmp_file'],
+  post:      ['readfile', 'python', 'nc', 'curl', 'create_tmp_file'],
 };
 
 const TYPE_EXTRAS: Record<string, string[]> = {
@@ -24,7 +24,7 @@ const PHASE_HINTS: Record<AttackPhase, RegExp[]> = {
   recon: [/nmap|masscan|rustscan|dns|whois|amass|subfinder|httpx|katana|wayback|gau|scan|recon/i],
   enumerate: [/gobuster|ffuf|dir|enum|arjun|param|ferox|hakrawler|x8/i],
   analyze: [/read|file|strings|hex|ghidra|radare|objdump|analy|forensic|volatility|exif/i],
-  exploit: [/sqlmap|nuclei|exploit|sqli|xss|rce|hydra|hashcat|pwntools|ropper|metasploit|commix|tplmap/i],
+  exploit: [/sqlmap|nuclei|exploit|sqli|xss|rce|hydra|hashcat|pwntools|ropper|metasploit|commix|tplmap|create_tmp_file|writepayload/i],
   post: [/report|post|persist|lateral|cleanup|exfil|token|cookie|dump|proof/i],
 };
 
@@ -91,4 +91,14 @@ export function inferPhaseFromStep(stepName: string): AttackPhase {
   if (s.includes('exploit') || s.includes('pwn'))      return 'exploit';
   if (s.includes('post') || s.includes('report'))      return 'post';
   return 'analyze';
+}
+
+export function inferPhaseFromTool(toolName: string): AttackPhase | null {
+  const t = toolName.toLowerCase();
+  if ((PHASE_HINTS.recon ?? []).some((re) => re.test(t))) return 'recon';
+  if ((PHASE_HINTS.enumerate ?? []).some((re) => re.test(t))) return 'enumerate';
+  if ((PHASE_HINTS.analyze ?? []).some((re) => re.test(t))) return 'analyze';
+  if ((PHASE_HINTS.exploit ?? []).some((re) => re.test(t))) return 'exploit';
+  if ((PHASE_HINTS.post ?? []).some((re) => re.test(t))) return 'post';
+  return null;
 }

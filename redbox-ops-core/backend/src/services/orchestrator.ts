@@ -11,23 +11,31 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { McpClient } from "./mcp-client.js";
 import { compressOutput, detectDeadEnd, detectSuccess } from './output-compressor.js';
-import { getToolsForPhase, inferPhaseFromStep } from './tool-router.js';
+import {
+  getToolsForPhase,
+  inferPhaseFromStep,
+  inferPhaseFromTool,
+} from './tool-router.js';
 import { createAttackState, recordResult, detectLoop, advancePhase, type AttackPhase } from './attack-state.js';
 import { findSimilarExperience, saveRawExperience } from './experience-memory.js';
 import { hashParams } from './tool-executor.js';
 import {
   getGraphContextWithTimeout,
+  getLiveGraphContext,
   writeServiceDiscovery,
   writeVulnerabilityFound,
   writeDeadEnd,
   persistRunDeadEnds,
   persistAttackPath,
   updateTacticMemory,
+  updateTacticMemoryFromResult,
   parsePortScanResult,
   buildGraphContextBlock,
+  buildMidRunGraphBlock,
   emptyGraphContext,
+  emptyLiveGraphContext,
 } from './graph-service.js';
-import type { GraphContext } from '../types/graph.js';
+import type { GraphContext, LiveGraphContext } from '../types/graph.js';
 
 const execAsync = promisify(exec);
 
@@ -215,21 +223,21 @@ function validateCommand(command: string, category: string): { isValid: boolean;
 
   // Basic blacklist
   const dangerousPatterns = [
-    /rm\s+-rf\s+\//, // Dangerous rm commands
+    /rm\s+-r[fF]?\s+\/\s*$/,      // Dangerous rm / commands
+    /rm\s+-r[fF]?\s+\/\*$/,       // Dangerous rm /* commands
+    /rm\s+-r[fF]?\s+~\/?\**$/,    // Dangerous rm home directory
+    /rm\s+-r[fF]?\s+\.\.\//,      // Dangerous rm parent traversal
+    /:\(\)\{\s*:\|:&\s*\};:/,     // Fork bomb
     /dd\s+if=.*of=/, // Disk operations
     /mkfs/, // Format filesystem
     /fdisk/, // Partition manipulation
-    /chmod\s+777/, // Dangerous permissions
+    /chmod\s+-R\s+777\s+\//, // Dangerous recursive permissions on root
+    /chmod\s+777\s+\/etc/, // Dangerous permissions on /etc
     /sudo\s+/, // Privilege escalation
     /su\s+/, // User switching
-    /\/etc\/passwd/, // System file access
     /\/etc\/shadow/, // Shadow file access
-    />\s*\/dev/, // Device file writes
-    /&\s*$/, // Background execution
+    />\s*\/dev\/(sda|hda|nvme)/, // Device file writes to disks
     /;\s*powerShell/i, // PowerShell injection
-    /\|\s*sh/, // Shell piping
-    /`.*`/, // Command substitution
-    /\$\(.*\)/, // Command substitution
   ];
 
   for (const pattern of dangerousPatterns) {
@@ -403,6 +411,26 @@ async function executeTool(
       return output || `Ports filtered/closed on ${target}`;
     }
 
+    // ===== TEMP FILE TOOL =====
+    if (tool === "createtmpfile" || tool === "create_tmp_file" || tool === "writepayload") {
+      const filename = (params.filename || params.name || params.file) as string | undefined;
+      const content = (params.content || params.data || params.code) as string | undefined;
+      if (!filename || content === undefined) return "Error: create_tmp_file requires 'filename' and 'content' parameters";
+
+      const tmpDir = path.join(process.cwd(), "tmp", runId);
+      fs.mkdirSync(tmpDir, { recursive: true });
+      const filePath = path.join(tmpDir, path.basename(filename)); // path.basename prevents path traversal
+
+      try {
+        fs.writeFileSync(filePath, content, "utf-8");
+        console.log(`[Run ${runId}] 📝 create_tmp_file → ${filePath}`);
+        // Return absolute path so the agent can use it in subsequent commands
+        return `✅ Temporary file created at: ${path.resolve(filePath)}\n(This file will be automatically destroyed after the session.)`;
+      } catch (e) {
+        return `Error writing temp file: ${e instanceof Error ? e.message : String(e)}`;
+      }
+    }
+
     // ===== FILE TOOLS (Forensics, RE) =====
     // FIXED: BUG-01 — Cross-platform file operations + flexible parameter names
     if (tool === "readfile" || tool === "cat" || tool === "type") {
@@ -568,7 +596,7 @@ async function executeTool(
     // writefile / write_file / savefile — saves text output to a deliverable file
     if (tool === "writefile" || tool === "write_file" || tool === "savefile" || tool === "save_file") {
       const filePath = (params.file || params.path) as string | undefined;
-      const content  = (params.content || params.data) as string | undefined;
+      const content = (params.content || params.data) as string | undefined;
       if (!filePath || content === undefined) return "Error: writefile requires 'file' and 'content' parameters";
       try {
         fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1824,13 +1852,19 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   // Build messages with enhanced context injection
   const runtimeToolContext = await buildRuntimeToolContext(cfg, route);
 
-  // ── GRAPH CONTEXT: read once before the agent loop ──────────────────────────
-  let graphContext: GraphContext = emptyGraphContext();
+  // ── GRAPH CONTEXT: initial read before the agent loop ───────────────────────
+  // LiveGraphContext is used throughout so periodic refreshes can upgrade it in-place.
+  let graphContext: LiveGraphContext = emptyLiveGraphContext();
   try {
-    graphContext = await getGraphContextWithTimeout(cfg.target);
+    const base = await getGraphContextWithTimeout(cfg.target);
+    graphContext = { ...base, tacticWeights: [], newDeadEndsSinceStart: [] };
   } catch (err) {
     console.warn('[Graph] Context read failed, proceeding without it:', err);
   }
+
+  // Timestamp captured before the loop — used by getLiveGraphContext() to filter
+  // dead ends / services added *during this run*, including from concurrent runs.
+  const loopStartTime = new Date().toISOString();
 
   const systemMessage = buildAgentSystemMessage(cfg, route, runtimeToolContext, graphContext);
   let userPrompt: string;
@@ -1917,25 +1951,95 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let detectedServiceType: string = 'unknown';
   let experienceSaved = false;
 
+  // ── Graph refresh interval — every N iterations ────────────────────────────
+  const GRAPH_REFRESH_INTERVAL = 3;
+  const TACTIC_WEIGHT_INCLUSION_THRESHOLD = 0.5;  // include in recommended tools
+  const TACTIC_WEIGHT_PHASE_ADVANCE_THRESHOLD = 0.6; // trigger phase advancement
+
   // AGENT LOOP
   for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+    // ── Periodic graph refresh (every GRAPH_REFRESH_INTERVAL iterations) ────────
+    // Updates the system message in-place — no synthetic user turns injected.
+    // Uses a 2-second timeout so Neo4j latency never blocks the scan.
+    if (iteration > 1 && iteration % GRAPH_REFRESH_INTERVAL === 0) {
+      try {
+        const freshCtx = await getLiveGraphContext(
+          cfg.target,
+          loopStartTime,
+          detectedServiceType,
+          2000
+        );
+        // Only update + rebuild if there is actually new information
+        const hasNewDeadEnds = freshCtx.newDeadEndsSinceStart.length > graphContext.newDeadEndsSinceStart.length;
+        const hasNewServices = freshCtx.knownServices.length > graphContext.knownServices.length;
+        const hasNewTactics = freshCtx.tacticWeights.length > 0;
+        if (hasNewDeadEnds || hasNewServices || hasNewTactics) {
+          graphContext = freshCtx;
+          // Rebuild the system message (messages[0]) with fresh graph intelligence.
+          // This is the correct way to update graph context mid-loop without
+          // injecting synthetic user turns that break the turn structure.
+          messages[0] = { role: 'system', content: buildAgentSystemMessage(cfg, route, runtimeToolContext, graphContext) };
+          // Also refresh the graph-recommended tools used by the tool router
+          const graphRecommended = [
+            ...freshCtx.tacticWeights.filter((t) => t.weight >= TACTIC_WEIGHT_INCLUSION_THRESHOLD).map((t) => t.tool),
+            ...freshCtx.recommendedTools,
+          ];
+          availablePhaseTools = getToolsForPhase(
+            attackState.phase,
+            cfg.testType,
+            attackState.deadEndTools,
+            runtimeToolContext.availableMcpTools,
+            [...new Set(graphRecommended)]
+          );
+          console.log(`[Run ${runId}] [Graph] System message refreshed at iteration ${iteration} — ${freshCtx.newDeadEndsSinceStart.length} new dead ends, ${freshCtx.tacticWeights.length} tactic weights`);
+          emit(runId, { type: 'status', content: `🧠 Graph intelligence updated (iteration ${iteration})`, timestamp: new Date().toISOString() });
+        } else {
+          console.log(`[Run ${runId}] [Graph] Refresh at iteration ${iteration} — no new data, skipping system message rebuild`);
+        }
+      } catch (graphErr) {
+        console.warn(`[Run ${runId}] [Graph] Periodic refresh failed (non-fatal):`, graphErr);
+      }
+    }
+
     // ── Loop Detection ──────────────────────────────────────────────────────
     if (detectLoop(attackState)) {
       emit(runId, { type: "status", content: `⚠️ Loop detected at iteration ${iteration} — advancing phase`, timestamp: new Date().toISOString() });
-      advancePhase(attackState);
+
+      // Use tactic weights from the graph to pick the best phase to advance to.
+      // Decision logic stays here in TypeScript — the graph returns raw data only.
+      // Strategy: if tactic weights exist and the highest-weight tool is known,
+      // prefer the phase that corresponds to that tool's typical usage.
+      // Otherwise fall back to the standard sequential phase advance.
+      const topTacticTool = graphContext.tacticWeights[0]?.tool ?? null;
+      if (topTacticTool && graphContext.tacticWeights[0]?.weight >= TACTIC_WEIGHT_PHASE_ADVANCE_THRESHOLD) {
+        // Map the highest-weighted tool to its most appropriate attack phase using regex patterns
+        const phaseByTopTool = inferPhaseFromTool(topTacticTool) ?? attackState.phase;
+
+        if (phaseByTopTool !== attackState.phase) {
+          attackState.phase = phaseByTopTool;
+          attackState.recentIntents = [];
+          console.log(`[Run ${runId}] [Graph] Tactic-guided phase jump → ${phaseByTopTool} (top tool: ${topTacticTool}, weight: ${graphContext.tacticWeights[0].weight.toFixed(2)})`);
+        } else {
+          advancePhase(attackState);
+        }
+      } else {
+        advancePhase(attackState);
+      }
+
+      // Rebuild tool list for the newly selected phase
+      const graphRecommendedOnLoop = [
+        ...graphContext.tacticWeights.filter((t) => t.weight >= TACTIC_WEIGHT_INCLUSION_THRESHOLD).map((t) => t.tool),
+        ...graphContext.recommendedTools,
+      ];
       availablePhaseTools = getToolsForPhase(
         attackState.phase,
         cfg.testType,
         attackState.deadEndTools,
         runtimeToolContext.availableMcpTools,
-        graphContext.recommendedTools
+        [...new Set(graphRecommendedOnLoop)]
       );
-      if (availablePhaseTools.length > 0) {
-        messages.push({
-          role: "user",
-          content: `Loop detected. Switch to phase ${attackState.phase}. Prefer: ${availablePhaseTools.join(', ')}`,
-        });
-      }
+      // Rebuild system message rather than injecting a user turn
+      messages[0] = { role: 'system', content: buildAgentSystemMessage(cfg, route, runtimeToolContext, graphContext) };
       console.log(`[Run ${runId}] Phase advanced to: ${attackState.phase}`);
     }
 
@@ -2031,6 +2135,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
         if (!allFindings.some((existing) => existing.title === f.title)) {
           allFindings.push(f);
           emit(runId, { type: "finding", data: f, timestamp: new Date().toISOString() });
+          // CRITICAL FIX: NEVER write based on LLM text output alone
+          // Removed writeVulnerabilityFound() from here to prevent hallucinated nodes in Neo4j
         }
       }
 
@@ -2272,7 +2378,7 @@ What is your next ACTION?`,
           }
         } else if ((tool === "readfile" || tool === "strings") && result.length > MAX_TOOL_CHARS) {
           const start = result.substring(0, Math.floor(MAX_TOOL_CHARS * 0.7));
-          const end   = result.substring(result.length - Math.floor(MAX_TOOL_CHARS * 0.3));
+          const end = result.substring(result.length - Math.floor(MAX_TOOL_CHARS * 0.3));
           truncated = `${start}\n\n[... ${result.length - MAX_TOOL_CHARS} chars truncated ...]\n\n${end}`;
         } else if (result.length > MAX_TOOL_CHARS) {
           truncated = result.substring(0, MAX_TOOL_CHARS) + `\n\n[...output truncated. ${result.length} chars total]`;
@@ -2298,6 +2404,17 @@ What is your next ACTION?`,
                 .slice(0, 40);
             }
           }
+
+          // ── Immediate tactic memory update (fire-and-forget) ──────────────────
+          // Updates TacticMemory EMA weight right after each real tool execution so
+          // that subsequent getLiveGraphContext() refreshes see current weights.
+          // serviceType defaults to detectedServiceType (updated by port scan above).
+          updateTacticMemoryFromResult(detectedServiceType, tool, result)
+            .catch((e) => console.warn('[Graph] Tactic memory update failed:', e));
+        } else {
+          // Tool failed — still update tactic memory with the fail outcome
+          updateTacticMemoryFromResult(detectedServiceType, tool, result)
+            .catch((e) => console.warn('[Graph] Tactic memory fail update failed:', e));
         }
 
         // ── Flag detection ──
@@ -2312,6 +2429,26 @@ What is your next ACTION?`,
             allFindings.push(exploitedVuln);
             emit(runId, { type: "finding", data: exploitedVuln, timestamp: new Date().toISOString() });
             console.log(`[Run ${runId}] 🔍 AUTO-DETECTED VULNERABILITY: ${exploitedVuln.title}`);
+
+            // ── Strict validation: NEVER write based on LLM text output alone ──
+            // Only write when a real tool returned structured output with actual evidence
+            const isToolSuccess = !result.startsWith('Error') && !result.includes('Tool error');
+            if (
+              isToolSuccess &&
+              exploitedVuln.evidence &&
+              exploitedVuln.evidence.length > 0
+            ) {
+              // ── Immediate vulnerability write to graph ──
+              writeVulnerabilityFound(
+                cfg.target,
+                0,
+                exploitedVuln.title,
+                tool,
+                exploitedVuln.evidence,
+                exploitedVuln.confidence === 'high' ? 0.9 : 0.5,
+                exploitedVuln.cve
+              ).catch((e) => console.warn('[Graph] Vulnerability write failed:', e));
+            }
           }
 
           if (!experienceSaved) {
@@ -2547,6 +2684,18 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
   });
 
   emit(runId, { type: "complete", data: { findings: allFindings, flag: flagCaptured }, timestamp: new Date().toISOString() });
+
+  // ── CLEANUP TEMP FILES ──────────────────────────────────────────────────
+  const tmpDir = path.join(process.cwd(), "tmp", runId);
+  try {
+    if (fs.existsSync(tmpDir)) {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+      console.log(`[Run ${runId}] 🧹 Cleaned up temporary directory: ${tmpDir}`);
+    }
+  } catch (err) {
+    console.warn(`[Run ${runId}] Failed to clean up temp directory:`, err);
+  }
+
   cleanupEmitter(runId);
 }
 
@@ -2554,7 +2703,14 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
  * Build system message - SHORT, focused on agent loop mechanics
  */
 // FIXED: ISSUE-08 — clean system prompt, no contradiction with templates
-function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: RuntimeToolContext, graphContext: GraphContext = emptyGraphContext()): string {
+function buildAgentSystemMessage(
+  cfg: RunConfig,
+  route: TaskRoute,
+  toolContext: RuntimeToolContext,
+  // Accepts LiveGraphContext so mid-run refreshes can inject the richer phase-aware block.
+  // Also accepts the base GraphContext for the initial build (LiveGraphContext extends it).
+  graphContext: GraphContext | LiveGraphContext = emptyGraphContext()
+): string {
   const isCTF = cfg.purpose === "ctf";
   const isFileTask = cfg.testType === 'reverse-engineering' || cfg.testType === 'forensics' || cfg.testType === 'cryptography';
 
@@ -2575,7 +2731,13 @@ function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: 
     ? "CTF goal: report only real flags found in tool output."
     : "Goal: continue until assessment objective is complete.";
 
-  const graphBlock = buildGraphContextBlock(graphContext);
+  // Use the phase-aware mid-run block when we have a LiveGraphContext with live data,
+  // otherwise fall back to the static persistent intelligence block.
+  const isLive = 'tacticWeights' in graphContext;
+  const phase = inferPhaseFromStep(route.promptFile?.replace('.txt', '') ?? 'analyze');
+  const graphBlock = isLive
+    ? buildMidRunGraphBlock(graphContext as LiveGraphContext, phase)
+    : buildGraphContextBlock(graphContext);
 
   return `You are RedBox AI. Execute one action per turn.
 

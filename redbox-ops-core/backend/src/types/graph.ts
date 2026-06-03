@@ -70,6 +70,20 @@ export interface GraphContext {
   exploredEndpoints: string[];
 }
 
+/**
+ * Returned by getLiveGraphContext() — used for mid-run periodic graph refreshes.
+ * Extends GraphContext with tactic weights and timestamp-filtered dead ends.
+ * The orchestrator is responsible for translating weights into decisions.
+ */
+export interface LiveGraphContext extends GraphContext {
+  /** Per-tool tactic weights from TacticMemory nodes for the current service type.
+   *  Raw data — orchestrator decides how to act on them. */
+  tacticWeights: Array<{ tool: string; weight: number; outcome: string }>;
+  /** Dead ends recorded after loopStartTime, scoped to this target.
+   *  Includes dead ends from concurrent runs on the same target. */
+  newDeadEndsSinceStart: Array<{ tool: string; endpoint: string }>;
+}
+
 // Parsed result from nmap/port-scan tool output
 export interface ParsedService {
   port: number;
