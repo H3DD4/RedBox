@@ -1,0 +1,79 @@
+export interface HostNode {
+  ip: string;
+  hostname?: string;
+  os?: string;
+  firstSeen: string;
+  lastSeen: string;
+  seenCount: number;
+}
+
+export interface ServiceNode {
+  ip: string;
+  port: number;
+  protocol: string;
+  version?: string;
+  banner?: string;
+  firstSeen: string;
+}
+
+export interface VulnNode {
+  type: string;
+  cve?: string;
+  confidence: number;   // 0.0 – 1.0 — only from real tool evidence
+  severity: string;     // low | medium | high | critical
+  tool: string;
+  evidence: string;     // max 500 chars of raw confirmed output
+}
+
+export interface DeadEndNode {
+  tool: string;
+  endpoint: string;
+  ip: string;
+  reason: string;
+  runId: string;
+  timestamp: string;
+}
+
+export interface AttackPathNode {
+  id: string;
+  steps: string[];         // ordered tool names used this path
+  serviceType: string;
+  successCount: number;
+  attemptCount: number;
+  successRate: number;     // successCount / attemptCount
+  lastUsed: string;
+  lastRunId: string;
+}
+
+export interface TacticMemoryNode {
+  serviceType: string;
+  tool: string;
+  outcome: 'success' | 'fail' | 'partial';
+  weight: number;          // 0.0 – 1.0, exponential moving average
+  updatedAt: string;
+}
+
+export interface TargetProfileNode {
+  fingerprint: string;
+  ip: string;
+  seenCount: number;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+// Returned by getGraphContext() — injected into the agent system message
+export interface GraphContext {
+  knownServices: Array<{ port: number; version?: string; hasVuln: boolean }>;
+  deadEnds: Array<{ tool: string; endpoint: string }>;
+  recommendedTools: string[];
+  successfulPaths: Array<{ steps: string[]; successRate: number }>;
+  exploredEndpoints: string[];
+}
+
+// Parsed result from nmap/port-scan tool output
+export interface ParsedService {
+  port: number;
+  protocol: string;
+  version?: string;
+  banner?: string;
+}

@@ -1,7 +1,7 @@
-const NETWORK_TOOLS = new Set(['nmap','nmap_light','masscan','rustscan','port_scan']);
-const WEB_TOOLS     = new Set(['gobuster','ffuf','dirb','directory_brute','feroxbuster']);
-const VULN_TOOLS    = new Set(['nuclei','sqlmap','nikto']);
-const BINARY_TOOLS  = new Set(['strings','hexdump','readfile','fileinfo','binwalk','xxd']);
+const NETWORK_TOOLS = new Set(['nmap', 'nmap_light', 'masscan', 'rustscan', 'port_scan']);
+const WEB_TOOLS = new Set(['gobuster', 'ffuf', 'dirb', 'directory_brute', 'feroxbuster']);
+const VULN_TOOLS = new Set(['nuclei', 'sqlmap', 'nikto']);
+const BINARY_TOOLS = new Set(['strings', 'hexdump', 'readfile', 'fileinfo', 'binwalk', 'xxd']);
 
 export function compressOutput(tool: string, rawOutput: string): string {
   if (!rawOutput?.trim()) return 'EMPTY_OUTPUT';
@@ -32,17 +32,17 @@ export function compressOutput(tool: string, rawOutput: string): string {
 
 export function detectDeadEnd(output: string): boolean {
   if (!output?.trim() || output.length < 5) return true;
-  if (['EMPTY_OUTPUT','NO_FINDINGS','NO_INTERESTING_PATHS'].includes(output)) return true;
+  if (['EMPTY_OUTPUT', 'NO_FINDINGS', 'NO_INTERESTING_PATHS'].includes(output)) return true;
   if (/connection refused|timed out|no route|command not found|permission denied/i.test(output)) return true;
   return false;
 }
 
 export function detectSuccess(output: string): { found: boolean; signal: string } {
   const flag = output.match(/(CTF|FLAG|flag|HTB|picoCTF|REDBOX)\{[^}]+\}/i);
-  if (flag)                           return { found: true, signal: `FLAG: ${flag[0]}` };
+  if (flag) return { found: true, signal: `FLAG: ${flag[0]}` };
   if (output.includes('root:x:0:0')) return { found: true, signal: 'LFI_CONFIRMED' };
   if (/you have an error in your sql|syntax.*mysql|ORA-\d{5}|sqlite3.*error/i.test(output))
-                                      return { found: true, signal: 'SQLI_CONFIRMED' };
+    return { found: true, signal: 'SQLI_CONFIRMED' };
   if (/RCE_CANARY_REDBOX/i.test(output)) return { found: true, signal: 'RCE_CONFIRMED' };
   return { found: false, signal: '' };
 }

@@ -15,6 +15,19 @@ import { getToolsForPhase, inferPhaseFromStep } from './tool-router.js';
 import { createAttackState, recordResult, detectLoop, advancePhase, type AttackPhase } from './attack-state.js';
 import { findSimilarExperience, saveRawExperience } from './experience-memory.js';
 import { hashParams } from './tool-executor.js';
+import {
+  getGraphContextWithTimeout,
+  writeServiceDiscovery,
+  writeVulnerabilityFound,
+  writeDeadEnd,
+  persistRunDeadEnds,
+  persistAttackPath,
+  updateTacticMemory,
+  parsePortScanResult,
+  buildGraphContextBlock,
+  emptyGraphContext,
+} from './graph-service.js';
+import type { GraphContext } from '../types/graph.js';
 
 const execAsync = promisify(exec);
 
@@ -1810,7 +1823,16 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
 
   // Build messages with enhanced context injection
   const runtimeToolContext = await buildRuntimeToolContext(cfg, route);
-  const systemMessage = buildAgentSystemMessage(cfg, route, runtimeToolContext);
+
+  // ── GRAPH CONTEXT: read once before the agent loop ──────────────────────────
+  let graphContext: GraphContext = emptyGraphContext();
+  try {
+    graphContext = await getGraphContextWithTimeout(cfg.target);
+  } catch (err) {
+    console.warn('[Graph] Context read failed, proceeding without it:', err);
+  }
+
+  const systemMessage = buildAgentSystemMessage(cfg, route, runtimeToolContext, graphContext);
   let userPrompt: string;
   let contextValidation: ContextValidationResult | null = null;
 
@@ -1881,7 +1903,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     attackPhase,
     cfg.testType,
     attackState.deadEndTools,
-    runtimeToolContext.availableMcpTools
+    runtimeToolContext.availableMcpTools,
+    graphContext.recommendedTools
   );
   console.log(`[Run ${runId}] Phase: ${attackPhase}, Available tools: [${availablePhaseTools.join(', ')}]`);
   if (availablePhaseTools.length > 0) {
@@ -1891,6 +1914,7 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     });
   }
   const stepActionLog: string[] = [];
+  let detectedServiceType: string = 'unknown';
   let experienceSaved = false;
 
   // AGENT LOOP
@@ -1903,7 +1927,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
         attackState.phase,
         cfg.testType,
         attackState.deadEndTools,
-        runtimeToolContext.availableMcpTools
+        runtimeToolContext.availableMcpTools,
+        graphContext.recommendedTools
       );
       if (availablePhaseTools.length > 0) {
         messages.push({
@@ -2256,6 +2281,25 @@ What is your next ACTION?`,
         results.push(`[TOOL: ${tool}]\n${truncated}`);
         stepActionLog.push(`${tool}(${JSON.stringify(params).slice(0, 60)})`);
 
+        // ── Graph: write real observations (fire-and-forget, never await in hot path) ──
+        if (!result.startsWith('Error') && !result.includes('Tool error')) {
+          // Parse and store service discovery from nmap/port-scan
+          if (tool === 'nmap' || tool === 'port_scan' || tool === 'nmapscan' || tool === 'portscan') {
+            const parsedServices = parsePortScanResult(result);
+            for (const svc of parsedServices) {
+              writeServiceDiscovery(
+                runId, cfg.target, svc.port, svc.protocol, svc.version, svc.banner
+              ).catch((e) => console.warn('[Graph] Service write failed:', e));
+            }
+            if (parsedServices.length > 0 && parsedServices[0].version) {
+              detectedServiceType = parsedServices[0].version
+                .toLowerCase()
+                .replace(/\s+/g, '_')
+                .slice(0, 40);
+            }
+          }
+        }
+
         // ── Flag detection ──
         const flagInResult = extractFlag(result, cfg.flagFormat);
         if (flagInResult && !flagCaptured) {
@@ -2319,6 +2363,9 @@ What is your next ACTION?`,
         }
         if (isDeadEnd) {
           emit(runId, { type: "status", content: `💀 Dead end for ${tool} — will try alternatives`, timestamp: new Date().toISOString() });
+          // Persist dead end to graph so future runs skip it
+          writeDeadEnd(runId, cfg.target, tool, '*', 'confirmed dead end')
+            .catch((e) => console.warn('[Graph] Dead end write failed:', e));
         }
       }
 
@@ -2460,6 +2507,30 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
     });
   }
 
+  // ── POST-RUN INTELLIGENCE PERSISTENCE ───────────────────────────────────────
+  try {
+    // Always persist dead ends — even failed runs teach the system something
+    await persistRunDeadEnds(runId, cfg.target, attackState.deadEndTools);
+
+    // Persist attack path on success — works for BOTH CTF and standard runs
+    const runSucceeded =
+      flagCaptured !== null ||                        // CTF success
+      (allFindings && allFindings.length > 0) ||      // standard pentest findings
+      stepActionLog.length >= 3;                      // ran meaningful tool sequence
+
+    if (runSucceeded && stepActionLog.length > 0) {
+      await persistAttackPath(
+        runId,
+        cfg.target,
+        stepActionLog,
+        detectedServiceType,
+        true
+      );
+    }
+  } catch (err) {
+    console.warn('[Graph] Post-run persistence failed (non-fatal):', err);
+  }
+
   // Save results
   db.prepare("UPDATE runs SET status = 'completed', findings = ?, output = ?, completed_at = datetime('now') WHERE id = ?")
     .run(
@@ -2483,7 +2554,7 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
  * Build system message - SHORT, focused on agent loop mechanics
  */
 // FIXED: ISSUE-08 — clean system prompt, no contradiction with templates
-function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: RuntimeToolContext): string {
+function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: RuntimeToolContext, graphContext: GraphContext = emptyGraphContext()): string {
   const isCTF = cfg.purpose === "ctf";
   const isFileTask = cfg.testType === 'reverse-engineering' || cfg.testType === 'forensics' || cfg.testType === 'cryptography';
 
@@ -2504,6 +2575,8 @@ function buildAgentSystemMessage(cfg: RunConfig, route: TaskRoute, toolContext: 
     ? "CTF goal: report only real flags found in tool output."
     : "Goal: continue until assessment objective is complete.";
 
+  const graphBlock = buildGraphContextBlock(graphContext);
+
   return `You are RedBox AI. Execute one action per turn.
 
 Output format:
@@ -2522,7 +2595,7 @@ Rules: do not invent tools; avoid repeating failed tool+params; keep output shor
 First action:
 ${firstAction}
 
-${goalLine}`;
+${goalLine}${graphBlock}`;
 }
 
 export async function startRun(cfg: RunConfig): Promise<string> {

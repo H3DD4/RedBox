@@ -63,7 +63,8 @@ export function getToolsForPhase(
   phase: AttackPhase,
   testType: string,
   usedAndFailed: Set<string> = new Set(),
-  availableMcpTools: string[] = []
+  availableMcpTools: string[] = [],
+  graphRecommendedTools: string[] = []          // ← new optional param
 ): string[] {
   const normalizedType = normalizeTestType(testType);
   const base = PHASE_TOOLS[phase] ?? PHASE_TOOLS.recon;
@@ -71,9 +72,15 @@ export function getToolsForPhase(
   const mcpRanked = [...new Set(availableMcpTools)]
     .sort((a, b) => scoreMcpTool(b, phase, normalizedType) - scoreMcpTool(a, phase, normalizedType) || a.localeCompare(b));
 
-  return [...new Set([...base, ...extras, ...mcpRanked])]
-    .filter((t) => !usedAndFailed.has(t.toLowerCase()))
-    .slice(0, 12);
+  const combined = [...new Set([...base, ...extras, ...mcpRanked])]
+    .filter((t) => !usedAndFailed.has(t.toLowerCase()));
+
+  // Boost graph-recommended tools to front — only if they are already in the list
+  const boosted = [
+    ...graphRecommendedTools.filter((t) => combined.includes(t)),
+    ...combined.filter((t) => !graphRecommendedTools.includes(t)),
+  ];
+  return boosted.slice(0, 12);
 }
 
 export function inferPhaseFromStep(stepName: string): AttackPhase {

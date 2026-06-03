@@ -14,7 +14,8 @@
     "setup-provider": "node scripts/quick-provider-setup.js",
     "test-rate-limiter": "tsx scripts/test-rate-limiter.js",
     "test-vuln-detection": "tsx scripts/test-vuln-detection.js",
-    "monitor-scan": "tsx scripts/monitor-scan.js"
+    "monitor-scan": "tsx scripts/monitor-scan.js",
+    "neo4j:init": "tsx scripts/run-cypher.ts scripts/neo4j-init.cypher"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
@@ -26,6 +27,7 @@
     "jsonwebtoken": "^9.0.3",
     "morgan": "^1.10.0",
     "multer": "^2.1.1",
+    "neo4j-driver": "^5.28.3",
     "pdf-parse": "^2.4.5",
     "pdfkit": "^0.18.0",
     "uuid": "^13.0.0",
