@@ -26,6 +26,7 @@
 - **🔌 MCP Integration**: HexStrike Model Context Protocol for actual security tool execution
 - **📊 Report Generation**: Automated executive, technical, and full security reports
 - **🔄 Multi-LLM Support**: Ollama, OpenAI, Anthropic Claude, Google Gemini, and custom endpoints
+- **🧠 Neo4j Graph Store**: Optional Neo4j integration for attack paths, host/service context, and vulnerability graph persistence.
 
 ---
 
@@ -57,6 +58,7 @@ RedBox/
 
 - **Node.js** 18+ and npm
 - **Python** 3.8+ (for HexStrike MCP server)
+- **Neo4j** 5.x (optional, for graph persistence and attack path analysis)
 - **Ollama** (optional - for local LLM) or API keys for cloud LLMs
 
 ### Installation
@@ -96,8 +98,39 @@ Edit `.env` files with your configuration:
 - Database path
 - API ports
 - LLM provider endpoints
+- Neo4j connection settings in `redbox-ops-core/backend/.env` if using graph persistence
 
-#### 4. Setup HexStrike MCP Server (Optional)
+Example backend Neo4j variables:
+```bash
+NEO4J_URI=bolt://localhost:7687
+NEO4J_USER=neo4j
+NEO4J_PASSWORD=your-password
+NEO4J_DATABASE=pentesting
+```
+
+#### 4. Setup Neo4j Graph Store (Optional)
+
+You can start Neo4j directly with Docker:
+
+```bash
+docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:latest
+```
+
+Or use the included Docker Compose service:
+
+```bash
+docker compose up --build
+```
+
+Then initialize the Neo4j schema from the backend folder:
+
+```bash
+cd redbox-ops-core/backend
+npm install
+npm run neo4j:init
+```
+
+#### 5. Setup HexStrike MCP Server (Optional)
 
 ```bash
 cd ../hexstrike/hexstrike-ai
@@ -120,7 +153,7 @@ Optional helper scripts (create .venv and install deps):
 ./scripts/setup-venv.sh
 ```
 
-#### 5. Start the Platform
+#### 6. Start the Platform
 
 **Terminal 1 - Backend:**
 ```bash
@@ -140,7 +173,7 @@ cd hexstrike/hexstrike-ai
 python hexstrike_server.py
 ```
 
-#### 6. Access RedBox
+#### 7. Access RedBox
 
 Open your browser and navigate to:
 ```
@@ -155,7 +188,7 @@ http://localhost:5173
 
 ## 🐳 Docker Compose (Recommended)
 
-Run the full stack with Docker:
+Run the full stack with Docker (includes Neo4j):
 
 ```bash
 docker compose up --build
@@ -171,6 +204,7 @@ docker compose --profile hexstrike up --build
 - Frontend: `http://localhost:5173`
 - Backend: `http://localhost:3001`
 - HexStrike (optional): `http://localhost:8888`
+- Neo4j: `http://localhost:7474` and `bolt://localhost:7687`
 - To point the backend at a host-run HexStrike, set `HEXSTRIKE_API_URL` in a root `.env` file.
 
 ---
@@ -212,6 +246,7 @@ docker compose --profile hexstrike up --build
 ### Backend
 - **Express.js** with TypeScript
 - **SQLite** with better-sqlite3
+- **Neo4j** graph persistence via `neo4j-driver`
 - **JWT** authentication
 - **Server-Sent Events (SSE)** for streaming
 - **Multer** for file uploads
@@ -244,6 +279,7 @@ redbox-ops-core/
 │   │   │   ├── orchestrator.ts   # Core orchestration logic
 │   │   │   ├── rag-engine.ts     # RAG implementation
 │   │   │   ├── llm-gateway.ts    # Multi-LLM interface
+│   │   │   ├── neo4j.ts          # Graph persistence service
 │   │   │   ├── prompt-engine.ts  # Template system
 │   │   │   └── report-generator.ts
 │   │   ├── db.ts             # Database schema
