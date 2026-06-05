@@ -45,6 +45,18 @@ export interface AttackPathNode {
   lastRunId: string;
 }
 
+export interface ActionRecord {
+  id: string;
+  runId: string;
+  seq: number;
+  tool: string;
+  paramsHash: string;
+  outcome: 'success' | 'partial' | 'fail';
+  outputSummary: string;
+  durationMs: number;
+  createdAt: string;
+}
+
 export interface TacticMemoryNode {
   serviceType: string;
   tool: string;
@@ -82,6 +94,8 @@ export interface LiveGraphContext extends GraphContext {
   /** Dead ends recorded after loopStartTime, scoped to this target.
    *  Includes dead ends from concurrent runs on the same target. */
   newDeadEndsSinceStart: Array<{ tool: string; endpoint: string }>;
+  /** Most recent action chain for the current run. */
+  recentActions: Array<Pick<ActionRecord, 'seq' | 'tool' | 'outcome' | 'outputSummary' | 'durationMs'>>;
 }
 
 // Parsed result from nmap/port-scan tool output

@@ -1,7 +1,8 @@
 // ── Section A — Imports ──────────────────────────────────────────────────────
 import { v4 as uuidv4 } from 'uuid';
+import { createHash } from 'node:crypto';
 import { runQuery } from './neo4j.js';
-import type { GraphContext, LiveGraphContext, ParsedService } from '../types/graph.js';
+import type { ActionRecord, GraphContext, LiveGraphContext, ParsedService } from '../types/graph.js';
 
 // ── Section B — Write operations (called during run, after real tool output only) ──
 
@@ -94,6 +95,60 @@ export async function writeDeadEnd(
   );
 }
 
+// ── Section B2 — Action chain logging (per tool execution, per run) ──────────
+
+export async function appendAction(
+  runId: string,
+  seq: number,
+  tool: string,
+  params: Record<string, unknown>,
+  outputSummary: string,
+  outcome: 'success' | 'partial' | 'fail',
+  durationMs: number
+): Promise<void> {
+  const now = new Date().toISOString();
+  const id = uuidv4();
+  const paramsStr = safeStringify(params).slice(0, 500);
+  const paramsHash = hashString(paramsStr);
+  const summary = outputSummary.slice(0, 800);
+
+  await runQuery(
+    `
+    MERGE (r:Run {id: $runId})
+    OPTIONAL MATCH (r)-[:HAS_ACTION]->(prev:Action {seq: $prevSeq})
+    CREATE (a:Action {
+      id: $id,
+      runId: $runId,
+      seq: $seq,
+      tool: $tool,
+      paramsHash: $paramsHash,
+      params: $paramsStr,
+      outcome: $outcome,
+      outputSummary: $summary,
+      durationMs: $durationMs,
+      createdAt: $now
+    })
+    MERGE (r)-[:HAS_ACTION]->(a)
+    FOREACH (_ IN CASE WHEN prev IS NOT NULL THEN [1] ELSE [] END |
+      CREATE (prev)-[:NEXT]->(a)
+    )
+    `,
+    {
+      runId,
+      id,
+      seq,
+      prevSeq: seq - 1,
+      tool,
+      paramsHash,
+      paramsStr,
+      outcome,
+      summary,
+      durationMs,
+      now,
+    }
+  );
+}
+
 // ── Section C — Read operations (called ONCE before the agent loop starts) ──
 
 /**
@@ -147,21 +202,24 @@ export async function getLiveGraphContext(
   target: string,
   loopStartTime: string,   // ISO timestamp — from new Date().toISOString() before loop
   serviceType = 'unknown',
-  timeoutMs = 2000
+  timeoutMs = 2000,
+  currentRunId?: string
 ): Promise<LiveGraphContext> {
   const base = await getGraphContextWithTimeout(target, timeoutMs);
   const empty = emptyLiveGraphContext(base);
 
   const live = await Promise.race([
     (async (): Promise<LiveGraphContext> => {
-      const [newDeadEnds, tacticWeights] = await Promise.all([
+      const [newDeadEnds, tacticWeights, recentActions] = await Promise.all([
         getDeadEndsSince(target, loopStartTime),
         getTacticWeights(serviceType),
+        currentRunId ? getRecentActions(currentRunId, 6) : Promise.resolve([]),
       ]);
       return {
         ...base,
         newDeadEndsSinceStart: newDeadEnds,
         tacticWeights,
+        recentActions,
       };
     })(),
     new Promise<LiveGraphContext>((resolve) =>
@@ -223,6 +281,42 @@ export async function getDeadEndsSince(
       tool:     r.tool     as string,
       endpoint: r.endpoint as string,
     }));
+  } catch {
+    return [];
+  }
+}
+
+export async function getRecentActions(
+  runId: string,
+  limit = 6
+): Promise<Array<Pick<ActionRecord, 'seq' | 'tool' | 'outcome' | 'outputSummary' | 'durationMs'>>> {
+  if (!runId) return [];
+  try {
+    const rows = await runQuery<{
+      seq: unknown;
+      tool: unknown;
+      outcome: unknown;
+      outputSummary: unknown;
+      durationMs: unknown;
+    }>(
+      `
+      MATCH (a:Action {runId: $runId})
+      RETURN a.seq AS seq, a.tool AS tool, a.outcome AS outcome,
+             a.outputSummary AS outputSummary, a.durationMs AS durationMs
+      ORDER BY a.seq DESC
+      LIMIT $limit
+      `,
+      { runId, limit }
+    );
+    return rows
+      .map((r) => ({
+        seq: Number(r.seq),
+        tool: r.tool as string,
+        outcome: r.outcome as 'success' | 'partial' | 'fail',
+        outputSummary: r.outputSummary as string,
+        durationMs: Number(r.durationMs),
+      }))
+      .reverse();
   } catch {
     return [];
   }
@@ -368,6 +462,18 @@ export function buildMidRunGraphBlock(
     lines.push('### New dead ends since scan started:');
     for (const de of ctx.newDeadEndsSinceStart) {
       lines.push(`  - ${de.tool} on ${de.endpoint}`);
+    }
+    lines.push('');
+  }
+
+  // ── ALL PHASES: Recent action chain (this run) ────────────────────────────
+  if (ctx.recentActions.length > 0) {
+    hasContent = true;
+    lines.push('### Recent action chain (this run):');
+    for (const action of ctx.recentActions) {
+      const summary = action.outputSummary.replace(/\s+/g, ' ').slice(0, 120);
+      const duration = Number.isFinite(action.durationMs) ? ` ${Math.round(action.durationMs)}ms` : '';
+      lines.push(`  - #${action.seq} ${action.tool} [${action.outcome}]${duration} — ${summary}`);
     }
     lines.push('');
   }
@@ -623,6 +729,7 @@ export function emptyLiveGraphContext(base?: GraphContext): LiveGraphContext {
     ...(base ?? emptyGraphContext()),
     tacticWeights: [],
     newDeadEndsSinceStart: [],
+    recentActions: [],
   };
 }
 

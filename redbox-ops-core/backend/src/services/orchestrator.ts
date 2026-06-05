@@ -1857,7 +1857,12 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let graphContext: LiveGraphContext = emptyLiveGraphContext();
   try {
     const base = await getGraphContextWithTimeout(cfg.target);
-    graphContext = { ...base, tacticWeights: [], newDeadEndsSinceStart: [] };
+    graphContext = {
+      ...base,
+      tacticWeights: [],
+      newDeadEndsSinceStart: [],
+      recentActions: [],
+    };
   } catch (err) {
     console.warn('[Graph] Context read failed, proceeding without it:', err);
   }
