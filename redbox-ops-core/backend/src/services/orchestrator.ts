@@ -17,7 +17,11 @@ import {
   inferPhaseFromTool,
 } from './tool-router.js';
 import { createAttackState, recordResult, detectLoop, advancePhase, type AttackPhase } from './attack-state.js';
-import { findSimilarExperience, saveRawExperience } from './experience-memory.js';
+import { findSimilarExperience, saveRawExperience, formatExperienceForPrompt } from './experience-memory.js';
+import { getPipelinePlan, type PhaseSpec } from './phase-engine.js';
+import { emptyTargetModel, renderTargetModel, addConfirmedVuln, addHypothesis, setHypothesisStatus, openHypotheses, type Hypothesis, type TargetModel } from '../types/target-model.js';
+import { createProgressState, recordProgress, shouldStopPhase, shouldReflect, actionSignature, buildReflectionPrompt, type ProgressState } from './reasoning.js';
+import { diffBoolean, diffTiming, diffReflection, diffErrorSignature, makeMarker, type DiffObservation, type DiffResult } from './validation.js';
 import { hashParams } from './tool-executor.js';
 import {
   getGraphContextWithTimeout,
@@ -29,11 +33,14 @@ import {
   persistAttackPath,
   updateTacticMemory,
   updateTacticMemoryFromResult,
+  deriveServiceType,
+  appendAction,
   parsePortScanResult,
   buildGraphContextBlock,
   buildMidRunGraphBlock,
   emptyGraphContext,
   emptyLiveGraphContext,
+  linkVulnChain, findAttackChains, formatAttackChains
 } from './graph-service.js';
 import type { GraphContext, LiveGraphContext } from '../types/graph.js';
 
@@ -123,7 +130,7 @@ const ALLOWED_COMMANDS: Record<string, string[]> = {
   network: ["ping", "nslookup", "telnet", "nc", "nmap", "dig", "powershell"],
   file: ["file", "strings", "hexdump", "head", "tail", "cat", "ls", "xxd", "type", "powershell"],
   crypto: ["openssl", "python", "node", "python3", "powershell"],
-  system: ["whoami", "id", "uname", "ps", "curl", "wget", "nc", "nmap", "ping", "powershell", "echo"],
+  system: ["whoami","id","uname","ps","curl","wget","nc","nmap","ping","powershell","echo","python","python3","openssl","bash","sh"],
   // Pentesting recon tools — used by built-in local aliases
   pentesting: ["curl", "wget", "nc", "nslookup", "dig", "nmap", "whatweb", "subfinder", "httpx",
     "nuclei", "gobuster", "ffuf", "cat", "ls", "find", "mkdir", "echo", "head", "tail",
@@ -187,7 +194,7 @@ async function executeShellCommand(command: string, categoryOrTimeout?: string |
       }
     });
 
-    let output = stdout || stderr || "Command completed (no output)";
+    let output = stdout || stderr || "[NO OUTPUT] Command exited 0 but printed nothing. If you expected a server response, the request likely failed silently — verify the tool, path, or network.";
 
     // Truncate large outputs
     if (output.length > MAX_TOOL_OUTPUT_SIZE) {
@@ -315,9 +322,12 @@ async function executeTool(
   console.log(`[Run ${runId}] Tool: ${toolName}`, JSON.stringify(params).substring(0, 100));
 
   try {
-    const tool = toolName.toLowerCase().replace(/_/g, "").replace("-", "");
+    const tool = toolName.toLowerCase().trim();
+    const runTmpDir = path.join(process.cwd(), "tmp", runId);
+    try { fs.mkdirSync(runTmpDir, { recursive: true }); } catch { /* ignore */ }
+    const fixTmp = (v: unknown): string => typeof v === "string" ? v.replace(/\/tmp\//g, runTmpDir.replace(/\\/g, "/") + "/") : String(v ?? "");
 
-    // ===== WEB TOOLS =====
+    // ===== BUILT-IN TOOLS =====
     if (tool === "httprequest" || tool === "curl" || tool === "fetch" || tool === "request") {
       const url = params.url as string;
       if (!url) return "Error: url parameter required";
@@ -505,17 +515,20 @@ async function executeTool(
     }
 
     // FIXED: BUG-01 — Cross-platform Python execution
-    if (tool === "python" || tool === "pythonscript") {
+    if (tool === "python" || tool === "pythonscript" || tool === "python_script") {
       const script = (params.script || params.code) as string | undefined;
       if (!script) return "Error: script required";
-      const safe = script.replace(/"/g, '\\"');
-      const pythonCmd = IS_WIN ? 'python' : 'python3';
-      return await executeShellCommand(`${pythonCmd} -c "${safe}"`, "crypto", 15000);
+      const fixedScript = script.replace(/\/tmp\//g, runTmpDir.replace(/\\/g, "/") + "/");
+      const pyFile = path.join(runTmpDir, `script_${Date.now()}.py`);
+      fs.writeFileSync(pyFile, fixedScript, "utf-8");
+      const pythonCmd = IS_WIN ? "python" : "python3";
+      const out = await executeShellCommand(`${pythonCmd} "${pyFile}" 2>&1`, "crypto", 30000);
+      return out.trim() ? out : "[python ran but produced NO output — ensure the script prints, and that imported modules like 'requests' are installed]";
     }
 
     // ===== GENERIC SHELL =====
     if (tool === "shell" || tool === "exec" || tool === "command") {
-      const cmd = (params.command || params.cmd) as string | undefined;
+      const cmd = fixTmp(params.command || params.cmd);
       if (!cmd) return "Error: command required";
       console.log(`[Run ${runId}] Shell: ${cmd.substring(0, 100)}`);
       return await executeShellCommand(cmd, 30000);
@@ -525,7 +538,7 @@ async function executeTool(
 
     // bash / sh — generic shell command
     if (tool === "bash" || tool === "sh") {
-      const cmd = (params.command || params.cmd) as string | undefined;
+      const cmd = fixTmp(params.command || params.cmd);
       if (!cmd) return "Error: command parameter required";
       console.log(`[Run ${runId}] Bash: ${cmd.substring(0, 100)}`);
       return await executeShellCommand(cmd, "pentesting", 30000);
@@ -533,6 +546,10 @@ async function executeTool(
 
     // nmap — local-first, falls through to MCP if binary not found
     if (tool === "nmap") {
+      const mcpFirst = await McpClient.getClient(mcpServerId).executeTool(toolName, normalizeMcpToolParams(toolName, params)).catch(() => null);
+      if (mcpFirst && mcpFirst.success && mcpFirst.output && mcpFirst.output.trim().length > 0) {
+        return mcpFirst.output;
+      }
       const target = (params.target || params.host) as string | undefined;
       if (!target) return "Error: nmap requires a target";
       const ports = (params.ports || "") as string;
@@ -550,6 +567,10 @@ async function executeTool(
 
     // subfinder — subdomain enumeration, local-first
     if (tool === "subfinder") {
+      const mcpFirst = await McpClient.getClient(mcpServerId).executeTool(toolName, normalizeMcpToolParams(toolName, params)).catch(() => null);
+      if (mcpFirst && mcpFirst.success && mcpFirst.output && mcpFirst.output.trim().length > 0) {
+        return mcpFirst.output;
+      }
       const domain = (params.domain || params.target) as string | undefined;
       if (!domain) return "Error: subfinder requires a domain";
       const extraArgs = Array.isArray(params.args) ? (params.args as string[]).join(" ") : "";
@@ -565,6 +586,10 @@ async function executeTool(
 
     // httpx — HTTP probing, local-first
     if (tool === "httpx") {
+      const mcpFirst = await McpClient.getClient(mcpServerId).executeTool(toolName, normalizeMcpToolParams(toolName, params)).catch(() => null);
+      if (mcpFirst && mcpFirst.success && mcpFirst.output && mcpFirst.output.trim().length > 0) {
+        return mcpFirst.output;
+      }
       const targets = params.targets || params.target || params.url;
       const targetStr = Array.isArray(targets) ? (targets as string[]).join("\n") : String(targets ?? "");
       if (!targetStr) return "Error: httpx requires targets";
@@ -581,6 +606,10 @@ async function executeTool(
 
     // whatweb — tech fingerprinting, local-first
     if (tool === "whatweb") {
+      const mcpFirst = await McpClient.getClient(mcpServerId).executeTool(toolName, normalizeMcpToolParams(toolName, params)).catch(() => null);
+      if (mcpFirst && mcpFirst.success && mcpFirst.output && mcpFirst.output.trim().length > 0) {
+        return mcpFirst.output;
+      }
       const url = (params.url || params.target) as string | undefined;
       if (!url) return "Error: whatweb requires a url";
       const localResult = await executeShellCommand(
@@ -1181,6 +1210,26 @@ function parseFindings(text: string): Finding[] {
 
   // Remove duplicates based on title
   return dedupeAndSanitizeFindings(findings);
+}
+
+function signalToVulnType(signal: string): { title: string; cwe: string; severity: string } | null {
+  switch (signal) {
+    case 'SQLI_CONFIRMED': return { title:'SQL Injection', cwe:'CWE-89', severity:'high' };
+    case 'LFI_CONFIRMED':  return { title:'Path Traversal / LFI', cwe:'CWE-22', severity:'high' };
+    case 'RCE_CONFIRMED':  return { title:'Remote Code Execution', cwe:'CWE-78', severity:'critical' };
+    default: return null;
+  }
+}
+function parseFindingsStrict(text: string): Finding[] {
+  const out: Finding[] = [];
+  try {
+    const m = text.match(/\[[\s\S]*?\]/);
+    if (m) { const parsed = JSON.parse(m[0]); if (Array.isArray(parsed)) {
+      for (const f of parsed) if (f && typeof f==='object' && typeof f.title==='string' && typeof f.evidence==='string' && f.evidence.trim().length>0)
+        out.push({ severity: normalizeSeverity(f.severity||'info'), title:f.title, cwe:f.cwe||undefined, cve:f.cve||undefined, confidence:f.confidence||undefined, evidence:f.evidence });
+    } }
+  } catch { /* prose -> nothing */ }
+  return dedupeAndSanitizeFindings(out);
 }
 
 function normalizeSeverity(s: string): string {
@@ -1798,10 +1847,45 @@ function isTaskComplete(response: string, isCTF: boolean, flagCaptured: string |
   return completionSignals.some(p => p.test(response));
 }
 
-/**
- * Main agent loop execution
- */
 async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
+  const db = getDb();
+  const plan = getPipelinePlan({ testType: cfg.testType, purpose: cfg.purpose, routePromptFile: route.promptFile ?? null });
+  const model: TargetModel = emptyTargetModel(cfg.target);
+  const seqRef = { value: 0 };
+  let allFindings: Finding[] = [];
+  let flagCaptured: string | null = null;
+  let fullOutput = '';
+  for (let i = 0; i < plan.phases.length; i++) {
+    const spec = plan.phases[i];
+    if (spec.promptFile) {
+      const folder = PIPELINE_FOLDERS[route.pipeline];
+      if (folder !== undefined) {
+        const fp = path.join(config.promptsDir, folder, spec.promptFile);
+        if (!fs.existsSync(fp)) { emit(runId, { type:'status', content:`⏭️ Skip ${spec.phase} (no ${spec.promptFile})`, timestamp:new Date().toISOString() }); continue; }
+      }
+    }
+    const run = db.prepare('SELECT status FROM runs WHERE id = ?').get(runId) as { status: string } | undefined;
+    if (run?.status === 'stopped') { emit(runId, { type:'status', content:'Stopped by user', timestamp:new Date().toISOString() }); break; }
+    emit(runId, { type:'status', content:`▶️ Phase ${i+1}/${plan.phases.length}: ${spec.phase}`, timestamp:new Date().toISOString() });
+    try {
+      const r = await executePhase(runId, cfg, route, spec, model, seqRef);
+      for (const f of r.findings) if (!allFindings.some((x) => x.title === f.title)) allFindings.push(f);
+      if (r.flag && !flagCaptured) flagCaptured = r.flag;
+      fullOutput += `\n\n===== PHASE: ${spec.phase} (${spec.promptFile}) =====\n`;
+    } catch (err) { emit(runId, { type:'error', content:`Phase ${spec.phase} failed: ${err instanceof Error ? err.message : String(err)}`, timestamp:new Date().toISOString() }); }
+    if (flagCaptured && cfg.purpose === 'ctf') break;
+  }
+  db.prepare("UPDATE runs SET status='completed', findings=?, output=?, completed_at=datetime('now') WHERE id=?").run(JSON.stringify(allFindings), JSON.stringify([{ step:'pipeline', output: fullOutput }]), runId);
+  emit(runId, { type:'complete', data:{ findings: allFindings, flag: flagCaptured }, timestamp:new Date().toISOString() });
+  const tmpDir = path.join(process.cwd(), 'tmp', runId);
+  try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive:true, force:true }); } catch (e) { console.warn(`[Run ${runId}] temp cleanup:`, e); }
+  cleanupEmitter(runId);
+}
+
+/**
+ * Main agent loop execution (per-phase)
+ */
+async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spec: PhaseSpec, model: TargetModel, seqRef: { value: number }): Promise<{ findings: Finding[]; flag: string | null }> {
   const db = getDb();
 
   emit(runId, { type: "status", content: `Starting: ${route.description}`, timestamp: new Date().toISOString() });
@@ -1811,7 +1895,7 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     return run?.status === "stopped";
   };
 
-  const stepName = route.promptFile?.replace(".txt", "") || "analysis";
+  const stepName = spec.promptFile?.replace(".txt", "") || "analysis";
   emit(runId, { type: "step_start", step: stepName, timestamp: new Date().toISOString() });
 
   // RELIABILITY MONITORING: Check rate limiter status before each step
@@ -1875,14 +1959,14 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let userPrompt: string;
   let contextValidation: ContextValidationResult | null = null;
 
-  if (!route.promptFile) {
-    userPrompt = `Perform a ${cfg.testType} security assessment on: ${cfg.target}\nPurpose: ${cfg.purpose}\nScope: ${cfg.scope || "Full scope"}\n\nUse available tools to gather information and identify vulnerabilities.`;
+  if (!spec.promptFile) {
+    userPrompt = `Perform a ${cfg.testType} ${cfg.purpose} assessment of: ${cfg.target}\nPhase: ${spec.phase}. Use tools to gather evidence, confirm findings with proof, and report only confirmed issues.`;
   } else {
-    const template = loadPromptTemplate(route.pipeline, route.promptFile);
+    const template = loadPromptTemplate(route.pipeline, spec.promptFile);
     if (!template) {
-      emit(runId, { type: "error", content: `Prompt not found: ${route.promptFile}`, timestamp: new Date().toISOString() });
-      throw new Error(`Prompt template not found: ${route.pipeline}/${route.promptFile}`);
-    }
+      userPrompt = `Perform a ${cfg.testType} ${cfg.purpose} assessment of: ${cfg.target}\nPhase: ${spec.phase}. Use tools to gather evidence, confirm findings with proof, and report only confirmed issues.`;
+      emit(runId, { type: "status", content: `⚠️ Prompt template not found: ${route.pipeline}/${spec.promptFile}. Using fallback prompt.`, timestamp: new Date().toISOString() });
+    } else {
 
     // Enhanced context injection with validation
     const { result, validation } = injectContext(template, cfg);
@@ -1908,6 +1992,7 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     } else {
       emit(runId, { type: "status", content: `✓ Context validation passed`, timestamp: new Date().toISOString() });
     }
+    }
   }
 
   const messages: ChatMessage[] = [
@@ -1915,21 +2000,48 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     { role: "user", content: userPrompt },
   ];
 
+  // S1.T6: memory recall + target-model hand-off
+  const carried = renderTargetModel(model);
+  if (carried) messages.push({ role:'user', content: carried });
+  const recalled = findSimilarExperience({ testType: cfg.testType, phase: (spec.phase === 'report' ? 'post' : spec.phase) as string, targetSignature: cfg.target, triggerCondition: spec.promptFile || spec.phase });
+  if (recalled) { messages.push({ role:'user', content: formatExperienceForPrompt(recalled) }); emit(runId, { type:'status', content:`🧠 Recalled: ${recalled.tool}`, timestamp:new Date().toISOString() }); }
+
+  if (spec.phase === 'report') {
+    const confirmed = model.confirmedVulns;
+    for (let i = 0; i < confirmed.length - 1; i++) for (let j = i + 1; j < confirmed.length; j++) linkVulnChain(cfg.target, confirmed[i].type, confirmed[j].type, 'co-confirmed on target').catch(() => {});
+    const chains = await findAttackChains(cfg.target).catch(() => []);
+    const chainBlock = formatAttackChains(chains);
+    if (chainBlock) { messages.push({ role:'user', content: chainBlock }); emit(runId, { type:'status', content:`🔗 ${chains.length} attack chain(s) surfaced for report`, timestamp:new Date().toISOString() }); }
+  }
+
+  // S4.T2: per-phase objective (non-CTF only)
+  if (cfg.purpose !== 'ctf') {
+    const phaseGoal: Record<string, string> = {
+      recon:     'Map the full attack surface (endpoints, params, tech, services). When mapped, save a deliverable and output: RECON COMPLETE.',
+      enumerate: 'Enumerate hidden endpoints/params/services. When exhausted, output: PHASE COMPLETE.',
+      analyze:   'For this vuln class, form hypotheses for every candidate surface. When all candidates are tested, output: ANALYSIS COMPLETE.',
+      exploit:   'Confirm each open hypothesis with a real payload + diff_probe. When all are confirmed or refuted, output: PHASE COMPLETE.',
+      report:    'Write the final report including confirmed vulns and attack chains. Then output: ASSESSMENT COMPLETE.',
+    };
+    const goal = phaseGoal[spec.phase] ?? 'Complete this phase, then output: PHASE COMPLETE.';
+    messages.push({ role:'user', content: `## PHASE OBJECTIVE (${spec.phase})\n${goal}\nThere is NO flag in a pentest — completion means the objective above is met.` });
+  }
+
   let fullOutput = "";
   let allFindings: Finding[] = [];
   let flagCaptured: string | null = null;
   const isCTF = cfg.purpose === "ctf";
   const isFileTask = cfg.testType === "reverse-engineering" || cfg.testType === "forensics" || cfg.testType === "cryptography";
-  // FIXED: ISSUE-09 — track consecutive errors for backoff
+  
   let consecutiveErrors = 0;
+  console.log(`[Run ${runId}] Agent loop starting - ${spec.promptFile || "direct"}`);
 
-  console.log(`[Run ${runId}] Agent loop starting - ${route.promptFile || "direct"}`);
-
-  // ── Attack State Integration ──────────────────────────────────────────────
-  const stepName_ = route.promptFile?.replace(".txt", "") || "analysis";
-  const attackPhase = inferPhaseFromStep(stepName_) as AttackPhase;
+  // stepName is defined above — re-use it rather than redefining as stepName_
+  const attackPhase = inferPhaseFromStep(stepName) as AttackPhase;
   const attackState = createAttackState(runId, cfg.target, cfg.testType, attackPhase);
-  const pastExperience = findSimilarExperience({ testType: cfg.testType, phase: attackPhase, targetSignature: cfg.target, triggerCondition: stepName_ });
+  // S1.T4(c): set phase from spec
+  attackState.phase = (spec.phase === 'report' ? 'post' : spec.phase) as typeof attackState.phase;
+  const pastExperience = findSimilarExperience({ testType: cfg.testType, phase: attackPhase, targetSignature: cfg.target, triggerCondition: stepName });
   if (pastExperience) {
     console.log(`[Run ${runId}] Found past experience: ${pastExperience.tool} (q=${pastExperience.q_value})`);
     emit(runId, { type: "status", content: `📚 Using past experience: ${pastExperience.tool} (confidence: ${pastExperience.q_value.toFixed(2)})`, timestamp: new Date().toISOString() });
@@ -1956,13 +2068,21 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let detectedServiceType: string = 'unknown';
   let experienceSaved = false;
 
+  void openHypotheses; void makeMarker;
   // ── Graph refresh interval — every N iterations ────────────────────────────
   const GRAPH_REFRESH_INTERVAL = 3;
   const TACTIC_WEIGHT_INCLUSION_THRESHOLD = 0.5;  // include in recommended tools
   const TACTIC_WEIGHT_PHASE_ADVANCE_THRESHOLD = 0.6; // trigger phase advancement
 
+  // S2.T3(a): adaptive progress tracking
+  const progress: ProgressState = createProgressState();
+
   // AGENT LOOP
-  for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
+  let iteration = 0;
+  while (true) {
+    iteration++;
+    const stopCheck = shouldStopPhase(progress, spec.maxIterations, cfg.purpose);
+    if (stopCheck.stop) { emit(runId, { type:'status', content:`⏹️ ${spec.phase} done: ${stopCheck.reason}`, timestamp:new Date().toISOString() }); break; }
     // ── Periodic graph refresh (every GRAPH_REFRESH_INTERVAL iterations) ────────
     // Updates the system message in-place — no synthetic user turns injected.
     // Uses a 2-second timeout so Neo4j latency never blocks the scan.
@@ -1972,7 +2092,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
           cfg.target,
           loopStartTime,
           detectedServiceType,
-          2000
+          2000,
+          runId          // ← pass runId so recentActions are populated from live graph
         );
         // Only update + rebuild if there is actually new information
         const hasNewDeadEnds = freshCtx.newDeadEndsSinceStart.length > graphContext.newDeadEndsSinceStart.length;
@@ -2051,13 +2172,11 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
     if (checkStopped()) {
       emit(runId, { type: "status", content: "Stopped by user", timestamp: new Date().toISOString() });
       db.prepare("UPDATE runs SET status = 'stopped', completed_at = datetime('now') WHERE id = ?").run(runId);
-      emit(runId, { type: "complete", timestamp: new Date().toISOString() });
-      cleanupEmitter(runId);
-      return;
+      return { findings: allFindings, flag: flagCaptured };
     }
 
-    console.log(`[Run ${runId}] Iteration ${iteration}/${MAX_ITERATIONS}`);
-    emit(runId, { type: "status", content: `Analyzing... (${iteration}/${MAX_ITERATIONS})`, timestamp: new Date().toISOString() });
+    console.log(`[Run ${runId}] Iteration ${iteration}/${spec.maxIterations}`);
+    emit(runId, { type: "status", content: `Analyzing... (${iteration}/${spec.maxIterations})`, timestamp: new Date().toISOString() });
 
     try {
       // FIXED: ISSUE-06 — use token-based trimming
@@ -2076,7 +2195,7 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
             providerId: cfg.llmProviderId,
             modelOverride: cfg.modelOverride,
             temperature: 0.3, // Low temperature = more focused, less hallucination
-            maxTokens: getMaxTokens(route.promptFile, cfg.testType),
+            maxTokens: getMaxTokens(spec.promptFile || null, cfg.testType),
           });
         } catch (llmError) {
           retryCount++;
@@ -2134,8 +2253,8 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
         });
       }
 
-      // Parse findings
-      const newFindings = parseFindings(response);
+      // Parse findings (evidence-gated: requires non-empty evidence field)
+      const newFindings = parseFindingsStrict(response);
       for (const f of newFindings) {
         if (!allFindings.some((existing) => existing.title === f.title)) {
           allFindings.push(f);
@@ -2239,8 +2358,19 @@ Output ONLY this one action now:`
           break;
         }
 
+        // S4.T1: pentest-aware phase completion (before CTF branch)
+        const isCTFrun = cfg.purpose === 'ctf';
+        if (!isCTFrun) {
+          const phaseDoneSignals = [/PHASE\s+COMPLETE/i, /ANALYSIS\s+COMPLETE/i, /RECON(?:NAISSANCE)?\s+COMPLETE/i, /NO\s+FURTHER/i, /DELIVERABLE\s+SAVED/i, /ASSESSMENT\s+COMPLETE/i];
+          if (phaseDoneSignals.some((re) => re.test(response))) {
+            emit(runId, { type:'status', content:`✅ ${spec.phase} phase complete (model signalled)`, timestamp:new Date().toISOString() });
+            break;
+          }
+          if (iteration >= spec.maxIterations) break;
+        }
+
         // CTF: prompt to continue if no flag yet
-        if (isCTF && !flagCaptured && iteration < MAX_ITERATIONS - 2) {
+        if (isCTF && !flagCaptured && iteration < spec.maxIterations - 2) {
           messages.push({
             role: "user",
             content: `No ACTION detected in your response, and no flag found yet.
@@ -2268,7 +2398,7 @@ What is your next ACTION?`,
         }
 
         // Max iterations or no more actions
-        if (iteration >= MAX_ITERATIONS - 1) break;
+        if (iteration >= spec.maxIterations - 1) break;
         continue;
       }
 
@@ -2303,11 +2433,32 @@ What is your next ACTION?`,
         console.log(`[Run ${runId}] ⚡ Capped ${removed} duplicate/excess actions (limit: ${actionCap})`);
         emit(runId, { type: "status", content: `⚡ Capped to ${actionCap} actions per turn for focus`, timestamp: new Date().toISOString() });
       }
+      // S2.T3(c): reflection injection before executing
+      if (shouldReflect(progress)) messages.push({ role:'user', content: buildReflectionPrompt([...progress.triedSignatures]) });
+      // S2.T3(d): track tried action signatures
+      for (const a of cappedActions) progress.triedSignatures.add(actionSignature(a.tool, a.params));
+
+      const diffActions = cappedActions.filter((a) => a.tool.toLowerCase() === 'diff_probe');
+      for (const a of diffActions) {
+        const p = a.params as Record<string, string>;
+        let dr: DiffResult;
+        const base: DiffObservation = { raw: String(p.baseline ?? ''), durationMs: Number(p.baselineMs ?? 0) };
+        if (p.check === 'boolean') dr = diffBoolean(base, { raw: String(p.true ?? '') }, { raw: String(p.false ?? '') });
+        else if (p.check === 'timing') dr = diffTiming(base, { raw: String(p.payload ?? ''), durationMs: Number(p.payloadMs ?? 0) }, Number(p.expectedDelayMs ?? 5000));
+        else if (p.check === 'reflection') dr = diffReflection(base, { raw: String(p.payload ?? '') }, String(p.marker ?? ''));
+        else dr = diffErrorSignature(base, { raw: String(p.payload ?? '') });
+        const verdict = dr.confirmed ? `✅ CONFIRMED (${(dr.confidence*100).toFixed(0)}%)` : `❌ NOT CONFIRMED`;
+        messages.push({ role:'user', content: `[diff_probe result] ${verdict}: ${dr.reason}` });
+        emit(runId, { type:'status', content:`🔬 diff_probe ${p.check}: ${verdict}`, timestamp:new Date().toISOString() });
+        if (dr.confirmed) { const ev = (p.payload ?? p.true ?? '').slice(0, 500); addConfirmedVuln(model, { type:`Confirmed ${p.check} vuln`, location:cfg.target, evidence: ev || dr.reason, severity:'high' }); }
+      }
+      const executableActions = cappedActions.filter((a) => a.tool.toLowerCase() !== 'diff_probe');
+
       // ── Execute all actions in PARALLEL, process results sequentially ──
       const results: string[] = [];
 
       // Emit tool_call events upfront (so UI shows all tools starting)
-      for (const { tool, params } of cappedActions) {
+      for (const { tool, params } of executableActions) {
         emit(runId, {
           type: "tool_call",
           content: `${tool} → ${JSON.stringify(params).substring(0, 80)}...`,
@@ -2322,25 +2473,28 @@ What is your next ACTION?`,
       }
 
       // Build promises — listtools is instant, others are async tool calls
-      const toolPromises = cappedActions.map(async ({ tool, params }) => {
+      const toolPromises = executableActions.map(async ({ tool, params }) => {
         const normalizedActionTool = normalizeToolName(tool);
         if (normalizedActionTool === "listtools" || normalizedActionTool === "listmcptools" || normalizedActionTool === "toolcatalog") {
-          return { tool, params, result: `[TOOL: ${tool}]\n${buildToolCatalog(runtimeToolContext)}`, isCatalog: true };
+          return { tool, params, result: `[TOOL: ${tool}]\n${buildToolCatalog(runtimeToolContext)}`, isCatalog: true, durationMs: 0 };
         }
+        const toolStart = Date.now();
         const result = await executeTool(tool, params, runId, cfg.mcpServerId);
-        return { tool, params, result, isCatalog: false };
+        return { tool, params, result, isCatalog: false, durationMs: Date.now() - toolStart };
       });
 
       const settled = await Promise.allSettled(toolPromises);
 
       // Process results sequentially — preserves state machine correctness
+      // S2.T3(e): evidence key collection
+      const evidenceKeys: string[] = [];
       for (const outcome of settled) {
         if (outcome.status === "rejected") {
           results.push(`[TOOL ERROR] ${String(outcome.reason)}`);
           continue;
         }
 
-        const { tool, params, result, isCatalog } = outcome.value;
+        const { tool, params, result, isCatalog, durationMs } = outcome.value;
 
         if (isCatalog) {
           results.push(result);
@@ -2392,9 +2546,59 @@ What is your next ACTION?`,
         results.push(`[TOOL: ${tool}]\n${truncated}`);
         stepActionLog.push(`${tool}(${JSON.stringify(params).slice(0, 60)})`);
 
-        // ── Graph: write real observations (fire-and-forget, never await in hot path) ──
+        // S2.T3(e): collect evidence keys from tool output
         if (!result.startsWith('Error') && !result.includes('Tool error')) {
-          // Parse and store service discovery from nmap/port-scan
+          for (const mm of result.matchAll(/(\d+)\/(?:tcp|udp)\s+open/gi)) evidenceKeys.push(`port:${mm[1]}`);
+          for (const mm of result.matchAll(/\b(20\d|30\d|40[13])\b/g)) evidenceKeys.push(`code:${mm[0]}:${tool}`);
+          const sg = detectSuccess(result).signal; if (sg) evidenceKeys.push(`signal:${sg}`);
+        }
+
+        if (!result.startsWith('Error') && !result.includes('Tool error')) {
+          const urlParams = [...result.matchAll(/[?&]([a-zA-Z0-9_]+)=([^&\s"']+)/g)];
+          for (const pm of urlParams.slice(0, 10)) {
+            const param = pm[1]; const value = pm[2];
+            if (/^\d+$/.test(value)) addHypothesis(model, { vulnClass:'IDOR/SQLi', location:`param ${param}`, rationale:`Numeric param "${param}" — test object access + injection.`, confidence:0.5 });
+            else addHypothesis(model, { vulnClass:'XSS/SQLi', location:`param ${param}`, rationale:`Reflected param "${param}" — test injection + reflection.`, confidence:0.4 });
+          }
+          if (/login|signin|password|auth|token|session/i.test(result)) addHypothesis(model, { vulnClass:'AuthBypass', location:cfg.target, rationale:'Authentication surface detected — test bypass / weak session handling.', confidence:0.45 });
+          const ssrfParams = [...result.matchAll(/[?&]([a-zA-Z0-9_]*(?:url|uri|redirect|next|dest|callback|target)[a-zA-Z0-9_]*)=/gi)];
+          for (const sm of ssrfParams.slice(0, 5)) addHypothesis(model, { vulnClass:'SSRF/OpenRedirect', location:`param ${sm[1]}`, rationale:`URL-like param "${sm[1]}" — test SSRF / open redirect.`, confidence:0.55 });
+        }
+
+        // S2.T3(f): fire-and-forget appendAction via seqRef
+        appendAction(runId, ++seqRef.value, tool, params, compressOutput(tool, result), (result.startsWith('Error')||result.includes('Tool error'))?'fail':'success', 0).catch(() => {});
+
+        // ── Graph: write real observations (fire-and-forget, never await in hot path) ──
+        const compressed = compressOutput(tool, result);
+        const isDeadEnd = detectDeadEnd(compressed);
+        const successResult = detectSuccess(compressed);
+        const toolOutcome: 'success' | 'partial' | 'fail' =
+          isDeadEnd ? 'fail' : successResult.found ? 'success' : 'partial';
+
+        // ── appendAction: persist every real tool call to Neo4j action chain ──
+        appendAction(
+          runId,
+          attackState.iterationCount + 1,  // seq (pre-increment; recordResult increments state)
+          tool,
+          params,
+          compressed.slice(0, 800),
+          toolOutcome,
+          durationMs ?? 0
+        ).catch((e) => console.warn('[Graph] appendAction failed:', e));
+
+        if (!result.startsWith('Error') && !result.includes('Tool error')) {
+          // ── Enrich detectedServiceType from HTTP headers (non-nmap tools) ──
+          if (
+            detectedServiceType === 'unknown' &&
+            (tool === 'http_request' || tool === 'httprequest' || tool === 'curl' ||
+             tool === 'headerscheck' || tool === 'headers_check')
+          ) {
+            const inferred = deriveServiceType(tool, result);
+            if (inferred !== 'unknown') {
+              detectedServiceType = inferred;
+              console.log(`[Run ${runId}] [Graph] Service type inferred from HTTP response: ${detectedServiceType}`);
+            }
+          }
           if (tool === 'nmap' || tool === 'port_scan' || tool === 'nmapscan' || tool === 'portscan') {
             const parsedServices = parsePortScanResult(result);
             for (const svc of parsedServices) {
@@ -2461,7 +2665,7 @@ What is your next ACTION?`,
             if (capture.valid && capture.outputSignature) {
               saveRawExperience(runId, {
                 testType: cfg.testType, phase: attackState.phase,
-                targetSignature: cfg.target, triggerCondition: stepName_,
+                targetSignature: cfg.target, triggerCondition: stepName,
                 tool, params, steps: stepActionLog,
                 deadEnds: [...attackState.deadEndTools],
                 outputSignature: capture.outputSignature,
@@ -2481,9 +2685,7 @@ What is your next ACTION?`,
         });
 
         // ── Attack State: record result + detect success/dead-end ──
-        const compressed = compressOutput(tool, result);
-        const isDeadEnd = detectDeadEnd(compressed);
-        const successResult = detectSuccess(compressed);
+        // (compressed, isDeadEnd, successResult already computed above)
         const paramHash = hashParams(params);
         recordResult(attackState, tool, paramHash, isDeadEnd, successResult.found, successResult.signal, successResult.found ? successResult.signal : undefined);
 
@@ -2493,12 +2695,33 @@ What is your next ACTION?`,
             emit(runId, { type: "status", content: `🎯 Verified success signal: ${capture.outputSignature}`, timestamp: new Date().toISOString() });
             saveRawExperience(runId, {
               testType: cfg.testType, phase: attackState.phase,
-              targetSignature: cfg.target, triggerCondition: stepName_,
+              targetSignature: cfg.target, triggerCondition: stepName,
               tool, params, steps: stepActionLog,
               deadEnds: [...attackState.deadEndTools],
               outputSignature: capture.outputSignature,
             });
             experienceSaved = true;
+            // S1.T5(c): evidence-gated confirmed vuln
+            const vt = signalToVulnType(successResult.signal);
+            if (vt) {
+              const port = model.services[0]?.port ?? 0;
+              const ev = result.slice(0, 500);
+              const cf: Finding = { severity: vt.severity, title: vt.title, cwe: vt.cwe, confidence: 'high', evidence: ev };
+              if (!allFindings.some((x) => x.title === cf.title)) { allFindings.push(cf); emit(runId, { type:'finding', data:cf, timestamp:new Date().toISOString() }); }
+              addConfirmedVuln(model, { type: vt.title, location: cfg.target, evidence: ev, severity: vt.severity });
+              writeVulnerabilityFound(cfg.target, port, vt.title, tool, ev, 0.9, undefined).catch((e) => console.warn('[Graph] vuln write:', e));
+
+              const vulnClassMap: Record<string, string> = { 'SQL Injection':'SQLi', 'Path Traversal / LFI':'LFI', 'Remote Code Execution':'RCE' };
+              const cls = vulnClassMap[vt.title];
+              if (cls) {
+                for (const h of model.hypotheses) {
+                  if (h.status === 'open' && h.vulnClass.toUpperCase().includes(cls.toUpperCase())) {
+                    setHypothesisStatus(model, h.id, 'confirmed', result.slice(0, 500));
+                    emit(runId, { type:'status', content:`✅ Hypothesis confirmed: ${h.vulnClass} @ ${h.location}`, timestamp:new Date().toISOString() });
+                  }
+                }
+              }
+            }
           } else {
             console.warn(`[Run ${runId}] Ignored noisy success signal ${successResult.signal}: ${capture.reason || "unknown reason"}`);
           }
@@ -2510,6 +2733,8 @@ What is your next ACTION?`,
             .catch((e) => console.warn('[Graph] Dead end write failed:', e));
         }
       }
+      // S2.T3(e): record progress after processing all results
+      if (recordProgress(progress, evidenceKeys)) emit(runId, { type:'status', content:`📈 evidence total ${progress.evidenceSeen.size}`, timestamp:new Date().toISOString() });
 
       // Feed results back to LLM - keep it concise
       // FIXED: Better error awareness - make LLM aware of failures
@@ -2673,14 +2898,6 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
     console.warn('[Graph] Post-run persistence failed (non-fatal):', err);
   }
 
-  // Save results
-  db.prepare("UPDATE runs SET status = 'completed', findings = ?, output = ?, completed_at = datetime('now') WHERE id = ?")
-    .run(
-      JSON.stringify(allFindings),
-      JSON.stringify([{ step: stepName, output: fullOutput }]),
-      runId
-    );
-
   emit(runId, {
     type: "step_complete",
     step: stepName,
@@ -2688,20 +2905,7 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
     timestamp: new Date().toISOString(),
   });
 
-  emit(runId, { type: "complete", data: { findings: allFindings, flag: flagCaptured }, timestamp: new Date().toISOString() });
-
-  // ── CLEANUP TEMP FILES ──────────────────────────────────────────────────
-  const tmpDir = path.join(process.cwd(), "tmp", runId);
-  try {
-    if (fs.existsSync(tmpDir)) {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-      console.log(`[Run ${runId}] 🧹 Cleaned up temporary directory: ${tmpDir}`);
-    }
-  } catch (err) {
-    console.warn(`[Run ${runId}] Failed to clean up temp directory:`, err);
-  }
-
-  cleanupEmitter(runId);
+  return { findings: allFindings, flag: flagCaptured };
 }
 
 /**
@@ -2732,9 +2936,10 @@ function buildAgentSystemMessage(
     ? `ACTION: readfile | {"file": "${cfg.target}"}`
     : `ACTION: http_request | {"url": "${cfg.target}", "method": "GET"}`;
 
-  const goalLine = isCTF
+  const goalLine = (isCTF
     ? "CTF goal: report only real flags found in tool output."
-    : "Goal: continue until assessment objective is complete.";
+    : "Goal: continue until assessment objective is complete.") + 
+    "\nWhen you suspect a vuln, FIRST send a baseline request, THEN a payload request, THEN confirm with diff_probe before reporting it.";
 
   // Use the phase-aware mid-run block when we have a LiveGraphContext with live data,
   // otherwise fall back to the static persistent intelligence block.
@@ -2751,6 +2956,7 @@ ACTION: tool_name | {"param": "value"}
 
 Allowed tools:
 - Built-in (${toolContext.builtInTools.length}): ${builtInPreview}
+- diff_probe: confirm a vuln by comparing responses. {"check":"boolean|timing|reflection|error","baseline":"<raw>","true":"<raw>","false":"<raw>","payload":"<raw>","marker":"<for reflection>","baselineMs":0,"payloadMs":0}
 - MCP preferred (${preferredUnion.length}): ${preferredPreview}
 - MCP available total: ${toolContext.availableMcpTools.length} (${mcpPreview})
 

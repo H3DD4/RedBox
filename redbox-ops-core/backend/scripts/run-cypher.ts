@@ -18,7 +18,7 @@ async function main(): Promise<void> {
 
   const driver = getNeo4jDriver();
   const session = driver.session({
-    database: process.env.NEO4J_DATABASE ?? 'pentesting',
+    database: process.env.NEO4J_DATABASE ?? 'neo4j',
   });
 
   try {

@@ -323,6 +323,33 @@ export async function getRecentActions(
 }
 
 /**
+ * Infers a semantic service-type label from raw tool output.
+ * Used to produce meaningful TacticMemory keys beyond 'unknown'.
+ * Called by updateTacticMemoryFromResult when the caller passes 'unknown'.
+ */
+export function deriveServiceType(tool: string, rawOutput: string): string {
+  const out = (rawOutput || '').toLowerCase();
+  // HTTP servers
+  if (/apache|nginx|iis|lighttpd|caddy/i.test(out)) return 'http';
+  // Web frameworks
+  if (/express|flask|django|rails|laravel|wordpress|drupal/i.test(out)) return 'webapp';
+  // APIs
+  if (/swagger|openapi|graphql|"api"|rest/i.test(out)) return 'api';
+  // Databases
+  if (/mysql|mariadb|postgresql|postgres|sqlite|mssql|oracle/i.test(out)) return 'database';
+  // SSH / FTP / SMTP
+  if (/openssh|dropbear|ssh-/i.test(out)) return 'ssh';
+  if (/vsftpd|proftpd|pure-ftpd|220.*ftp/i.test(out)) return 'ftp';
+  if (/postfix|sendmail|exim|220.*smtp/i.test(out)) return 'smtp';
+  // CTF binary / forensics / crypto tools
+  if (['readfile', 'strings', 'hexdump', 'xxd', 'fileinfo', 'binwalk'].includes(tool)) return 'binary';
+  if (['python', 'hash', 'base64decode', 'base64encode'].includes(tool)) return 'crypto';
+  // Network
+  if (['nmap', 'nmap_scan', 'portscan', 'nc', 'dns_lookup'].includes(tool)) return 'network';
+  return 'unknown';
+}
+
+/**
  * Immediately updates TacticMemory after a tool execution.
  * Detects outcome from raw tool output so the orchestrator doesn't need to.
  * Call this inside the agent loop after each tool result — not just at run end.
@@ -333,6 +360,10 @@ export async function updateTacticMemoryFromResult(
   rawOutput: string
 ): Promise<void> {
   if (!rawOutput || rawOutput.length < 5) return;
+
+  // Enrich 'unknown' service type using output content
+  const effectiveServiceType =
+    serviceType === 'unknown' ? deriveServiceType(tool, rawOutput) : serviceType;
 
   const out = rawOutput.toLowerCase();
 
@@ -364,7 +395,7 @@ export async function updateTacticMemoryFromResult(
   const outcome: 'success' | 'partial' | 'fail' =
     isSuccess ? 'success' : isPartial ? 'partial' : 'fail';
 
-  await updateTacticMemory(serviceType, tool, outcome).catch(
+  await updateTacticMemory(effectiveServiceType, tool, outcome).catch(
     (e) => console.warn('[Graph] TacticMemory update failed:', e)
   );
 }
@@ -624,17 +655,19 @@ export async function updateTacticMemory(
 
 // ── Section E — Utilities ────────────────────────────────────────────────────
 
-export function scoreAttackPath(path: {
-  successRate: number;
-  attemptCount: number;
-  lastUsed: string;
-}): number {
-  const daysSince =
-    (Date.now() - new Date(path.lastUsed).getTime()) / (1000 * 60 * 60 * 24);
-  const recency     = Math.exp(-daysSince / 30);   // 30-day exponential decay
-  const floor       = path.attemptCount >= 2 ? 1.0 : 0.5;
-  return path.successRate * recency * floor;
+export function hashString(str: string): string {
+  return createHash('sha256').update(str).digest('hex').slice(0, 16);
 }
+
+export function safeStringify(obj: unknown): string {
+  try {
+    return JSON.stringify(obj);
+  } catch {
+    return '[Circular or Unserializable]';
+  }
+}
+
+
 
 /**
  * Formats graph intelligence into a plain-text block for the LLM system prompt.
@@ -754,4 +787,39 @@ function deriveRecommendedTools(
     if (svc.port === 21)   fromPorts.push('ftp_probe');
   }
   return [...new Set([...fromPaths, ...fromPorts])];
+}
+
+export async function linkVulnChain(target: string, fromType: string, toType: string, rationale: string): Promise<void> {
+  await runQuery(
+    `
+    MATCH (a:Vuln {type: $fromType, ip: $target})
+    MATCH (b:Vuln {type: $toType,   ip: $target})
+    MERGE (a)-[r:ENABLES]->(b)
+    ON CREATE SET r.rationale = $rationale, r.createdAt = $now
+    `,
+    { target, fromType, toType, rationale, now: new Date().toISOString() }
+  );
+}
+export interface AttackChainStep { type: string; severity: string; }
+export async function findAttackChains(target: string): Promise<AttackChainStep[][]> {
+  const rows = await runQuery<{ types: unknown; sevs: unknown }>(
+    `
+    MATCH p = (start:Vuln {ip: $target})-[:ENABLES*1..5]->(end:Vuln {ip: $target})
+    WHERE NOT ()-[:ENABLES]->(start)
+    RETURN [n IN nodes(p) | n.type] AS types, [n IN nodes(p) | n.severity] AS sevs
+    ORDER BY length(p) DESC
+    LIMIT 5
+    `,
+    { target }
+  );
+  return rows.map((r) => {
+    const types = (r.types as string[]) ?? []; const sevs = (r.sevs as string[]) ?? [];
+    return types.map((t, i) => ({ type: t, severity: sevs[i] ?? 'unknown' }));
+  });
+}
+export function formatAttackChains(chains: AttackChainStep[][]): string {
+  if (chains.length === 0) return '';
+  const lines = ['## CONFIRMED ATTACK CHAINS (chain low findings into critical impact):'];
+  for (const chain of chains) lines.push('  - ' + chain.map((s) => `${s.type}[${s.severity}]`).join(' → '));
+  return lines.join('\n');
 }

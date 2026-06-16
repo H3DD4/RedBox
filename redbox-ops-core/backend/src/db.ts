@@ -20,7 +20,7 @@ export function getDb(): Database.Database {
 
     // FIXED: DB-02 — periodic WAL checkpoint every 5 minutes
     setInterval(() => {
-      try { db.pragma("wal_checkpoint(PASSIVE)"); } catch {}
+      try { db.pragma("wal_checkpoint(PASSIVE)"); } catch { }
     }, 5 * 60 * 1000);
   }
   return db;
@@ -145,7 +145,7 @@ function initSchema() {
   db.pragma("wal_autocheckpoint = 1000");
 
   // FIXED: DB-03 — add missing columns (safe ALTER TABLE)
-  const safeAlter = (sql: string) => { try { db.exec(sql); } catch {} };
+  const safeAlter = (sql: string) => { try { db.exec(sql); } catch { } };
   safeAlter("ALTER TABLE runs ADD COLUMN flag_captured TEXT");
   safeAlter("ALTER TABLE runs ADD COLUMN iteration_count INTEGER DEFAULT 0");
   safeAlter("ALTER TABLE runs ADD COLUMN token_usage INTEGER DEFAULT 0");

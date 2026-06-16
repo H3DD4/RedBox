@@ -48,7 +48,7 @@ export async function runQuery<T = Record<string, unknown>>(
   params: Record<string, unknown> = {}
 ): Promise<T[]> {
   const driverInstance = getNeo4jDriver();
-  const database = process.env.NEO4J_DATABASE ?? 'pentesting';
+  const database = process.env.NEO4J_DATABASE ?? 'neo4j';
 
   const connectivityOk = await verifyConnectivityCached(driverInstance);
   if (!connectivityOk) {

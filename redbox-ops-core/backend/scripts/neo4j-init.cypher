@@ -21,3 +21,5 @@ FOR (tp:TargetProfile) ON (tp.ip);
 
 CREATE INDEX attack_path_service IF NOT EXISTS
 FOR (ap:AttackPath) ON (ap.serviceType);
+
+CREATE INDEX vuln_ip_type IF NOT EXISTS FOR (v:Vuln) ON (v.ip, v.type);
