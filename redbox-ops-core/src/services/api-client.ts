@@ -379,6 +379,15 @@ export const orchestrator = {
   deleteRun: (id: string) => json(`/api/orchestrator/runs/${id}`, "DELETE") as Promise<{ ok: boolean }>,
 
   streamUrl: (runId: string) => `${BACKEND_URL}/api/orchestrator/runs/${runId}/stream`,
+
+  verifyFlag: (runId: string, flagId: string, verdict: "correct" | "incorrect") =>
+    json(`/api/runs/${runId}/flags/${flagId}`, "PATCH", { verdict }) as Promise<{ success: boolean; verdict: string }>,
+
+  submitScore: (id: string, score: number, remarks: string) =>
+    json(`/api/runs/${id}/score`, "POST", { score, remarks }) as Promise<{ success: boolean }>,
+
+  skipScore: (runId: string) =>
+    json(`/api/runs/${runId}/skip_score`, "POST") as Promise<{ success: boolean }>,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────

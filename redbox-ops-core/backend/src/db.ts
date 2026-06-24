@@ -101,6 +101,26 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS run_flags (
+      id TEXT PRIMARY KEY,
+      run_id TEXT,
+      flag_value TEXT,
+      status TEXT DEFAULT 'pending',
+      attempt_number INTEGER DEFAULT 1,
+      technique_id TEXT,
+      endpoint TEXT,
+      attack_description TEXT,
+      submitted_at TEXT,
+      verified_at TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS run_feedback (
+      run_id TEXT PRIMARY KEY,
+      score INTEGER,
+      remarks TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    );
+
     CREATE TABLE IF NOT EXISTS rag_documents (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -128,6 +148,20 @@ function initSchema() {
       user_id TEXT,
       exit_code INTEGER,
       created_at TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS run_flags (
+      id TEXT PRIMARY KEY,
+      run_id TEXT,
+      flag_value TEXT,
+      status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'correct', 'incorrect', 'abandoned')),
+      attempt_number INTEGER DEFAULT 1,
+      technique_id TEXT,
+      endpoint TEXT,
+      attack_description TEXT,
+      submitted_at TEXT,
+      verified_at TEXT,
+      FOREIGN KEY (run_id) REFERENCES runs(id)
     );
   `);
 

@@ -21,6 +21,8 @@ import reportRoutes from "./routes/reports.js";
 import dashboardRoutes from "./routes/dashboard.js";
 import chatRoutes from "./routes/chat.js";
 import experienceRouter from "./routes/experience.js";
+import runsRoutes from "./routes/runs.js";
+import { bootstrapCompetencySystem } from "./services/competency-schema.js";
 
 // ─── App ─────────────────────────────────────────────────────────────────────
 const app = express();
@@ -41,6 +43,10 @@ app.use(
 try {
   getDb();
   console.log("  Database initialized");
+  // Initialize Neo4j competency schema
+  bootstrapCompetencySystem().catch(err => {
+    console.error("  Failed to bootstrap competency schema:", err);
+  });
 } catch (err) {
   console.error("Failed to initialize database:", err);
   process.exit(1);
@@ -62,6 +68,7 @@ app.use("/api/reports", optionalAuth, reportRoutes); // FIXED: Make reports acce
 app.use("/api/dashboard", requireAuth, dashboardRoutes);
 app.use("/api/chat", requireAuth, chatRoutes);
 app.use("/api/experiences", experienceRouter);
+app.use("/api/runs", optionalAuth, runsRoutes);
 
 // ─── Error handling ──────────────────────────────────────────────────────────
 app.use(notFound);

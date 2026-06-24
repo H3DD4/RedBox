@@ -11,6 +11,16 @@ import { Textarea } from "@/components/ui/textarea";
 import { TerminalOutput, type TerminalLine } from "@/components/TerminalOutput";
 import StatusBadge from "@/components/StatusBadge";
 import RunDetailModal from "@/components/RunDetailModal";
+import FlagVerificationModal from "@/components/FlagVerificationModal";
+import FindingsPanel from "@/components/FindingsPanel";
+import ScoringModal, { type RunFeedbackSummary } from "@/components/ScoringModal";
+import {
+  extractCapturedFlag,
+  loadPendingFeedback,
+  loadSubmittedFeedbackRuns,
+  markFeedbackSubmitted,
+  savePendingFeedback,
+} from "@/lib/run-feedback";
 import {
   orchestrator, mcpServers, llmProviders, uploads, reports,
   type McpServer, type LlmProvider, type Finding, type Run,
@@ -91,6 +101,31 @@ function saveOrchestratorSessionState(state: OrchestratorSessionState): void {
   }
 }
 
+function normalizeFlagCandidate(data: unknown): {
+  flagId: string;
+  flagValue: string;
+  attackDescription: string;
+  confidence: number;
+} | null {
+  if (!data || typeof data !== "object") return null;
+  const d = data as Record<string, unknown>;
+  const evidence =
+    d.evidence && typeof d.evidence === "object"
+      ? (d.evidence as Record<string, unknown>)
+      : {};
+  const flagValue = String(d.flagValue ?? evidence.flag_value ?? "").trim();
+  const flagId = String(d.flagId ?? evidence.flag_id ?? d.finding_id ?? "").trim();
+  if (!flagValue || !flagId) return null;
+  return {
+    flagId,
+    flagValue,
+    attackDescription: String(
+      d.attackDescription ?? evidence.attack_path ?? d.description ?? ""
+    ),
+    confidence: Number(d.confidence ?? d.confidence_total ?? 0),
+  };
+}
+
 const Orchestrator = () => {
   const { toast } = useToast();
   const initialSessionRef = useRef<OrchestratorSessionState | null>(loadOrchestratorSessionState());
@@ -123,7 +158,21 @@ const Orchestrator = () => {
     initialSessionRef.current?.output?.length ? initialSessionRef.current.output : DEFAULT_OUTPUT_LINES
   );
   const [findings, setFindings] = useState<Finding[]>(initialSessionRef.current?.findings ?? []);
+  
+  // Competency System state
+  const [liveEvents, setLiveEvents] = useState<any[]>([]);
+  const [currentConfidence, setCurrentConfidence] = useState(0);
+  const [flagCandidate, setFlagCandidate] = useState<any | null>(null);
+  const [pendingFeedback, setPendingFeedback] = useState<RunFeedbackSummary | null>(() => loadPendingFeedback());
+  const [showScoringModal, setShowScoringModal] = useState(false);
+  const [feedbackSubmittedRuns, setFeedbackSubmittedRuns] = useState<Set<string>>(() => loadSubmittedFeedbackRuns());
+  
   const streamAbortRef = useRef<AbortController | null>(null);
+  const activeStreamRunIdRef = useRef<string | null>(null);
+  const targetRef = useRef(target);
+  const findingsRef = useRef(findings);
+  targetRef.current = target;
+  findingsRef.current = findings;
 
   // ── Uploads ──
   const [uploadedFiles, setUploadedFiles] = useState<{ id: string; name: string; path?: string }[]>(initialSessionRef.current?.uploadedFiles ?? []);
@@ -272,6 +321,20 @@ const Orchestrator = () => {
   const appendLine = useCallback((line: TerminalLine) =>
     setOutput((p) => [...p, line]), []);
 
+  const queueRunFeedback = useCallback((summary: RunFeedbackSummary, showModal = true) => {
+    if (loadSubmittedFeedbackRuns().has(summary.runId)) return;
+    setPendingFeedback(summary);
+    savePendingFeedback(summary);
+    if (showModal) setShowScoringModal(true);
+  }, []);
+
+  const finishRunFeedback = useCallback((runId: string) => {
+    markFeedbackSubmitted(runId);
+    setFeedbackSubmittedRuns(loadSubmittedFeedbackRuns());
+    setShowScoringModal(false);
+    setPendingFeedback(null);
+  }, []);
+
   // Load config on mount
   useEffect(() => {
     orchestrator.config().then(({ testTypes: tt, purposes: pp }) => {
@@ -378,9 +441,14 @@ const Orchestrator = () => {
 
   // SSE stream handler
   const connectStream = useCallback((id: string) => {
+    // Prevent duplicate listeners (handleRun + useEffect both call this)
+    if (activeStreamRunIdRef.current === id) return;
+
     if (streamAbortRef.current) {
       streamAbortRef.current.abort();
     }
+
+    activeStreamRunIdRef.current = id;
 
     const token = localStorage.getItem("redbox_token") || "";
     const ctrl = new AbortController();
@@ -424,10 +492,39 @@ const Orchestrator = () => {
               appendLine({ type: "info", content: `🔧 Tool: ${ev.content}`, timestamp: now() });
             } else if (ev.type === "mcp_result" || ev.type === "tool_result") {
               appendLine({ type: "output", content: `   ↳ ${ev.content}`, timestamp: now() });
+            } else if (ev.type === "competency_finding") {
+              const fData = ev.data as any;
+              setLiveEvents(p => [...p, fData]);
+              if (fData.confidenceDelta) {
+                setCurrentConfidence(p => Math.min(100, Math.max(0, p + fData.confidenceDelta)));
+              }
+              if (fData.type === "flag_candidate") {
+                const candidate = normalizeFlagCandidate(fData);
+                if (candidate) setFlagCandidate(candidate);
+              }
+            } else if (ev.type === "flag_candidate") {
+              const candidate = normalizeFlagCandidate(ev.data);
+              if (candidate) setFlagCandidate(candidate);
             } else if (ev.type === "complete") {
               appendLine({ type: "system", content: "— Run complete —", timestamp: now() });
               setIsRunning(false);
+              const completeData = ev.data as { findings?: Finding[]; flag?: string | null } | undefined;
+              const completedFindings = completeData?.findings ?? [];
+              if (completedFindings.length > 0) {
+                setFindings(completedFindings);
+              }
+              queueRunFeedback({
+                runId: id,
+                target: targetRef.current,
+                capturedFlag: extractCapturedFlag(
+                  completeData?.flag,
+                  completedFindings.length > 0 ? completedFindings : findingsRef.current
+                ),
+                findingsCount: completedFindings.length > 0 ? completedFindings.length : findingsRef.current.length,
+                completedAt: new Date().toISOString(),
+              }, true);
               refreshRuns();
+              activeStreamRunIdRef.current = null;
               streamAbortRef.current = null;
               ctrl.abort();
             }
@@ -435,13 +532,19 @@ const Orchestrator = () => {
         }
       }
     }).catch((err) => {
+      if (activeStreamRunIdRef.current === id) {
+        activeStreamRunIdRef.current = null;
+      }
       streamAbortRef.current = null;
       if (err.name !== "AbortError") {
         appendLine({ type: "error", content: `Stream error: ${err.message}`, timestamp: now() });
         setIsRunning(false);
       }
     });
-  }, [appendLine]);
+  }, [appendLine, queueRunFeedback]);
+
+  const connectStreamRef = useRef(connectStream);
+  connectStreamRef.current = connectStream;
 
   useEffect(() => {
     if (!runId) return;
@@ -469,19 +572,24 @@ const Orchestrator = () => {
         const active = run.status === "running" || run.status === "pending";
         setIsRunning(active);
         if (active) {
-          connectStream(runId);
+          connectStreamRef.current(runId);
         }
       })
       .catch(() => {
         if (!cancelled && isRunning) {
-          connectStream(runId);
+          connectStreamRef.current(runId);
         }
       });
 
     return () => {
       cancelled = true;
+      if (streamAbortRef.current) {
+        streamAbortRef.current.abort();
+        streamAbortRef.current = null;
+      }
+      activeStreamRunIdRef.current = null;
     };
-  }, [runId, connectStream]);
+  }, [runId]);
 
   useEffect(() => {
     return () => {
@@ -489,6 +597,7 @@ const Orchestrator = () => {
         streamAbortRef.current.abort();
         streamAbortRef.current = null;
       }
+      activeStreamRunIdRef.current = null;
     };
   }, []);
 
@@ -973,36 +1082,15 @@ const Orchestrator = () => {
               </div>
             </div>
 
-            {/* Findings */}
-            <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg">
-              <div className="p-4 border-b border-zinc-700/50 flex items-center justify-between">
-                <h3 className="text-zinc-200 font-mono text-xs uppercase tracking-[0.15em]">// Findings</h3>
-                <span className="text-xs font-mono text-zinc-400">{findings.length} item{findings.length !== 1 ? "s" : ""}</span>
-              </div>
-              {findings.length === 0 ? (
-                <div className="flex items-center justify-center py-10 text-zinc-500 font-mono text-sm">
-                  No findings yet — execute a task.
-                </div>
-              ) : (
-                <div className="divide-y divide-zinc-800/60 max-h-72 overflow-auto">
-                  {findings.map((f, i) => (
-                    <div key={i} className="px-5 py-3.5 flex items-center justify-between hover:bg-zinc-900/50 transition-colors">
-                      <div className="flex items-center gap-3">
-                        {severityIcon(f.severity as FindingSeverity)}
-                        <div>
-                          <p className="text-sm text-zinc-100 font-mono">{f.title}</p>
-                          <p className="text-[11px] font-mono text-zinc-400">{f.cwe}{f.cve ? ` / ${f.cve}` : ""}</p>
-                        </div>
-                      </div>
-                      <StatusBadge
-                        variant={["critical","high"].includes(f.severity) ? "offline" : f.severity === "medium" ? "warning" : "online"}
-                        label={f.severity}
-                      />
-                    </div>
-                  ))}
-                </div>
-              )}
+            {/* Findings Panel (Competency System) */}
+            <div className="h-[400px]">
+              <FindingsPanel 
+                findings={findings} 
+                liveEvents={liveEvents} 
+                currentConfidence={currentConfidence} 
+              />
             </div>
+
 
             {/* Run History Panel */}
             {showHistory && (
@@ -1101,13 +1189,63 @@ const Orchestrator = () => {
         </div>
       </div>
 
-      {/* Run Detail Modal */}
-      <RunDetailModal
-        runId={selectedRunId}
-        open={!!selectedRunId}
-        onClose={() => setSelectedRunId(null)}
-        onDeleted={refreshRuns}
+      {/* Modals */}
+      {selectedRunId && (
+        <RunDetailModal
+          runId={selectedRunId}
+          open={!!selectedRunId}
+          onClose={() => setSelectedRunId(null)}
+          onDeleted={refreshRuns}
+        />
+      )}
+
+      {/* Competency System Modals */}
+      <FlagVerificationModal 
+        candidate={flagCandidate}
+        onVerify={async (flagId, verdict) => {
+          if (!runId) return;
+          try {
+            await orchestrator.verifyFlag(runId, flagId, verdict);
+            setFlagCandidate(null);
+            appendLine({ type: "system", content: `Flag marked as ${verdict}. Resuming...`, timestamp: now() });
+          } catch (e) {
+            toast({ title: "Verification Failed", description: String(e), variant: "destructive" });
+          }
+        }}
+        onClose={() => setFlagCandidate(null)}
       />
+
+      {pendingFeedback &&
+        !showScoringModal &&
+        !feedbackSubmittedRuns.has(pendingFeedback.runId) && (
+        <div className="fixed bottom-6 right-6 z-40">
+          <Button
+            type="button"
+            onClick={() => setShowScoringModal(true)}
+            className="shadow-lg gap-2"
+          >
+            <Trophy className="h-4 w-4" />
+            Rate this run
+          </Button>
+        </div>
+      )}
+
+      {showScoringModal && pendingFeedback && !feedbackSubmittedRuns.has(pendingFeedback.runId) && (
+        <ScoringModal
+          summary={pendingFeedback}
+          onDismiss={() => setShowScoringModal(false)}
+          onSubmit={async (score, remarks) => {
+            await orchestrator.submitScore(pendingFeedback.runId, score, remarks);
+            finishRunFeedback(pendingFeedback.runId);
+            toast({ title: "Score Submitted", description: "Thanks for the feedback!" });
+          }}
+          onSkip={async () => {
+            await orchestrator.skipScore(pendingFeedback.runId);
+            finishRunFeedback(pendingFeedback.runId);
+            toast({ title: "Score Skipped", description: "Reflection started in background." });
+          }}
+        />
+      )}
     </AppLayout>
   );
 };

@@ -249,8 +249,8 @@ export async function getTacticWeights(
       { serviceType }
     );
     return rows.map((r) => ({
-      tool:    r.tool    as string,
-      weight:  r.weight  as number,
+      tool: r.tool as string,
+      weight: r.weight as number,
       outcome: r.outcome as string,
     }));
   } catch {
@@ -278,7 +278,7 @@ export async function getDeadEndsSince(
       { target, since }
     );
     return rows.map((r) => ({
-      tool:     r.tool     as string,
+      tool: r.tool as string,
       endpoint: r.endpoint as string,
     }));
   } catch {
@@ -382,15 +382,15 @@ export async function updateTacticMemoryFromResult(
   const isPartial =
     !isFail &&
     (out.includes('open') || out.includes('200') || out.includes('found') ||
-     out.includes('running') || out.includes('filtered'));
+      out.includes('running') || out.includes('filtered'));
 
   // Hard success signals
   const isSuccess =
     !isFail &&
     (out.includes('flag{') || out.includes('htb{') || out.includes('picoctf{') ||
-     out.includes('uid=0') || out.includes('root:') ||
-     out.includes('successfully') || out.includes('exploited') ||
-     out.includes('vulnerability confirmed') || out.includes('dumped'));
+      out.includes('uid=0') || out.includes('root:') ||
+      out.includes('successfully') || out.includes('exploited') ||
+      out.includes('vulnerability confirmed') || out.includes('dumped'));
 
   const outcome: 'success' | 'partial' | 'fail' =
     isSuccess ? 'success' : isPartial ? 'partial' : 'fail';
@@ -429,7 +429,7 @@ export function buildMidRunGraphBlock(
       hasContent = true;
       lines.push('### Already confirmed open ports — skip re-scanning these:');
       for (const svc of ctx.knownServices) {
-        const v   = svc.version ? ` (${svc.version})` : '';
+        const v = svc.version ? ` (${svc.version})` : '';
         const tag = svc.hasVuln ? ' ← VULN CONFIRMED' : '';
         lines.push(`  - Port ${svc.port}${v}${tag}`);
       }
@@ -777,14 +777,14 @@ function deriveRecommendedTools(
   services: Array<{ port: number; version?: string }>,
   paths: Array<{ steps: string[] }>
 ): string[] {
-  const fromPaths   = paths.flatMap((p) => p.steps);
+  const fromPaths = paths.flatMap((p) => p.steps);
   const fromPorts: string[] = [];
   for (const svc of services) {
     if (svc.port === 80 || svc.port === 443) fromPorts.push('http_request', 'web_fuzzer');
-    if (svc.port === 22)   fromPorts.push('ssh_probe');
+    if (svc.port === 22) fromPorts.push('ssh_probe');
     if (svc.port === 3306) fromPorts.push('mysql_probe');
     if (svc.port === 5432) fromPorts.push('postgres_probe');
-    if (svc.port === 21)   fromPorts.push('ftp_probe');
+    if (svc.port === 21) fromPorts.push('ftp_probe');
   }
   return [...new Set([...fromPaths, ...fromPorts])];
 }

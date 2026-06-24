@@ -103,7 +103,7 @@ Edit `.env` files with your configuration:
 
 Example backend Neo4j variables:
 ```bash
-NEO4J_URI=bolt://localhost:7687
+NEO4J_URI=bolt://localhost:9687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your-password
 NEO4J_DATABASE=neo4j
@@ -114,7 +114,7 @@ NEO4J_DATABASE=neo4j
 You can start Neo4j directly with Docker:
 
 ```bash
-docker run -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/password neo4j:latest
+docker run -p 9474:7474 -p 9687:7687 -e NEO4J_AUTH=neo4j/password neo4j:latest
 ```
 
 Or use the included Docker Compose service:
@@ -205,7 +205,7 @@ docker compose --profile hexstrike up --build
 - Frontend: `http://localhost:5173`
 - Backend: `http://localhost:3001`
 - HexStrike (optional): `http://localhost:8888`
-- Neo4j: `http://localhost:7474` and `bolt://localhost:7687`
+- Neo4j: `http://localhost:9474` and `bolt://localhost:9687`
 - To point the backend at a host-run HexStrike, set `HEXSTRIKE_API_URL` in a root `.env` file.
 
 ---

@@ -43,6 +43,10 @@ import {
   linkVulnChain, findAttackChains, formatAttackChains
 } from './graph-service.js';
 import type { GraphContext, LiveGraphContext } from '../types/graph.js';
+import { runQuery } from './neo4j.js';
+import { getRelevantTechniques, getTechniqueDetail, checkFailurePatterns, formatCompetencyBriefing } from './competency-retrieval.js';
+import { getOrCreateFindingEmitter, destroyFindingEmitter } from './finding-emitter.js';
+import { buildPostRunPrompt } from './post-run-learning.js';
 
 const execAsync = promisify(exec);
 
@@ -142,6 +146,20 @@ const runEmitters = new Map<string, EventEmitter>();
 
 export function getRunEmitter(runId: string): EventEmitter | undefined {
   return runEmitters.get(runId);
+}
+
+const pendingFlagVerifications = new Map<string, (result: string) => void>();
+
+export function resumeRun(runId: string, payload: Record<string, unknown>) {
+  const resolve = pendingFlagVerifications.get(runId);
+  if (resolve) {
+    pendingFlagVerifications.delete(runId);
+    if (payload.verdict === 'correct') {
+      resolve(`✅ SUCCESS: The submitted flag was VERIFIED AS CORRECT.`);
+    } else {
+      resolve(`❌ FAILED: The submitted flag was INCORRECT. You must continue searching.`);
+    }
+  }
 }
 
 function emit(runId: string, event: RunEvent) {
@@ -328,6 +346,85 @@ async function executeTool(
     const fixTmp = (v: unknown): string => typeof v === "string" ? v.replace(/\/tmp\//g, runTmpDir.replace(/\\/g, "/") + "/") : String(v ?? "");
 
     // ===== BUILT-IN TOOLS =====
+    if (tool === "query_competency") {
+      const indicators = params.indicators as string[];
+      const fingerprint = params.target_fingerprint as string;
+      const mode = params.mode as string;
+      const results = await getRelevantTechniques(indicators || [], fingerprint || "", mode || "ctf");
+      return JSON.stringify(results, null, 2);
+    }
+    if (tool === "fetch_technique_detail") {
+      const technique_id = params.technique_id as string;
+      const sections = params.sections as string[];
+      if (!technique_id) return "Error: technique_id required";
+      const detail = await getTechniqueDetail(technique_id, sections || []);
+      return detail ? JSON.stringify(detail, null, 2) : "Technique not found or Neo4j offline";
+    }
+    if (tool === "emit_finding") {
+      const type = params.type as any;
+      const desc = params.description as string;
+      const conf = params.confidence_delta as number || 0;
+      const evidence = params.evidence as Record<string, unknown> || {};
+      if (!type || !desc) return "Error: type and description required";
+      const emitter = getOrCreateFindingEmitter(runId);
+      await emitter.emit({ type, description: desc, confidence_delta: conf, evidence });
+      return "Finding emitted successfully";
+    }
+    if (tool === "submit_flag") {
+      const flag_value = params.flag_value as string;
+      const technique_id = params.technique_id as string | undefined;
+      const endpoint = params.endpoint as string | undefined;
+      const attack_description = params.attack_description as string | undefined;
+
+      if (!flag_value) return "Error: flag_value required";
+
+      const db = getDb();
+      const existing = db.prepare("SELECT id FROM run_flags WHERE run_id = ? AND flag_value = ?").get(runId, flag_value) as any;
+      if (existing) {
+        return "Flag already submitted for this run. Wait for human verification or submit a different flag.";
+      }
+
+      const flagId = uuidv4();
+      const now = new Date().toISOString();
+
+      db.prepare(`
+        INSERT INTO run_flags (id, run_id, flag_value, status, technique_id, endpoint, attack_description, submitted_at)
+        VALUES (?, ?, ?, 'pending', ?, ?, ?, ?)
+      `).run(flagId, runId, flag_value, technique_id || null, endpoint || null, attack_description || null, now);
+
+      try {
+        await runQuery(
+          `MERGE (r:CTFRun {id: $runId})
+           CREATE (f:Flag {
+             id: $flagId,
+             value: $value,
+             status: 'pending',
+             submitted_at: $now
+           })
+           MERGE (r)-[:SUBMITTED_FLAG]->(f)`,
+          { runId, flagId, value: flag_value, now }
+        );
+      } catch (e) {
+        console.warn("[Flag] Neo4j persist failed:", e);
+      }
+
+      const findingEmitter = getOrCreateFindingEmitter(runId);
+      await findingEmitter.emitFlagCandidate(flagId, flag_value, findingEmitter.getConfidence(), attack_description || 'Unknown path');
+
+      // Suspend agent loop
+      return new Promise<string>((resolve) => {
+        pendingFlagVerifications.set(runId, resolve);
+      });
+    }
+    if (tool === "mark_dead_end") {
+      const path_desc = params.path_description as string;
+      const reason = params.reason as string;
+      if (!path_desc || !reason) return "Error: path_description and reason required";
+      const emitter = getOrCreateFindingEmitter(runId);
+      await emitter.emitDeadEnd(path_desc, reason, -10);
+      return "Dead end marked successfully";
+    }
+
     if (tool === "httprequest" || tool === "curl" || tool === "fetch" || tool === "request") {
       const url = params.url as string;
       if (!url) return "Error: url parameter required";
@@ -1508,6 +1605,8 @@ async function buildRuntimeToolContext(cfg: RunConfig, route: TaskRoute): Promis
     "writefile", "write_file", "savefile", "save_file",
     "save_deliverable", "savedeliverable",
     "read_deliverable", "readdeliverable",
+    // Competency Tools
+    "query_competency", "fetch_technique_detail", "emit_finding", "submit_flag", "mark_dead_end"
   ];
 
   try {
@@ -1995,10 +2094,23 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
     }
   }
 
-  const messages: ChatMessage[] = [
-    { role: "system", content: systemMessage },
-    { role: "user", content: userPrompt },
-  ];
+    // Competency System (Stage 1): Inject competency briefing
+    let briefing = "";
+    try {
+      const fingerprint = cfg.target; // Simple fingerprint for now
+      const mode = cfg.purpose === "ctf" ? "ctf" : "pentest";
+      const techSummaries = await getRelevantTechniques([], fingerprint, mode);
+      briefing = formatCompetencyBriefing(techSummaries, []);
+    } catch (e) {
+      console.warn(`[Run ${runId}] Competency briefing fetch failed:`, e);
+    }
+
+    const finalPrompt = briefing ? `${briefing}\n\n${userPrompt}` : userPrompt;
+
+    const messages: ChatMessage[] = [
+      { role: "system", content: systemMessage },
+      { role: "user", content: finalPrompt },
+    ];
 
   // S1.T6: memory recall + target-model hand-off
   const carried = renderTargetModel(model);
@@ -2242,17 +2354,6 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
       // Stream to client
       emit(runId, { type: "step_output", step: stepName, content: response, timestamp: new Date().toISOString() });
 
-      // Do not trust assistant-declared flags until raw tool output confirms them.
-      const mentionedFlag = extractFlag(response, cfg.flagFormat);
-      if (mentionedFlag && !flagCaptured) {
-        console.warn(`[Run ${runId}] Flag mentioned by model but not yet verified by tool output: ${mentionedFlag}`);
-        emit(runId, {
-          type: "status",
-          content: "⚠️ Flag mention detected in model response; waiting for tool-output verification.",
-          timestamp: new Date().toISOString(),
-        });
-      }
-
       // Parse findings (evidence-gated: requires non-empty evidence field)
       const newFindings = parseFindingsStrict(response);
       for (const f of newFindings) {
@@ -2266,6 +2367,26 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
 
       // Parse and execute actions
       const actions = parseActions(response);
+
+      // Competency System (Part 7): Auto-intercept flags in LLM output
+      const mentionedFlag = extractFlag(response, cfg.flagFormat);
+      if (mentionedFlag && !flagCaptured) {
+        console.log(`[Run ${runId}] Auto-intercepted flag from text: ${mentionedFlag}`);
+        emit(runId, {
+          type: "status",
+          content: `🚩 Flag detected in text. Suspending agent for verification: ${mentionedFlag}`,
+          timestamp: new Date().toISOString(),
+        });
+        
+        // Auto-call the submit_flag tool
+        actions.push({ 
+          tool: "submit_flag", 
+          params: { 
+            flag_value: mentionedFlag, 
+            attack_description: "Auto-intercepted from LLM textual output" 
+          } 
+        });
+      }
 
       // ANTI-HALLUCINATION CHECK - Much stronger detection
       if (iteration <= 2) {
@@ -2479,6 +2600,14 @@ What is your next ACTION?`,
           return { tool, params, result: `[TOOL: ${tool}]\n${buildToolCatalog(runtimeToolContext)}`, isCatalog: true, durationMs: 0 };
         }
         const toolStart = Date.now();
+        // Competency System (Stage 3): Check for failure patterns before wasting budget
+        const warning = await checkFailurePatterns(`${tool} ${JSON.stringify(params)}`, "", {});
+        if (warning) {
+          console.warn(`[Run ${runId}] Blocked by failure pattern: ${warning}`);
+          const emitter = getOrCreateFindingEmitter(runId);
+          await emitter.emitPatternWarning(warning);
+          return { tool, params, result: `[SYSTEM BLOCKED] ${warning}`, isCatalog: false, durationMs: 0 };
+        }
         const result = await executeTool(tool, params, runId, cfg.mcpServerId);
         return { tool, params, result, isCatalog: false, durationMs: Date.now() - toolStart };
       });
@@ -2957,6 +3086,11 @@ ACTION: tool_name | {"param": "value"}
 Allowed tools:
 - Built-in (${toolContext.builtInTools.length}): ${builtInPreview}
 - diff_probe: confirm a vuln by comparing responses. {"check":"boolean|timing|reflection|error","baseline":"<raw>","true":"<raw>","false":"<raw>","payload":"<raw>","marker":"<for reflection>","baselineMs":0,"payloadMs":0}
+- query_competency: search past successful techniques. {"indicators":["..."],"target_fingerprint":"..."}
+- fetch_technique_detail: read full details of a technique. {"technique_id":"...","sections":["commands", "failures"]}
+- emit_finding: stream findings to user. {"type":"...","description":"...","confidence_delta":0,"evidence":{}}
+- submit_flag: submit a captured flag for verification. {"flag_value":"...","attack_description":"..."}
+- mark_dead_end: record a failed path so future runs skip it. {"path_description":"...","reason":"..."}
 - MCP preferred (${preferredUnion.length}): ${preferredPreview}
 - MCP available total: ${toolContext.availableMcpTools.length} (${mcpPreview})
 
