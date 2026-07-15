@@ -16,8 +16,18 @@ Service Endpoint: {{HOST}}:{{PORT}} (if remote)
 Architecture: {{ARCH}} (x86/x64/ARM)
 Protections: {{PROTECTIONS}} (Checksec output)
 Libc Provided: {{LIBC_PATH}} (if available)
+Uploaded Files: {{FILES}}
 Challenge Name: {{CHALLENGE_NAME}}
 </target>
+
+<mission_config>
+Scope / In-Scope Targets : {{SCOPE}}
+Flag Format              : {{FLAG_FORMAT}}
+Rules - AVOID            : {{RULES_AVOID}}
+Rules - FOCUS ON         : {{RULES_FOCUS}}
+
+These are hard operator constraints. Follow them precisely throughout every step of this assessment.
+</mission_config>
 
 <available_tools>
 You have access to MCP tools for:

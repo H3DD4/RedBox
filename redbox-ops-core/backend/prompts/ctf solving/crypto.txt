@@ -16,6 +16,15 @@ Files Provided: {{FILES}} (encrypted data, source code, etc.)
 Service Endpoint: {{HOST}}:{{PORT}} (if interactive)
 </target>
 
+<mission_config>
+Scope / In-Scope Targets : {{SCOPE}}
+Flag Format              : {{FLAG_FORMAT}}
+Rules - AVOID            : {{RULES_AVOID}}
+Rules - FOCUS ON         : {{RULES_FOCUS}}
+
+These are hard operator constraints. Follow them precisely throughout every step of this assessment.
+</mission_config>
+
 <available_tools>
 You have access to MCP tools for:
 - Classical cipher analysis and brute forcing

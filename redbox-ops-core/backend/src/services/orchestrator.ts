@@ -1657,7 +1657,7 @@ function injectContext(template: string, cfg: RunConfig): { result: string; vali
   let contextVars: Record<string, string> = {
     // Common variables
     "CHALLENGE_NAME": sanitizedChallengeName || "Unknown Challenge",
-    "SCOPE": sanitizedScope || "Full scope",
+    "SCOPE": sanitizedScope || "Full scope — no restrictions.",
     "TEST_TYPE": cfg.testType,
     "PURPOSE": cfg.purpose,
     // FIXED: BUG-02 — resolve MCP server name from ID
@@ -1672,6 +1672,8 @@ function injectContext(template: string, cfg: RunConfig): { result: string; vali
     "LOGIN_INSTRUCTIONS": cfg.loginInstructions || "No authentication required — access all endpoints directly.",
     "RULES_AVOID": cfg.rulesAvoid || "None — full scope authorized.",
     "RULES_FOCUS": cfg.rulesFocus || "All standard attack vectors.",
+    // Fix 2: Add FLAG_FORMAT so templates can use {{FLAG_FORMAT}}
+    "FLAG_FORMAT": cfg.flagFormat || "Standard CTF flag format (e.g. flag{...}, HTB{...}, picoCTF{...}). Submit whatever format you find.",
   };
 
   // Add context-specific variables based on test type
@@ -1883,7 +1885,8 @@ function resolveUploadPaths(uploadIds: string[]): string {
     }).filter(Boolean);
     return resolved.join("\n") || "None";
   } catch {
-    return uploadIds.join(", ");
+    // Fix 5: Return a descriptive error rather than raw UUIDs the LLM cannot use
+    return `[File path lookup failed — ${uploadIds.length} file(s) uploaded, IDs: ${uploadIds.join(", ")}]`;
   }
 }
 
@@ -2058,18 +2061,42 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
   let userPrompt: string;
   let contextValidation: ContextValidationResult | null = null;
 
+  // Fix 3: Build the full user config block that is appended to both the fallback and template prompts
+  const uploadedFiles = resolveUploadPaths(cfg.uploadIds || []);
+  const userConfigBlock = [
+    ``,
+    `═══════════════════════════════════════════`,
+    `         MISSION CONFIGURATION             `,
+    `═══════════════════════════════════════════`,
+    `Target          : ${cfg.target}`,
+    `Scope           : ${cfg.scope || "Full scope — no restrictions."}`,
+    `Uploaded Files  : ${uploadedFiles}`,
+    cfg.flagFormat        ? `Flag Format     : ${cfg.flagFormat}` : null,
+    cfg.challengeName     ? `Challenge Name  : ${cfg.challengeName}` : null,
+    cfg.loginInstructions ? `Login/Auth      : ${cfg.loginInstructions}` : null,
+    cfg.rulesAvoid        ? `⛔ AVOID        : ${cfg.rulesAvoid}` : null,
+    cfg.rulesFocus        ? `🎯 FOCUS ON     : ${cfg.rulesFocus}` : null,
+    cfg.host              ? `Service Host    : ${cfg.host}` : null,
+    cfg.port              ? `Service Port    : ${cfg.port}` : null,
+    `═══════════════════════════════════════════`,
+    ``,
+    `You MUST respect every field above. The scope, rules, and files above are the operator's direct instructions — treat them as hard constraints throughout this entire run.`,
+    ``,
+  ].filter(line => line !== null).join("\n");
+
   if (!spec.promptFile) {
-    userPrompt = `Perform a ${cfg.testType} ${cfg.purpose} assessment of: ${cfg.target}\nPhase: ${spec.phase}. Use tools to gather evidence, confirm findings with proof, and report only confirmed issues.`;
+    userPrompt = userConfigBlock + `\nPerform a ${cfg.testType} ${cfg.purpose} assessment of: ${cfg.target}\nPhase: ${spec.phase}. Use tools to gather evidence, confirm findings with proof, and report only confirmed issues.`;
   } else {
     const template = loadPromptTemplate(route.pipeline, spec.promptFile);
     if (!template) {
-      userPrompt = `Perform a ${cfg.testType} ${cfg.purpose} assessment of: ${cfg.target}\nPhase: ${spec.phase}. Use tools to gather evidence, confirm findings with proof, and report only confirmed issues.`;
+      userPrompt = userConfigBlock + `\nPerform a ${cfg.testType} ${cfg.purpose} assessment of: ${cfg.target}\nPhase: ${spec.phase}. Use tools to gather evidence, confirm findings with proof, and report only confirmed issues.`;
       emit(runId, { type: "status", content: `⚠️ Prompt template not found: ${route.pipeline}/${spec.promptFile}. Using fallback prompt.`, timestamp: new Date().toISOString() });
     } else {
 
     // Enhanced context injection with validation
     const { result, validation } = injectContext(template, cfg);
-    userPrompt = result;
+    // Fix 3: Always prepend the mission config block to the injected template so the LLM cannot miss it
+    userPrompt = userConfigBlock + result;
     contextValidation = validation;
 
     // Report validation issues
@@ -3067,7 +3094,7 @@ function buildAgentSystemMessage(
 
   const goalLine = (isCTF
     ? "CTF goal: report only real flags found in tool output."
-    : "Goal: continue until assessment objective is complete.") + 
+    : "Goal: continue until assessment objective is complete.") +
     "\nWhen you suspect a vuln, FIRST send a baseline request, THEN a payload request, THEN confirm with diff_probe before reporting it.";
 
   // Use the phase-aware mid-run block when we have a LiveGraphContext with live data,
@@ -3078,8 +3105,35 @@ function buildAgentSystemMessage(
     ? buildMidRunGraphBlock(graphContext as LiveGraphContext, phase)
     : buildGraphContextBlock(graphContext);
 
-  return `You are RedBox AI. Execute one action per turn.
+  // Fix 1: Build an operator mission block from all user config so the LLM always sees it
+  const uploadedFiles = resolveUploadPaths(cfg.uploadIds || []);
+  const missionLines: string[] = [
+    ``,
+    `╔════════════════════════════════════════════╗`,
+    `║           OPERATOR MISSION CONFIG          ║`,
+    `╚════════════════════════════════════════════╝`,
+    `  Target       : ${cfg.target}`,
+    `  Scope        : ${cfg.scope || "Full scope — no restrictions."}`,
+    `  Test Type    : ${cfg.testType}`,
+    `  Purpose      : ${cfg.purpose}`,
+    `  Files        : ${uploadedFiles}`,
+  ];
+  if (cfg.flagFormat)        missionLines.push(`  Flag Format  : ${cfg.flagFormat}`);
+  if (cfg.challengeName)     missionLines.push(`  Challenge    : ${cfg.challengeName}`);
+  if (cfg.loginInstructions) missionLines.push(`  Auth Steps   : ${cfg.loginInstructions}`);
+  if (cfg.rulesAvoid)        missionLines.push(`  ⛔ AVOID     : ${cfg.rulesAvoid}`);
+  if (cfg.rulesFocus)        missionLines.push(`  🎯 FOCUS ON  : ${cfg.rulesFocus}`);
+  if (cfg.host)              missionLines.push(`  Host         : ${cfg.host}`);
+  if (cfg.port)              missionLines.push(`  Port         : ${cfg.port}`);
+  missionLines.push(`  ──────────────────────────────────────────`);
+  missionLines.push(`  ⚡ MANDATORY: Every field above is a hard`);
+  missionLines.push(`  constraint. Respect scope, rules, and files`);
+  missionLines.push(`  throughout the ENTIRE run. Do NOT ignore them.`);
+  missionLines.push(``);
+  const missionBlock = missionLines.join("\r\n");
 
+  return `You are RedBox AI. Execute one action per turn.
+${missionBlock}
 Output format:
 ACTION: tool_name | {"param": "value"}
 

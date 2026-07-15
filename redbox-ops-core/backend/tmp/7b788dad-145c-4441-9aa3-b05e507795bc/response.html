@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tom & Jerry Lucky Draw</title>
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka+One&family=Nunito:wght@400;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+    <header>
+        <div class="logo">
+            <h1>🐭 Tom & Jerry Lucky Draw 🐱</h1>
+        </div>
+        <nav>
+            
+                <span>Welcome, <strong>winflag</strong>!</span>
+                <a href="/" class="btn-small">Dashboard</a>
+                <a href="/settings" class="btn-small">Settings</a>
+                <a href="/logout" class="btn-small">Logout</a>
+            
+        </nav>
+    </header>
+
+    <div class="flash-container">
+        
+            
+                
+                    <div class="flash error slide-down">
+                        <span>You need a score of 85+ after 10 spins to claim the flag!</span>
+                        <button onclick="this.parentElement.style.opacity='0'; setTimeout(()=>this.parentElement.style.display='none', 300);" class="close-btn">&times;</button>
+                    </div>
+                
+            
+        
+    </div>
+
+    <div class="container">
+        
+<div class="dashboard fade-in">
+    <!-- Panel 1: Menu Items (Extreme Left) -->
+    <div class="menu-sidebar glass-panel slide-in-left">
+        <h3>Menu Items</h3>
+        <div class="menu-grid">
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/egg-svgrepo-com.svg" alt="Item 1">
+                    <div class="menu-badge">1</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/donut-svgrepo-com.svg" alt="Item 2">
+                    <div class="menu-badge">2</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/fries-svgrepo-com.svg" alt="Item 3">
+                    <div class="menu-badge">3</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/hamburger-svgrepo-com.svg" alt="Item 4">
+                    <div class="menu-badge">4</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/beer-svgrepo-com.svg" alt="Item 5">
+                    <div class="menu-badge">5</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/rice-svgrepo-com.svg" alt="Item 6">
+                    <div class="menu-badge">6</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/luke-svgrepo-com.svg" alt="Item 7">
+                    <div class="menu-badge">7</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/ice-cream-svgrepo-com.svg" alt="Item 8">
+                    <div class="menu-badge">8</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/cake-svgrepo-com.svg" alt="Item 9">
+                    <div class="menu-badge">9</div>
+                </div>
+            
+                <div class="menu-card hover-scale">
+                    <img src="/static/images/cheese-svgrepo-com.svg" alt="Item 10">
+                    <div class="menu-badge">10</div>
+                </div>
+            
+        </div>
+    </div>
+
+    <!-- Panel 2: Progress and Actions -->
+    <div class="sidebar glass-panel slide-in-left" style="animation-delay: 0.1s;">
+        <h3>Game Progress</h3>
+        <hr class="divider">
+        <div class="stats">
+            <p>Spins: <strong><span id="spins-count" class="highlight">0</span> / 10</strong></p>
+            <p>Score: <strong><span id="score-count" class="highlight">0</span></strong></p>
+            <p>Target Score: <strong>85+</strong></p>
+        </div>
+        <div class="actions">
+            <button id="spin-btn" class="btn-primary btn-spin pulse-anim" onclick="spinWheel()" >Spin Wheel! 🎲</button>
+            <form action="/reset" method="POST">
+                <button type="submit" class="btn-warning hover-scale">Reset Draw</button>
+            </form>
+            <form action="/claim" method="POST">
+                <button id="claim-btn" type="submit" class="btn-success btn-claim hover-scale" disabled>Claim Flag 🚩</button>
+            </form>
+        </div>
+    </div>
+    
+    <!-- Panel 3: The Wheel -->
+    <div class="wheel-stage glass-panel">
+        <h2 style="margin-bottom: 10px;">Lucky Draw</h2>
+        <div class="wheel-container">
+            <div class="wheel-pointer">▼</div>
+            <div class="wheel" id="wheel" style="transform: rotate(0deg);">
+                
+                <div class="wheel-slice" style="transform: rotate(0deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/egg-svgrepo-com.svg" alt="Item 1" style="transform: rotate(0deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(36deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/donut-svgrepo-com.svg" alt="Item 2" style="transform: rotate(-36deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(72deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/fries-svgrepo-com.svg" alt="Item 3" style="transform: rotate(-72deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(108deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/hamburger-svgrepo-com.svg" alt="Item 4" style="transform: rotate(-108deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(144deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/beer-svgrepo-com.svg" alt="Item 5" style="transform: rotate(-144deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(180deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/rice-svgrepo-com.svg" alt="Item 6" style="transform: rotate(-180deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(216deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/luke-svgrepo-com.svg" alt="Item 7" style="transform: rotate(-216deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(252deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/ice-cream-svgrepo-com.svg" alt="Item 8" style="transform: rotate(-252deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(288deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/cake-svgrepo-com.svg" alt="Item 9" style="transform: rotate(-288deg);">
+                    </div>
+                </div>
+                
+                <div class="wheel-slice" style="transform: rotate(324deg);">
+                    <div class="wheel-item">
+                        <img src="/static/images/cheese-svgrepo-com.svg" alt="Item 10" style="transform: rotate(-324deg);">
+                    </div>
+                </div>
+                
+            </div>
+            <div class="wheel-center-dot"></div>
+        </div>
+        <h3 class="sub-heading" style="margin-top: 15px; color: var(--tom-blue-dark); font-size: 1.1em;">Are you lucky enough to get the best meal ??</h3>
+    </div>
+
+    <!-- Panel 4: Drawn items -->
+    <div class="items-sidebar glass-panel slide-in-right">
+        <h2 style="margin-bottom: 15px;">Drawn Items</h2>
+        <div class="items-grid" id="drawn-list">
+            
+                <p class="empty-state" id="empty-state">Start spinning!</p>
+            
+        </div>
+    </div>
+</div>
+
+<script>
+    const spinSound = new Audio("/static/audio/spin.mp3");
+    spinSound.preload = "auto";
+    let currentRotation = 0;
+    let isSpinning = false;
+    
+    
+    
+    function flashMessage(msg, type) {
+        const container = document.querySelector('.flash-container');
+        const div = document.createElement('div');
+        div.className = `flash ${type} slide-down`;
+        div.innerHTML = `<span>${msg}</span><button onclick="this.parentElement.style.opacity='0'; setTimeout(()=>this.parentElement.style.display='none', 300);" class="close-btn">&times;</button>`;
+        container.appendChild(div);
+    }
+    
+    function spinWheel() {
+        if(isSpinning) return;
+        isSpinning = true;
+        
+        spinSound.currentTime = 0;
+        spinSound.play().catch(e => console.log('Audio play failed:', e));
+        
+        document.getElementById('spin-btn').disabled = true;
+        
+        fetch("/spin", {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' }
+        })
+        .then(response => response.json())
+        .then(data => {
+            if(data.error) {
+                flashMessage(data.error, 'error');
+                isSpinning = false;
+                document.getElementById('spin-btn').disabled = false;
+                return;
+            }
+            
+            let val = data.val;
+            let targetAngle = -((val - 1) * 36);
+            let spins = 1800;
+            let base = Math.ceil(currentRotation / 360) * 360;
+            let finalAngle = base + spins + targetAngle;
+            
+            let wheel = document.getElementById('wheel');
+            wheel.style.transform = `rotate(${finalAngle}deg)`;
+            currentRotation = finalAngle;
+            
+            setTimeout(() => {
+                document.getElementById('spins-count').innerText = data.spins;
+                document.getElementById('score-count').innerText = data.score;
+                
+                let emptyState = document.getElementById('empty-state');
+                if(emptyState) emptyState.remove();
+                
+                let drawnList = document.getElementById('drawn-list');
+                let card = document.createElement('div');
+                card.className = 'item-card swing-in pop-hover';
+                card.innerHTML = `
+                    <img src="/static/images/${data.image}" alt="Item">
+                    <div class="item-value">+${data.val}</div>
+                `;
+                drawnList.appendChild(card);
+                
+                if(data.spins >= 10) {
+                    document.getElementById('claim-btn').disabled = false;
+                    document.getElementById('spin-btn').style.display = 'none';
+                } else {
+                    document.getElementById('spin-btn').disabled = false;
+                }
+                
+                isSpinning = false;
+            }, 4000);
+        })
+        .catch(err => {
+            console.error(err);
+            flashMessage('An error occurred during the spin.', 'error');
+            isSpinning = false;
+            document.getElementById('spin-btn').disabled = false;
+        });
+    }
+</script>
+
+    </div>
+
+    <footer>
+        <p>&copy; 2026 Tom & Jerry CTF Challenge</p>
+    </footer>
+</body>
+</html>

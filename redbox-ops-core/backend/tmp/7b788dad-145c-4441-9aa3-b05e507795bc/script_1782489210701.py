@@ -1,0 +1,1 @@
+import base64; print(base64.urlsafe_b64decode('aj6frg=='))

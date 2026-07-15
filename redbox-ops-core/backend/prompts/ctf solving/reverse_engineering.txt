@@ -15,7 +15,19 @@ Binary File: {{BINARY_PATH}}
 Architecture: {{ARCH}} (x86/x64/ARM)
 File Type: {{FILE_TYPE}} (ELF/PE/Mach-O)
 Challenge Name: {{CHALLENGE_NAME}}
+Uploaded Files: {{FILES}}
 </target>
+
+<mission_config>
+Scope / In-Scope Targets : {{SCOPE}}
+Flag Format              : {{FLAG_FORMAT}}
+Protections              : {{PROTECTIONS}}
+LibC Path                : {{LIBC_PATH}}
+Rules - AVOID            : {{RULES_AVOID}}
+Rules - FOCUS ON         : {{RULES_FOCUS}}
+
+These are hard operator constraints. Follow them precisely throughout every step of this assessment.
+</mission_config>
 
 <available_tools>
 You have access to MCP tools for:

@@ -13,8 +13,18 @@ Analyze the provided forensic artifact to recover hidden or deleted information 
 <target>
 Challenge Name: {{CHALLENGE_NAME}}
 Evidence File: {{FILE_PATH}}
+Uploaded Files: {{FILES}}
 File Type: {{FILE_TYPE}} (disk image, memory dump, pcap, etc.)
 </target>
+
+<mission_config>
+Scope / In-Scope Targets : {{SCOPE}}
+Flag Format              : {{FLAG_FORMAT}}
+Rules - AVOID            : {{RULES_AVOID}}
+Rules - FOCUS ON         : {{RULES_FOCUS}}
+
+These are hard operator constraints. Follow them precisely throughout every step of this assessment.
+</mission_config>
 
 <available_tools>
 You have access to MCP tools for:
