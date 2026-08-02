@@ -494,9 +494,16 @@ const Orchestrator = () => {
               appendLine({ type: "output", content: `   ↳ ${ev.content}`, timestamp: now() });
             } else if (ev.type === "competency_finding") {
               const fData = ev.data as any;
-              setLiveEvents(p => [...p, fData]);
-              if (fData.confidenceDelta) {
-                setCurrentConfidence(p => Math.min(100, Math.max(0, p + fData.confidenceDelta)));
+              // Normalise snake_case (backend) and camelCase keys so both work
+              const normFData = {
+                ...fData,
+                confidenceDelta: fData.confidenceDelta ?? fData.confidence_delta ?? 0,
+                confidenceTotal: fData.confidenceTotal ?? fData.confidence_total ?? 0,
+              };
+              setLiveEvents(p => [...p, normFData]);
+              const delta = normFData.confidenceDelta;
+              if (delta) {
+                setCurrentConfidence(p => Math.min(100, Math.max(0, p + delta)));
               }
               if (fData.type === "flag_candidate") {
                 const candidate = normalizeFlagCandidate(fData);

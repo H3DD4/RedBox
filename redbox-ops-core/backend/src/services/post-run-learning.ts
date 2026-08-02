@@ -15,6 +15,8 @@ import { runQuery } from './neo4j.js';
 import { ensureVulnTypeExists, validateVulnTypeName } from './vulntype-manager.js';
 import { getDb } from '../db.js';
 import { chatComplete } from './llm-gateway.js';
+import { getBestVerifiedSignal } from './verified-signals-store.js';
+import { signalToCompetencyOutcome } from '../types/success-signal.js';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -174,12 +176,19 @@ function parseAndValidateReflection(raw: string): { reflection: AgentReflection 
 /**
  * Weighted average competency score update (spec §5.3).
  * Returns new score, clamped to [0, 10].
+ *
+ * `evidenceOutcome` (Phase 4-A) is an optional verified-evidence seed in [0,1]
+ * (from a SuccessSignal's trust tier — see signalToCompetencyOutcome). Precedence:
+ *   humanScore (explicit human rating, always wins) > evidenceOutcome (verified
+ *   signal, NEW) > runSucceeded boolean (today's behavior). Existing callers that
+ *   pass no evidenceOutcome are byte-for-byte unchanged.
  */
 export async function updateCompetencyScore(
   techniqueId: string,
   runSucceeded: boolean,
   humanScore: number | null | undefined,
-  _runDate: Date
+  _runDate: Date,
+  evidenceOutcome?: number
 ): Promise<number> {
   // 1. Fetch all past run outcomes linked to this technique
   const rows = await runQuery<{ outcome: unknown; date: unknown }>(
@@ -193,6 +202,8 @@ export async function updateCompetencyScore(
   let newOutcome: number;
   if (humanScore != null) {
     newOutcome = humanScore / 10.0;
+  } else if (evidenceOutcome != null) {
+    newOutcome = evidenceOutcome;
   } else if (runSucceeded) {
     newOutcome = 0.75;
   } else {
@@ -263,7 +274,8 @@ export async function processPostRunReflection(
   raw: string,
   runSucceeded: boolean,
   humanScore?: number,
-  humanRemark?: string
+  humanRemark?: string,
+  evidenceOutcome?: number
 ): Promise<{ result: WriteBackResult; error: string | null }> {
   // 1. Validate JSON
   const { reflection, error } = parseAndValidateReflection(raw);
@@ -351,7 +363,7 @@ export async function processPostRunReflection(
 
   // 4. Update competency score
   try {
-    const newScore = await updateCompetencyScore(techniqueId, runSucceeded, humanScore, new Date());
+    const newScore = await updateCompetencyScore(techniqueId, runSucceeded, humanScore, new Date(), evidenceOutcome);
     result.competency_deltas[techniqueId] = newScore;
   } catch (scoreErr) {
     console.warn('[PostRun] Score update failed:', scoreErr);
@@ -549,13 +561,21 @@ export async function executeBackgroundReflection(runId: string, humanScore?: nu
     console.log(`[PostRunLearning] Got LLM reflection response for ${runId}`);
     
     // 5. Process writeback
-    const runSucceeded = (flagStatus === 'CORRECT_FLAG_FOUND');
+    // Phase 4-B: read the verified-evidence set persisted at run end. A verified
+    // signal is ground truth — a human-validated flag means the run succeeded
+    // even if the flag_status heuristics below missed it — and its trust tier
+    // seeds competency_score (evidenceOutcome) instead of LLM narration alone.
+    const bestSignal = getBestVerifiedSignal(runId);
+    const evidenceOutcome = bestSignal ? signalToCompetencyOutcome(bestSignal) : undefined;
+
+    const runSucceeded = (flagStatus === 'CORRECT_FLAG_FOUND') || (bestSignal != null);
     const { result, error } = await processPostRunReflection(
       runId,
       rawJson,
       runSucceeded,
       humanScore,
-      humanRemark
+      humanRemark,
+      evidenceOutcome
     );
     
     if (error) {

@@ -6,6 +6,7 @@ import { getOrCreateFindingEmitter } from "../services/finding-emitter.js";
 import { processPostRunReflection, executeBackgroundReflection } from "../services/post-run-learning.js";
 import { runQuery } from "../services/neo4j.js";
 import { getLiveGraphContext } from "../services/graph-service.js";
+import { buildTargetFingerprint } from "../services/competency-retrieval.js";
 
 const router = Router();
 
@@ -24,14 +25,22 @@ router.post("/start", async (req, res) => {
         await runQuery(
           `CREATE (r:CTFRun {
              id: $id,
-             target_fingerprint: $target,
+             target_fingerprint: $fingerprint,
              date: $now,
              status: 'in_progress',
              vuln_types_attempted: []
            })`,
           {
             id: runId,
-            target: config.target, // Note: real fingerprint logic is in retrieval service
+            // Phase 5: store the REAL fingerprint (host|ports hash) instead of the
+            // raw target string. This MUST match the fingerprint the orchestrator
+            // builds at phase-start and the one stamped on FAILED_ON — so it is a
+            // stable target identity (host + ports only, NO indicators, which vary
+            // per run). The FAILED_ON exclusion in getRelevantTechniques joins on
+            // this field, so it must be the hash, computed identically everywhere.
+            fingerprint: buildTargetFingerprint(config.target, [], {
+              ports: config.port != null ? [parseInt(String(config.port), 10)].filter(Number.isFinite) : []
+            }),
             now: new Date().toISOString()
           }
         );

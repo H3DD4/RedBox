@@ -1,8 +1,20 @@
 // ── Section A — Imports ──────────────────────────────────────────────────────
 import { v4 as uuidv4 } from 'uuid';
 import { createHash } from 'node:crypto';
-import { runQuery } from './neo4j.js';
+import { runQuery, getConnectivityStatus } from './neo4j.js';
 import type { ActionRecord, GraphContext, LiveGraphContext, ParsedService } from '../types/graph.js';
+
+// Sentinel endpoint written by persistRunDeadEnds to mean "this tool failed
+// run-wide", not against one endpoint. It is NOT a real endpoint, so it must be
+// excluded from exploredEndpoints and rendered specially in prompts (Phase 3, #6).
+export const DEADEND_WILDCARD = '*';
+
+/** Human-readable rendering of a dead end for LLM prompts, wildcard-aware. */
+export function formatDeadEndForPrompt(tool: string, endpoint: string): string {
+  return endpoint === DEADEND_WILDCARD
+    ? `${tool} (tool-wide — failed everywhere tried)`
+    : `${tool} on ${endpoint}`;
+}
 
 // ── Section B — Write operations (called during run, after real tool output only) ──
 
@@ -169,7 +181,10 @@ export async function getGraphContext(target: string): Promise<GraphContext> {
     deadEnds,
     recommendedTools,
     successfulPaths,
-    exploredEndpoints: deadEnds.map((d) => d.endpoint),
+    // Wildcard dead ends ('*') are tool-wide, not real endpoints — exclude them
+    // so they don't pollute the "already explored endpoints" list.
+    exploredEndpoints: deadEnds.filter((d) => d.endpoint !== DEADEND_WILDCARD).map((d) => d.endpoint),
+    memoryStatus: getConnectivityStatus(),
   };
 }
 
@@ -471,7 +486,7 @@ export function buildMidRunGraphBlock(
       hasContent = true;
       lines.push('### Confirmed dead ends — do NOT attempt these vectors again:');
       for (const de of uniqueDeadEnds) {
-        lines.push(`  - ${de.tool} on ${de.endpoint}`);
+        lines.push(`  - ${formatDeadEndForPrompt(de.tool, de.endpoint)}`);
       }
       lines.push('');
     }
@@ -492,7 +507,7 @@ export function buildMidRunGraphBlock(
     hasContent = true;
     lines.push('### New dead ends since scan started:');
     for (const de of ctx.newDeadEndsSinceStart) {
-      lines.push(`  - ${de.tool} on ${de.endpoint}`);
+      lines.push(`  - ${formatDeadEndForPrompt(de.tool, de.endpoint)}`);
     }
     lines.push('');
   }
@@ -585,7 +600,7 @@ export async function persistRunDeadEnds(
   deadEndTools: Set<string>   // ← Set<string> matching actual attackState type
 ): Promise<void> {
   for (const tool of deadEndTools) {
-    await writeDeadEnd(runId, target, tool, '*', 'marked dead end during run');
+    await writeDeadEnd(runId, target, tool, DEADEND_WILDCARD, 'marked dead end during run');
   }
 }
 
@@ -633,23 +648,40 @@ export async function persistAttackPath(
 
 /**
  * Call after any tool produces a definitive outcome against a detected service.
- * Uses exponential moving average (0.7 old + 0.3 new) to smooth weights.
+ * Uses an exponential moving average to smooth weights: new = old*(1-alpha) + signal*alpha.
+ *
+ * `options` (Phase 1a) lets a caller express signal quality:
+ *   - alpha : EMA learning rate. Default 0.3 (the historical hardcoded value, so
+ *             every existing 3-arg caller is byte-for-byte unchanged). A trusted
+ *             signal (e.g. human validation) can pass a higher alpha to move the
+ *             weight faster; a low-trust automated heuristic a lower one.
+ *   - source: provenance stamped on the node so a human signal and an automated
+ *             heuristic are distinguishable after the fact. Default 'automated'.
+ *
+ * Provenance is additive: `source` is set once on create; `lastSource` /
+ * `lastSourceAt` track the most recent writer on every update. No existing
+ * read path depends on these fields, so this is backward compatible.
  */
 export async function updateTacticMemory(
   serviceType: string,
   tool: string,
-  outcome: 'success' | 'fail' | 'partial'
+  outcome: 'success' | 'fail' | 'partial',
+  options?: { alpha?: number; source?: 'human' | 'automated' }
 ): Promise<void> {
   const weight = outcome === 'success' ? 1.0 : outcome === 'partial' ? 0.5 : 0.0;
+  const alpha = options?.alpha ?? 0.3;
+  const source = options?.source ?? 'automated';
   const now = new Date().toISOString();
   await runQuery(
     `
     MERGE (tm:TacticMemory {serviceType: $serviceType, tool: $tool})
-    ON CREATE SET tm.outcome = $outcome, tm.weight = $weight, tm.updatedAt = $now
-    ON MATCH  SET tm.weight  = (tm.weight * 0.7) + ($weight * 0.3),
-                  tm.outcome = $outcome, tm.updatedAt = $now
+    ON CREATE SET tm.outcome = $outcome, tm.weight = $weight, tm.updatedAt = $now,
+                  tm.source = $source, tm.lastSource = $source, tm.lastSourceAt = $now
+    ON MATCH  SET tm.weight  = (tm.weight * (1.0 - $alpha)) + ($weight * $alpha),
+                  tm.outcome = $outcome, tm.updatedAt = $now,
+                  tm.lastSource = $source, tm.lastSourceAt = $now
     `,
-    { serviceType, tool, outcome, weight, now }
+    { serviceType, tool, outcome, weight, now, alpha, source }
   );
 }
 
@@ -700,7 +732,7 @@ export function buildGraphContextBlock(ctx: GraphContext): string {
   if (ctx.deadEnds.length > 0) {
     lines.push('### Confirmed dead ends — do NOT attempt these again:');
     for (const de of ctx.deadEnds) {
-      lines.push(`  - ${de.tool} on ${de.endpoint}`);
+      lines.push(`  - ${formatDeadEndForPrompt(de.tool, de.endpoint)}`);
     }
     lines.push('');
   }
@@ -750,6 +782,9 @@ export function emptyGraphContext(): GraphContext {
     recommendedTools: [],
     successfulPaths: [],
     exploredEndpoints: [],
+    // Reflect the last real connectivity check: on a timeout/empty fallback this
+    // surfaces 'degraded' when Neo4j is actually down, 'unknown' if never probed.
+    memoryStatus: getConnectivityStatus(),
   };
 }
 

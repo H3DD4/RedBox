@@ -17,9 +17,11 @@ import {
   inferPhaseFromTool,
 } from './tool-router.js';
 import { createAttackState, recordResult, detectLoop, advancePhase, type AttackPhase } from './attack-state.js';
-import { findSimilarExperience, saveRawExperience, formatExperienceForPrompt } from './experience-memory.js';
+import { findSimilarExperience, saveRawExperience, formatExperienceForPrompt, recordSuccessfulUse } from './experience-memory.js';
 import { getPipelinePlan, type PhaseSpec } from './phase-engine.js';
 import { emptyTargetModel, renderTargetModel, addConfirmedVuln, addHypothesis, setHypothesisStatus, openHypotheses, type Hypothesis, type TargetModel } from '../types/target-model.js';
+import { observeVulnBelief, confirmVulnBelief, contradictVulnBelief } from '../types/belief-graph.js';
+import { classifySuccessSignal, type SuccessSignal } from '../types/success-signal.js';
 import { createProgressState, recordProgress, shouldStopPhase, shouldReflect, actionSignature, buildReflectionPrompt, type ProgressState } from './reasoning.js';
 import { diffBoolean, diffTiming, diffReflection, diffErrorSignature, makeMarker, type DiffObservation, type DiffResult } from './validation.js';
 import { hashParams } from './tool-executor.js';
@@ -43,10 +45,16 @@ import {
   linkVulnChain, findAttackChains, formatAttackChains
 } from './graph-service.js';
 import type { GraphContext, LiveGraphContext } from '../types/graph.js';
-import { runQuery } from './neo4j.js';
-import { getRelevantTechniques, getTechniqueDetail, checkFailurePatterns, formatCompetencyBriefing } from './competency-retrieval.js';
+import { runQuery, getConnectivityStatus } from './neo4j.js';
+import {
+  type ActionParseResult,
+  type ProposedAction,
+  validateProposedAction,
+} from '../types/planner-decision.js';
+import { getRelevantTechniques, getTechniqueDetail, checkFailurePatterns, formatCompetencyBriefing, buildTargetFingerprint } from './competency-retrieval.js';
 import { getOrCreateFindingEmitter, destroyFindingEmitter } from './finding-emitter.js';
 import { buildPostRunPrompt } from './post-run-learning.js';
+import { persistVerifiedSignals } from './verified-signals-store.js';
 
 const execAsync = promisify(exec);
 
@@ -134,7 +142,7 @@ const ALLOWED_COMMANDS: Record<string, string[]> = {
   network: ["ping", "nslookup", "telnet", "nc", "nmap", "dig", "powershell"],
   file: ["file", "strings", "hexdump", "head", "tail", "cat", "ls", "xxd", "type", "powershell"],
   crypto: ["openssl", "python", "node", "python3", "powershell"],
-  system: ["whoami","id","uname","ps","curl","wget","nc","nmap","ping","powershell","echo","python","python3","openssl","bash","sh"],
+  system: ["whoami", "id", "uname", "ps", "curl", "wget", "nc", "nmap", "ping", "powershell", "echo", "python", "python3", "openssl", "bash", "sh"],
   // Pentesting recon tools — used by built-in local aliases
   pentesting: ["curl", "wget", "nc", "nslookup", "dig", "nmap", "whatweb", "subfinder", "httpx",
     "nuclei", "gobuster", "ffuf", "cat", "ls", "find", "mkdir", "echo", "head", "tail",
@@ -425,7 +433,7 @@ async function executeTool(
       return "Dead end marked successfully";
     }
 
-    if (tool === "httprequest" || tool === "curl" || tool === "fetch" || tool === "request") {
+    if (tool === "httprequest" || tool === "http_request" || tool === "curl" || tool === "fetch" || tool === "request") {
       const url = params.url as string;
       if (!url) return "Error: url parameter required";
 
@@ -453,13 +461,13 @@ async function executeTool(
       return await executeShellCommand(cmd, "web", 25000);
     }
 
-    if (tool === "headerscheck") {
+    if (tool === "headerscheck" || tool === "headers_check") {
       const url = params.url as string;
       if (!url) return "Error: url required";
       return await executeShellCommand(`curl -I -L --max-time 10 "${url}"`, "web");
     }
 
-    if (tool === "directorybrute" || tool === "dirbrute" || tool === "pathcheck") {
+    if (tool === "directorybrute" || tool === "dirbrute" || tool === "dir_brute" || tool === "directory_brute" || tool === "pathcheck") {
       const url = params.url as string;
       if (!url) return "Error: url required";
       const baseUrl = url.replace(/\/$/, "");
@@ -918,8 +926,21 @@ function extractBalancedJson(text: string, startIdx: number): string | null {
   return null;
 }
 
-function parseActions(text: string): Array<{ tool: string; params: Record<string, unknown> }> {
-  const actions: Array<{ tool: string; params: Record<string, unknown> }> = [];
+/**
+ * Parse ACTION: lines from LLM output into typed, validated actions.
+ *
+ * P4-B: the legacy parser is preserved (multi-action turns + free-text reasoning
+ * are load-bearing in the loop), but every parsed action now runs through
+ * ProposedActionSchema so the loop executes ONLY shape-valid tool calls. The
+ * result distinguishes:
+ *   - 'ok'        → at least one valid action (execute)
+ *   - 'malformed' → the model attempted an ACTION but every attempt failed
+ *                   validation → caller RETRIES (never executes, never silently drops)
+ *   - 'none'      → no ACTION attempted (existing completion / re-prompt path)
+ */
+function parseActions(text: string): ActionParseResult {
+  const actions: ProposedAction[] = [];
+  const errors: string[] = [];
   const headerPattern = /ACTION:\s*([\w_-]+)\s*\|/gi;
   let match;
 
@@ -929,18 +950,27 @@ function parseActions(text: string): Array<{ tool: string; params: Record<string
     const jsonStr = extractBalancedJson(text, searchStart);
     if (jsonStr) {
       try {
-        const params = JSON.parse(jsonStr);
-        actions.push({ tool, params });
+        const raw = JSON.parse(jsonStr);
+        const validated = validateProposedAction({ tool, params: raw });
+        if (validated.ok) {
+          actions.push(validated.action);
+        } else {
+          errors.push(validated.error);
+          console.error(`[parseActions] Invalid action for tool ${tool}:`, validated.error);
+        }
       } catch {
+        errors.push(`ACTION ${tool}: unparseable JSON`);
         console.error(`[parseActions] Failed to parse JSON for tool ${tool}:`, jsonStr.substring(0, 100));
       }
+    } else {
+      errors.push(`ACTION ${tool}: missing JSON body`);
     }
   }
 
   // Backward compatibility for older prompt styles like:
   // hexstrike__browser_navigate to https://example.com
   // hexstrike__browser_take_screenshot with filename "shot.png"
-  if (actions.length === 0) {
+  if (actions.length === 0 && errors.length === 0) {
     const lines = text.split("\n");
     for (const rawLine of lines) {
       const line = rawLine
@@ -957,7 +987,9 @@ function parseActions(text: string): Array<{ tool: string; params: Record<string
         const params = /^https?:\/\//i.test(target)
           ? { url: target, method: "GET" }
           : { target };
-        actions.push({ tool, params });
+        const validated = validateProposedAction({ tool, params });
+        if (validated.ok) actions.push(validated.action);
+        else errors.push(validated.error);
         continue;
       }
 
@@ -985,12 +1017,16 @@ function parseActions(text: string): Array<{ tool: string; params: Record<string
           }
         }
 
-        actions.push({ tool, params });
+        const validated = validateProposedAction({ tool, params });
+        if (validated.ok) actions.push(validated.action);
+        else errors.push(validated.error);
       }
     }
   }
 
-  return actions;
+  if (actions.length > 0) return { status: 'ok', actions };
+  if (errors.length > 0) return { status: 'malformed', errors };
+  return { status: 'none' };
 }
 
 /**
@@ -1311,9 +1347,9 @@ function parseFindings(text: string): Finding[] {
 
 function signalToVulnType(signal: string): { title: string; cwe: string; severity: string } | null {
   switch (signal) {
-    case 'SQLI_CONFIRMED': return { title:'SQL Injection', cwe:'CWE-89', severity:'high' };
-    case 'LFI_CONFIRMED':  return { title:'Path Traversal / LFI', cwe:'CWE-22', severity:'high' };
-    case 'RCE_CONFIRMED':  return { title:'Remote Code Execution', cwe:'CWE-78', severity:'critical' };
+    case 'SQLI_CONFIRMED': return { title: 'SQL Injection', cwe: 'CWE-89', severity: 'high' };
+    case 'LFI_CONFIRMED': return { title: 'Path Traversal / LFI', cwe: 'CWE-22', severity: 'high' };
+    case 'RCE_CONFIRMED': return { title: 'Remote Code Execution', cwe: 'CWE-78', severity: 'critical' };
     default: return null;
   }
 }
@@ -1321,10 +1357,12 @@ function parseFindingsStrict(text: string): Finding[] {
   const out: Finding[] = [];
   try {
     const m = text.match(/\[[\s\S]*?\]/);
-    if (m) { const parsed = JSON.parse(m[0]); if (Array.isArray(parsed)) {
-      for (const f of parsed) if (f && typeof f==='object' && typeof f.title==='string' && typeof f.evidence==='string' && f.evidence.trim().length>0)
-        out.push({ severity: normalizeSeverity(f.severity||'info'), title:f.title, cwe:f.cwe||undefined, cve:f.cve||undefined, confidence:f.confidence||undefined, evidence:f.evidence });
-    } }
+    if (m) {
+      const parsed = JSON.parse(m[0]); if (Array.isArray(parsed)) {
+        for (const f of parsed) if (f && typeof f === 'object' && typeof f.title === 'string' && typeof f.evidence === 'string' && f.evidence.trim().length > 0)
+          out.push({ severity: normalizeSeverity(f.severity || 'info'), title: f.title, cwe: f.cwe || undefined, cve: f.cve || undefined, confidence: f.confidence || undefined, evidence: f.evidence });
+      }
+    }
   } catch { /* prose -> nothing */ }
   return dedupeAndSanitizeFindings(out);
 }
@@ -1957,37 +1995,45 @@ async function executeTask(runId: string, cfg: RunConfig, route: TaskRoute) {
   let allFindings: Finding[] = [];
   let flagCaptured: string | null = null;
   let fullOutput = '';
+
+  // P3-D: Emit a degraded-memory status at most once per run. The connectivity
+  // status only becomes meaningful after the first graph read (inside
+  // executePhase), so the flag is checked there and flipped after emitting.
+  const memoryNotified = { value: false };
+
   for (let i = 0; i < plan.phases.length; i++) {
     const spec = plan.phases[i];
     if (spec.promptFile) {
       const folder = PIPELINE_FOLDERS[route.pipeline];
       if (folder !== undefined) {
         const fp = path.join(config.promptsDir, folder, spec.promptFile);
-        if (!fs.existsSync(fp)) { emit(runId, { type:'status', content:`⏭️ Skip ${spec.phase} (no ${spec.promptFile})`, timestamp:new Date().toISOString() }); continue; }
+        if (!fs.existsSync(fp)) { emit(runId, { type: 'status', content: `⏭️ Skip ${spec.phase} (no ${spec.promptFile})`, timestamp: new Date().toISOString() }); continue; }
       }
     }
     const run = db.prepare('SELECT status FROM runs WHERE id = ?').get(runId) as { status: string } | undefined;
-    if (run?.status === 'stopped') { emit(runId, { type:'status', content:'Stopped by user', timestamp:new Date().toISOString() }); break; }
-    emit(runId, { type:'status', content:`▶️ Phase ${i+1}/${plan.phases.length}: ${spec.phase}`, timestamp:new Date().toISOString() });
+    if (run?.status === 'stopped') { emit(runId, { type: 'status', content: 'Stopped by user', timestamp: new Date().toISOString() }); break; }
+    emit(runId, { type: 'status', content: `▶️ Phase ${i + 1}/${plan.phases.length}: ${spec.phase}`, timestamp: new Date().toISOString() });
     try {
-      const r = await executePhase(runId, cfg, route, spec, model, seqRef);
+      const r = await executePhase(runId, cfg, route, spec, model, seqRef, memoryNotified);
       for (const f of r.findings) if (!allFindings.some((x) => x.title === f.title)) allFindings.push(f);
       if (r.flag && !flagCaptured) flagCaptured = r.flag;
       fullOutput += `\n\n===== PHASE: ${spec.phase} (${spec.promptFile}) =====\n`;
-    } catch (err) { emit(runId, { type:'error', content:`Phase ${spec.phase} failed: ${err instanceof Error ? err.message : String(err)}`, timestamp:new Date().toISOString() }); }
+    } catch (err) { emit(runId, { type: 'error', content: `Phase ${spec.phase} failed: ${err instanceof Error ? err.message : String(err)}`, timestamp: new Date().toISOString() }); }
     if (flagCaptured && cfg.purpose === 'ctf') break;
   }
-  db.prepare("UPDATE runs SET status='completed', findings=?, output=?, completed_at=datetime('now') WHERE id=?").run(JSON.stringify(allFindings), JSON.stringify([{ step:'pipeline', output: fullOutput }]), runId);
-  emit(runId, { type:'complete', data:{ findings: allFindings, flag: flagCaptured }, timestamp:new Date().toISOString() });
+  db.prepare("UPDATE runs SET status='completed', findings=?, output=?, completed_at=datetime('now') WHERE id=?").run(JSON.stringify(allFindings), JSON.stringify([{ step: 'pipeline', output: fullOutput }]), runId);
+  // P3-D: report the memory layer's health in the run summary so the operator
+  // can weight the results — a 'degraded' run had no persistent intelligence.
+  emit(runId, { type: 'complete', data: { findings: allFindings, flag: flagCaptured, memoryStatus: getConnectivityStatus() }, timestamp: new Date().toISOString() });
   const tmpDir = path.join(process.cwd(), 'tmp', runId);
-  try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive:true, force:true }); } catch (e) { console.warn(`[Run ${runId}] temp cleanup:`, e); }
+  try { if (fs.existsSync(tmpDir)) fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { console.warn(`[Run ${runId}] temp cleanup:`, e); }
   cleanupEmitter(runId);
 }
 
 /**
  * Main agent loop execution (per-phase)
  */
-async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spec: PhaseSpec, model: TargetModel, seqRef: { value: number }): Promise<{ findings: Finding[]; flag: string | null }> {
+async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spec: PhaseSpec, model: TargetModel, seqRef: { value: number }, memoryNotified?: { value: boolean }): Promise<{ findings: Finding[]; flag: string | null }> {
   const db = getDb();
 
   emit(runId, { type: "status", content: `Starting: ${route.description}`, timestamp: new Date().toISOString() });
@@ -2053,6 +2099,16 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
     console.warn('[Graph] Context read failed, proceeding without it:', err);
   }
 
+  // P3-D: After the first real graph read the connectivity status is meaningful.
+  // Surface a degraded-memory notice at most once per run so the operator can
+  // distinguish "Neo4j offline, running blind" from "no relevant history".
+  // Graceful degradation is unchanged — the run continues either way.
+  if (memoryNotified && !memoryNotified.value && getConnectivityStatus() === 'degraded') {
+    memoryNotified.value = true;
+    emit(runId, { type: 'status', content: '⚠️ Memory layer degraded — Neo4j unreachable, running without persistent intelligence', timestamp: new Date().toISOString() });
+    console.warn(`[Run ${runId}] Neo4j memory layer is degraded; graph-based intelligence unavailable this run`);
+  }
+
   // Timestamp captured before the loop — used by getLiveGraphContext() to filter
   // dead ends / services added *during this run*, including from concurrent runs.
   const loopStartTime = new Date().toISOString();
@@ -2071,13 +2127,13 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
     `Target          : ${cfg.target}`,
     `Scope           : ${cfg.scope || "Full scope — no restrictions."}`,
     `Uploaded Files  : ${uploadedFiles}`,
-    cfg.flagFormat        ? `Flag Format     : ${cfg.flagFormat}` : null,
-    cfg.challengeName     ? `Challenge Name  : ${cfg.challengeName}` : null,
+    cfg.flagFormat ? `Flag Format     : ${cfg.flagFormat}` : null,
+    cfg.challengeName ? `Challenge Name  : ${cfg.challengeName}` : null,
     cfg.loginInstructions ? `Login/Auth      : ${cfg.loginInstructions}` : null,
-    cfg.rulesAvoid        ? `⛔ AVOID        : ${cfg.rulesAvoid}` : null,
-    cfg.rulesFocus        ? `🎯 FOCUS ON     : ${cfg.rulesFocus}` : null,
-    cfg.host              ? `Service Host    : ${cfg.host}` : null,
-    cfg.port              ? `Service Port    : ${cfg.port}` : null,
+    cfg.rulesAvoid ? `⛔ AVOID        : ${cfg.rulesAvoid}` : null,
+    cfg.rulesFocus ? `🎯 FOCUS ON     : ${cfg.rulesFocus}` : null,
+    cfg.host ? `Service Host    : ${cfg.host}` : null,
+    cfg.port ? `Service Port    : ${cfg.port}` : null,
     `═══════════════════════════════════════════`,
     ``,
     `You MUST respect every field above. The scope, rules, and files above are the operator's direct instructions — treat them as hard constraints throughout this entire run.`,
@@ -2093,77 +2149,89 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
       emit(runId, { type: "status", content: `⚠️ Prompt template not found: ${route.pipeline}/${spec.promptFile}. Using fallback prompt.`, timestamp: new Date().toISOString() });
     } else {
 
-    // Enhanced context injection with validation
-    const { result, validation } = injectContext(template, cfg);
-    // Fix 3: Always prepend the mission config block to the injected template so the LLM cannot miss it
-    userPrompt = userConfigBlock + result;
-    contextValidation = validation;
+      // Enhanced context injection with validation
+      const { result, validation } = injectContext(template, cfg);
+      // Fix 3: Always prepend the mission config block to the injected template so the LLM cannot miss it
+      userPrompt = userConfigBlock + result;
+      contextValidation = validation;
 
-    // Report validation issues
-    if (!validation.isValid) {
-      const issues = [];
-      if (validation.missingVariables.length > 0) {
-        issues.push(`Missing variables: ${validation.missingVariables.join(", ")}`);
-      }
-      if (validation.errors.length > 0) {
-        issues.push(`Errors: ${validation.errors.join(", ")}`);
-      }
-      emit(runId, { type: "status", content: `⚠️ Context validation issues: ${issues.join("; ")}`, timestamp: new Date().toISOString() });
+      // Report validation issues
+      if (!validation.isValid) {
+        const issues = [];
+        if (validation.missingVariables.length > 0) {
+          issues.push(`Missing variables: ${validation.missingVariables.join(", ")}`);
+        }
+        if (validation.errors.length > 0) {
+          issues.push(`Errors: ${validation.errors.join(", ")}`);
+        }
+        emit(runId, { type: "status", content: `⚠️ Context validation issues: ${issues.join("; ")}`, timestamp: new Date().toISOString() });
 
-      // If there are security errors, abort
-      if (validation.errors.length > 0) {
-        emit(runId, { type: "error", content: `Security validation failed: ${validation.errors.join("; ")}`, timestamp: new Date().toISOString() });
-        throw new Error(`Context validation failed: ${validation.errors.join("; ")}`);
+        // If there are security errors, abort
+        if (validation.errors.length > 0) {
+          emit(runId, { type: "error", content: `Security validation failed: ${validation.errors.join("; ")}`, timestamp: new Date().toISOString() });
+          throw new Error(`Context validation failed: ${validation.errors.join("; ")}`);
+        }
+      } else {
+        emit(runId, { type: "status", content: `✓ Context validation passed`, timestamp: new Date().toISOString() });
       }
-    } else {
-      emit(runId, { type: "status", content: `✓ Context validation passed`, timestamp: new Date().toISOString() });
-    }
     }
   }
 
-    // Competency System (Stage 1): Inject competency briefing
-    let briefing = "";
-    try {
-      const fingerprint = cfg.target; // Simple fingerprint for now
-      const mode = cfg.purpose === "ctf" ? "ctf" : "pentest";
-      const techSummaries = await getRelevantTechniques([], fingerprint, mode);
-      briefing = formatCompetencyBriefing(techSummaries, []);
-    } catch (e) {
-      console.warn(`[Run ${runId}] Competency briefing fetch failed:`, e);
-    }
+  // Competency System (Stage 1): Inject competency briefing
+  let briefing = "";
+  try {
+    // Phase 5: the fingerprint is a STABLE target identity (host|ports) — it must
+    // be byte-identical at run-creation (runs.ts), here at phase-start, and at the
+    // FAILED_ON stamp (post-run-learning), or the exclusion join silently never
+    // matches. Indicators are therefore kept OUT of the fingerprint (they vary per
+    // phase/run) and passed separately to getRelevantTechniques for the Indicator
+    // MATCH. `cfg.port` (CTF service-port override) folds into the ports dimension.
+    // Previously this passed the raw target + [] indicators, which made
+    // getRelevantTechniques early-return [] unconditionally (dead briefing).
+    const portNum = cfg.port != null ? parseInt(String(cfg.port), 10) : NaN;
+    const indicators = [...new Set(model.tech)];
+    const fingerprint = buildTargetFingerprint(cfg.target, [], {
+      ports: Number.isFinite(portNum) ? [portNum] : []
+    });
+    const mode = cfg.purpose === "ctf" ? "ctf" : "pentest";
+    const techSummaries = await getRelevantTechniques(indicators, fingerprint, mode);
+    briefing = formatCompetencyBriefing(techSummaries, indicators);
+  } catch (e) {
+    console.warn(`[Run ${runId}] Competency briefing fetch failed:`, e);
+  }
 
-    const finalPrompt = briefing ? `${briefing}\n\n${userPrompt}` : userPrompt;
+  const finalPrompt = briefing ? `${briefing}\n\n${userPrompt}` : userPrompt;
 
-    const messages: ChatMessage[] = [
-      { role: "system", content: systemMessage },
-      { role: "user", content: finalPrompt },
-    ];
+  const messages: ChatMessage[] = [
+    { role: "system", content: systemMessage },
+    { role: "user", content: finalPrompt },
+  ];
 
   // S1.T6: memory recall + target-model hand-off
   const carried = renderTargetModel(model);
-  if (carried) messages.push({ role:'user', content: carried });
+  if (carried) messages.push({ role: 'user', content: carried });
   const recalled = findSimilarExperience({ testType: cfg.testType, phase: (spec.phase === 'report' ? 'post' : spec.phase) as string, targetSignature: cfg.target, triggerCondition: spec.promptFile || spec.phase });
-  if (recalled) { messages.push({ role:'user', content: formatExperienceForPrompt(recalled) }); emit(runId, { type:'status', content:`🧠 Recalled: ${recalled.tool}`, timestamp:new Date().toISOString() }); }
+  if (recalled) { messages.push({ role: 'user', content: formatExperienceForPrompt(recalled) }); emit(runId, { type: 'status', content: `🧠 Recalled: ${recalled.tool}`, timestamp: new Date().toISOString() }); }
 
   if (spec.phase === 'report') {
     const confirmed = model.confirmedVulns;
-    for (let i = 0; i < confirmed.length - 1; i++) for (let j = i + 1; j < confirmed.length; j++) linkVulnChain(cfg.target, confirmed[i].type, confirmed[j].type, 'co-confirmed on target').catch(() => {});
+    for (let i = 0; i < confirmed.length - 1; i++) for (let j = i + 1; j < confirmed.length; j++) linkVulnChain(cfg.target, confirmed[i].type, confirmed[j].type, 'co-confirmed on target').catch(() => { });
     const chains = await findAttackChains(cfg.target).catch(() => []);
     const chainBlock = formatAttackChains(chains);
-    if (chainBlock) { messages.push({ role:'user', content: chainBlock }); emit(runId, { type:'status', content:`🔗 ${chains.length} attack chain(s) surfaced for report`, timestamp:new Date().toISOString() }); }
+    if (chainBlock) { messages.push({ role: 'user', content: chainBlock }); emit(runId, { type: 'status', content: `🔗 ${chains.length} attack chain(s) surfaced for report`, timestamp: new Date().toISOString() }); }
   }
 
   // S4.T2: per-phase objective (non-CTF only)
   if (cfg.purpose !== 'ctf') {
     const phaseGoal: Record<string, string> = {
-      recon:     'Map the full attack surface (endpoints, params, tech, services). When mapped, save a deliverable and output: RECON COMPLETE.',
+      recon: 'Map the full attack surface (endpoints, params, tech, services). When mapped, save a deliverable and output: RECON COMPLETE.',
       enumerate: 'Enumerate hidden endpoints/params/services. When exhausted, output: PHASE COMPLETE.',
-      analyze:   'For this vuln class, form hypotheses for every candidate surface. When all candidates are tested, output: ANALYSIS COMPLETE.',
-      exploit:   'Confirm each open hypothesis with a real payload + diff_probe. When all are confirmed or refuted, output: PHASE COMPLETE.',
-      report:    'Write the final report including confirmed vulns and attack chains. Then output: ASSESSMENT COMPLETE.',
+      analyze: 'For this vuln class, form hypotheses for every candidate surface. When all candidates are tested, output: ANALYSIS COMPLETE.',
+      exploit: 'Confirm each open hypothesis with a real payload + diff_probe. When all are confirmed or refuted, output: PHASE COMPLETE.',
+      report: 'Write the final report including confirmed vulns and attack chains. Then output: ASSESSMENT COMPLETE.',
     };
     const goal = phaseGoal[spec.phase] ?? 'Complete this phase, then output: PHASE COMPLETE.';
-    messages.push({ role:'user', content: `## PHASE OBJECTIVE (${spec.phase})\n${goal}\nThere is NO flag in a pentest — completion means the objective above is met.` });
+    messages.push({ role: 'user', content: `## PHASE OBJECTIVE (${spec.phase})\n${goal}\nThere is NO flag in a pentest — completion means the objective above is met.` });
   }
 
   let fullOutput = "";
@@ -2171,7 +2239,13 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
   let flagCaptured: string | null = null;
   const isCTF = cfg.purpose === "ctf";
   const isFileTask = cfg.testType === "reverse-engineering" || cfg.testType === "forensics" || cfg.testType === "cryptography";
-  
+
+  // Phase 0 + 2: verified successes accumulated during this run, for the run-end
+  // distillation hook. Only evidence-gated (validateExperienceCapture-passed)
+  // outcomes are pushed here — never raw substring guesses. Each carries a typed,
+  // trust-ranked SuccessSignal so distillation can apply a differentiated alpha.
+  const verifiedSuccesses: Array<{ serviceType: string; tool: string; signal: SuccessSignal }> = [];
+
   let consecutiveErrors = 0;
   console.log(`[Run ${runId}] Agent loop starting - ${spec.promptFile || "direct"}`);
 
@@ -2218,10 +2292,14 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
 
   // AGENT LOOP
   let iteration = 0;
+  // P4-B: bound how many times we re-prompt the model to fix a malformed ACTION
+  // before giving up on that turn (never execute an invalid tool call).
+  let malformedActionRetries = 0;
+  const MAX_MALFORMED_RETRIES = 3;
   while (true) {
     iteration++;
     const stopCheck = shouldStopPhase(progress, spec.maxIterations, cfg.purpose);
-    if (stopCheck.stop) { emit(runId, { type:'status', content:`⏹️ ${spec.phase} done: ${stopCheck.reason}`, timestamp:new Date().toISOString() }); break; }
+    if (stopCheck.stop) { emit(runId, { type: 'status', content: `⏹️ ${spec.phase} done: ${stopCheck.reason}`, timestamp: new Date().toISOString() }); break; }
     // ── Periodic graph refresh (every GRAPH_REFRESH_INTERVAL iterations) ────────
     // Updates the system message in-place — no synthetic user turns injected.
     // Uses a 2-second timeout so Neo4j latency never blocks the scan.
@@ -2314,8 +2392,11 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
       return { findings: allFindings, flag: flagCaptured };
     }
 
-    console.log(`[Run ${runId}] Iteration ${iteration}/${spec.maxIterations}`);
-    emit(runId, { type: "status", content: `Analyzing... (${iteration}/${spec.maxIterations})`, timestamp: new Date().toISOString() });
+    // Display the TRUE ceiling the loop enforces (shouldStopPhase hard ceiling),
+    // not the soft budget — otherwise the UI shows nonsense like "10/8".
+    const displayCeiling = Math.max(spec.maxIterations * 10, 50);
+    console.log(`[Run ${runId}] Iteration ${iteration}/${displayCeiling}`);
+    emit(runId, { type: "status", content: `Analyzing... (${iteration}/${displayCeiling})`, timestamp: new Date().toISOString() });
 
     try {
       // FIXED: ISSUE-06 — use token-based trimming
@@ -2330,15 +2411,27 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
         try {
           // FIXED: ISSUE-06 — dynamic token budget per phase
           // FIXED: Lower temperature (0.3) for more deterministic output, helps weak models follow instructions
-          response = await chatComplete(trimmedMessages, {
-            providerId: cfg.llmProviderId,
-            modelOverride: cfg.modelOverride,
-            temperature: 0.3, // Low temperature = more focused, less hallucination
-            maxTokens: getMaxTokens(spec.promptFile || null, cfg.testType),
-          });
+          // ANTI-HANG: hard timeout so a stalled provider request can NEVER freeze the
+          // phase. On timeout we abort the fetch and throw, which the retry logic below
+          // turns into a visible status + retry, guaranteeing the loop always advances.
+          const LLM_TIMEOUT_MS = 120000; // 2 min per attempt
+          const llmController = new AbortController();
+          const llmTimer = setTimeout(() => llmController.abort(), LLM_TIMEOUT_MS);
+          try {
+            response = await chatComplete(trimmedMessages, {
+              providerId: cfg.llmProviderId,
+              modelOverride: cfg.modelOverride,
+              temperature: 0.3, // Low temperature = more focused, less hallucination
+              maxTokens: getMaxTokens(spec.promptFile || null, cfg.testType),
+              signal: llmController.signal,
+            });
+          } finally {
+            clearTimeout(llmTimer);
+          }
         } catch (llmError) {
           retryCount++;
           const errorMsg = llmError instanceof Error ? llmError.message : String(llmError);
+          const isTimeout = errorMsg.includes('abort') || errorMsg.includes('Abort') || (llmError as { name?: string })?.name === 'AbortError';
 
           // Check if it's a rate limit error
           if (errorMsg.includes('RATE_LIMIT') || errorMsg.includes('429')) {
@@ -2348,9 +2441,12 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
             await new Promise(resolve => setTimeout(resolve, waitTime));
           } else {
             // Non-rate-limit error - still retry but with shorter wait
-            console.error(`[Run ${runId}] LLM error: ${errorMsg}, retrying...`);
-            emit(runId, { type: "status", content: `⚠️ Error: ${errorMsg.slice(0, 100)}... Retrying...`, timestamp: new Date().toISOString() });
-            await new Promise(resolve => setTimeout(resolve, 5000));
+            const label = isTimeout
+              ? `⏱️ LLM timed out after 120s — retrying (${retryCount}/${MAX_RETRIES})...`
+              : `⚠️ Error: ${errorMsg.slice(0, 100)}... Retrying...`;
+            console.error(`[Run ${runId}] LLM ${isTimeout ? 'timeout' : 'error'}: ${errorMsg}, retrying...`);
+            emit(runId, { type: "status", content: label, timestamp: new Date().toISOString() });
+            await new Promise(resolve => setTimeout(resolve, isTimeout ? 1000 : 5000));
           }
 
           if (retryCount >= MAX_RETRIES) {
@@ -2392,8 +2488,38 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
         }
       }
 
-      // Parse and execute actions
-      const actions = parseActions(response);
+      // Parse and execute actions (P4-B: typed, zod-validated result)
+      const parseResult = parseActions(response);
+
+      // Malformed → the model emitted an ACTION but it failed validation.
+      // Re-prompt it to correct itself (bounded) instead of silently dropping
+      // the turn or executing a garbage tool call.
+      if (parseResult.status === 'malformed') {
+        malformedActionRetries++;
+        console.warn(`[Run ${runId}] Malformed ACTION (retry ${malformedActionRetries}/${MAX_MALFORMED_RETRIES}):`, parseResult.errors.join(' | '));
+        if (malformedActionRetries <= MAX_MALFORMED_RETRIES) {
+          emit(runId, { type: "status", content: `⚠️ Malformed action rejected — asking model to correct (${malformedActionRetries}/${MAX_MALFORMED_RETRIES})`, timestamp: new Date().toISOString() });
+          messages.push({
+            role: "user",
+            content: `❌ Your ACTION could not be parsed:
+${parseResult.errors.map((e) => `  - ${e}`).join('\n')}
+
+Emit exactly one valid action line in this format (valid JSON object after the pipe):
+ACTION: tool_name | {"param": "value"}
+
+Try again now.`,
+          });
+          continue;
+        }
+        // Retries exhausted — treat as no action this turn and fall through to
+        // the existing completion / re-prompt handling below.
+        console.warn(`[Run ${runId}] Malformed ACTION retries exhausted; treating turn as no-action.`);
+      } else {
+        // A clean turn resets the malformed counter.
+        malformedActionRetries = 0;
+      }
+
+      const actions: ProposedAction[] = parseResult.status === 'ok' ? [...parseResult.actions] : [];
 
       // Competency System (Part 7): Auto-intercept flags in LLM output
       const mentionedFlag = extractFlag(response, cfg.flagFormat);
@@ -2404,14 +2530,14 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
           content: `🚩 Flag detected in text. Suspending agent for verification: ${mentionedFlag}`,
           timestamp: new Date().toISOString(),
         });
-        
+
         // Auto-call the submit_flag tool
-        actions.push({ 
-          tool: "submit_flag", 
-          params: { 
-            flag_value: mentionedFlag, 
-            attack_description: "Auto-intercepted from LLM textual output" 
-          } 
+        actions.push({
+          tool: "submit_flag",
+          params: {
+            flag_value: mentionedFlag,
+            attack_description: "Auto-intercepted from LLM textual output"
+          }
         });
       }
 
@@ -2511,7 +2637,7 @@ Output ONLY this one action now:`
         if (!isCTFrun) {
           const phaseDoneSignals = [/PHASE\s+COMPLETE/i, /ANALYSIS\s+COMPLETE/i, /RECON(?:NAISSANCE)?\s+COMPLETE/i, /NO\s+FURTHER/i, /DELIVERABLE\s+SAVED/i, /ASSESSMENT\s+COMPLETE/i];
           if (phaseDoneSignals.some((re) => re.test(response))) {
-            emit(runId, { type:'status', content:`✅ ${spec.phase} phase complete (model signalled)`, timestamp:new Date().toISOString() });
+            emit(runId, { type: 'status', content: `✅ ${spec.phase} phase complete (model signalled)`, timestamp: new Date().toISOString() });
             break;
           }
           if (iteration >= spec.maxIterations) break;
@@ -2582,7 +2708,7 @@ What is your next ACTION?`,
         emit(runId, { type: "status", content: `⚡ Capped to ${actionCap} actions per turn for focus`, timestamp: new Date().toISOString() });
       }
       // S2.T3(c): reflection injection before executing
-      if (shouldReflect(progress)) messages.push({ role:'user', content: buildReflectionPrompt([...progress.triedSignatures]) });
+      if (shouldReflect(progress)) messages.push({ role: 'user', content: buildReflectionPrompt([...progress.triedSignatures]) });
       // S2.T3(d): track tried action signatures
       for (const a of cappedActions) progress.triedSignatures.add(actionSignature(a.tool, a.params));
 
@@ -2595,10 +2721,11 @@ What is your next ACTION?`,
         else if (p.check === 'timing') dr = diffTiming(base, { raw: String(p.payload ?? ''), durationMs: Number(p.payloadMs ?? 0) }, Number(p.expectedDelayMs ?? 5000));
         else if (p.check === 'reflection') dr = diffReflection(base, { raw: String(p.payload ?? '') }, String(p.marker ?? ''));
         else dr = diffErrorSignature(base, { raw: String(p.payload ?? '') });
-        const verdict = dr.confirmed ? `✅ CONFIRMED (${(dr.confidence*100).toFixed(0)}%)` : `❌ NOT CONFIRMED`;
-        messages.push({ role:'user', content: `[diff_probe result] ${verdict}: ${dr.reason}` });
-        emit(runId, { type:'status', content:`🔬 diff_probe ${p.check}: ${verdict}`, timestamp:new Date().toISOString() });
-        if (dr.confirmed) { const ev = (p.payload ?? p.true ?? '').slice(0, 500); addConfirmedVuln(model, { type:`Confirmed ${p.check} vuln`, location:cfg.target, evidence: ev || dr.reason, severity:'high' }); }
+        const verdict = dr.confirmed ? `✅ CONFIRMED (${(dr.confidence * 100).toFixed(0)}%)` : `❌ NOT CONFIRMED`;
+        messages.push({ role: 'user', content: `[diff_probe result] ${verdict}: ${dr.reason}` });
+        emit(runId, { type: 'status', content: `🔬 diff_probe ${p.check}: ${verdict}`, timestamp: new Date().toISOString() });
+        if (dr.confirmed) { const ev = (p.payload ?? p.true ?? '').slice(0, 500); addConfirmedVuln(model, { type: `Confirmed ${p.check} vuln`, location: cfg.target, evidence: ev || dr.reason, severity: 'high' }); confirmVulnBelief(model.beliefs, p.target ?? cfg.target, `diff_probe:${p.check} — ${dr.reason}`.slice(0, 240), Math.min(0.95, dr.confidence)); }
+        else { contradictVulnBelief(model.beliefs, p.target ?? cfg.target, `diff_probe:${p.check} not confirmed — ${dr.reason}`.slice(0, 200)); }
       }
       const executableActions = cappedActions.filter((a) => a.tool.toLowerCase() !== 'diff_probe');
 
@@ -2713,16 +2840,16 @@ What is your next ACTION?`,
           const urlParams = [...result.matchAll(/[?&]([a-zA-Z0-9_]+)=([^&\s"']+)/g)];
           for (const pm of urlParams.slice(0, 10)) {
             const param = pm[1]; const value = pm[2];
-            if (/^\d+$/.test(value)) addHypothesis(model, { vulnClass:'IDOR/SQLi', location:`param ${param}`, rationale:`Numeric param "${param}" — test object access + injection.`, confidence:0.5 });
-            else addHypothesis(model, { vulnClass:'XSS/SQLi', location:`param ${param}`, rationale:`Reflected param "${param}" — test injection + reflection.`, confidence:0.4 });
+            if (/^\d+$/.test(value)) { addHypothesis(model, { vulnClass: 'IDOR/SQLi', location: `param ${param}`, rationale: `Numeric param "${param}" — test object access + injection.`, confidence: 0.5 }); observeVulnBelief(model.beliefs, `IDOR/SQLi @ param ${param}`, 0.5); }
+            else { addHypothesis(model, { vulnClass: 'XSS/SQLi', location: `param ${param}`, rationale: `Reflected param "${param}" — test injection + reflection.`, confidence: 0.4 }); observeVulnBelief(model.beliefs, `XSS/SQLi @ param ${param}`, 0.4); }
           }
-          if (/login|signin|password|auth|token|session/i.test(result)) addHypothesis(model, { vulnClass:'AuthBypass', location:cfg.target, rationale:'Authentication surface detected — test bypass / weak session handling.', confidence:0.45 });
+          if (/login|signin|password|auth|token|session/i.test(result)) { addHypothesis(model, { vulnClass: 'AuthBypass', location: cfg.target, rationale: 'Authentication surface detected — test bypass / weak session handling.', confidence: 0.45 }); observeVulnBelief(model.beliefs, `AuthBypass @ ${cfg.target}`, 0.45); }
           const ssrfParams = [...result.matchAll(/[?&]([a-zA-Z0-9_]*(?:url|uri|redirect|next|dest|callback|target)[a-zA-Z0-9_]*)=/gi)];
-          for (const sm of ssrfParams.slice(0, 5)) addHypothesis(model, { vulnClass:'SSRF/OpenRedirect', location:`param ${sm[1]}`, rationale:`URL-like param "${sm[1]}" — test SSRF / open redirect.`, confidence:0.55 });
+          for (const sm of ssrfParams.slice(0, 5)) { addHypothesis(model, { vulnClass: 'SSRF/OpenRedirect', location: `param ${sm[1]}`, rationale: `URL-like param "${sm[1]}" — test SSRF / open redirect.`, confidence: 0.55 }); observeVulnBelief(model.beliefs, `SSRF/OpenRedirect @ param ${sm[1]}`, 0.55); }
         }
 
         // S2.T3(f): fire-and-forget appendAction via seqRef
-        appendAction(runId, ++seqRef.value, tool, params, compressOutput(tool, result), (result.startsWith('Error')||result.includes('Tool error'))?'fail':'success', 0).catch(() => {});
+        appendAction(runId, ++seqRef.value, tool, params, compressOutput(tool, result), (result.startsWith('Error') || result.includes('Tool error')) ? 'fail' : 'success', 0).catch(() => { });
 
         // ── Graph: write real observations (fire-and-forget, never await in hot path) ──
         const compressed = compressOutput(tool, result);
@@ -2747,7 +2874,7 @@ What is your next ACTION?`,
           if (
             detectedServiceType === 'unknown' &&
             (tool === 'http_request' || tool === 'httprequest' || tool === 'curl' ||
-             tool === 'headerscheck' || tool === 'headers_check')
+              tool === 'headerscheck' || tool === 'headers_check')
           ) {
             const inferred = deriveServiceType(tool, result);
             if (inferred !== 'unknown') {
@@ -2819,13 +2946,21 @@ What is your next ACTION?`,
           if (!experienceSaved) {
             const capture = validateExperienceCapture(cfg, tool, result, `FLAG: ${flagInResult}`);
             if (capture.valid && capture.outputSignature) {
-              saveRawExperience(runId, {
+              // Phase 0+2: flag capture is a top-trust verified success.
+              verifiedSuccesses.push({ serviceType: detectedServiceType, tool, signal: classifySuccessSignal(`flag:${flagInResult}`) });
+              // Phase 1b: boost the row that produced the flag, and the recalled
+              // row if it was the technique that paid off.
+              if (pastExperience && pastExperience.tool === tool) {
+                recordSuccessfulUse(pastExperience.id);
+              }
+              const flagExperienceId = saveRawExperience(runId, {
                 testType: cfg.testType, phase: attackState.phase,
                 targetSignature: cfg.target, triggerCondition: stepName,
                 tool, params, steps: stepActionLog,
                 deadEnds: [...attackState.deadEndTools],
                 outputSignature: capture.outputSignature,
               });
+              recordSuccessfulUse(flagExperienceId);
               experienceSaved = true;
             } else {
               console.warn(`[Run ${runId}] Skipping unverified experience save (flag path): ${capture.reason || "unknown reason"}`);
@@ -2849,13 +2984,27 @@ What is your next ACTION?`,
           const capture = validateExperienceCapture(cfg, tool, result, successResult.signal);
           if (capture.valid && capture.outputSignature) {
             emit(runId, { type: "status", content: `🎯 Verified success signal: ${capture.outputSignature}`, timestamp: new Date().toISOString() });
-            saveRawExperience(runId, {
+            // Phase 1b: reward the correct row(s) on a verified success.
+            // 1) If a recalled experience actually paid off (same tool that was
+            //    recalled), apply the upward correction to THAT row — a proven
+            //    technique recovering from decay.
+            if (pastExperience && pastExperience.tool === tool) {
+              recordSuccessfulUse(pastExperience.id);
+            }
+            // Phase 0+2: record this evidence-gated success for run-end distillation.
+            verifiedSuccesses.push({ serviceType: detectedServiceType, tool, signal: classifySuccessSignal(successResult.signal) });
+            // 2) The row that ACTUALLY produced this run's verified finding is the
+            //    freshly saved one — boost it directly, so the Q-value rises even
+            //    when nothing was recalled. This is the row findSimilarExperience
+            //    will retrieve on the next run.
+            const newExperienceId = saveRawExperience(runId, {
               testType: cfg.testType, phase: attackState.phase,
               targetSignature: cfg.target, triggerCondition: stepName,
               tool, params, steps: stepActionLog,
               deadEnds: [...attackState.deadEndTools],
               outputSignature: capture.outputSignature,
             });
+            recordSuccessfulUse(newExperienceId);
             experienceSaved = true;
             // S1.T5(c): evidence-gated confirmed vuln
             const vt = signalToVulnType(successResult.signal);
@@ -2863,17 +3012,18 @@ What is your next ACTION?`,
               const port = model.services[0]?.port ?? 0;
               const ev = result.slice(0, 500);
               const cf: Finding = { severity: vt.severity, title: vt.title, cwe: vt.cwe, confidence: 'high', evidence: ev };
-              if (!allFindings.some((x) => x.title === cf.title)) { allFindings.push(cf); emit(runId, { type:'finding', data:cf, timestamp:new Date().toISOString() }); }
+              if (!allFindings.some((x) => x.title === cf.title)) { allFindings.push(cf); emit(runId, { type: 'finding', data: cf, timestamp: new Date().toISOString() }); }
               addConfirmedVuln(model, { type: vt.title, location: cfg.target, evidence: ev, severity: vt.severity });
               writeVulnerabilityFound(cfg.target, port, vt.title, tool, ev, 0.9, undefined).catch((e) => console.warn('[Graph] vuln write:', e));
 
-              const vulnClassMap: Record<string, string> = { 'SQL Injection':'SQLi', 'Path Traversal / LFI':'LFI', 'Remote Code Execution':'RCE' };
+              const vulnClassMap: Record<string, string> = { 'SQL Injection': 'SQLi', 'Path Traversal / LFI': 'LFI', 'Remote Code Execution': 'RCE' };
               const cls = vulnClassMap[vt.title];
               if (cls) {
                 for (const h of model.hypotheses) {
                   if (h.status === 'open' && h.vulnClass.toUpperCase().includes(cls.toUpperCase())) {
                     setHypothesisStatus(model, h.id, 'confirmed', result.slice(0, 500));
-                    emit(runId, { type:'status', content:`✅ Hypothesis confirmed: ${h.vulnClass} @ ${h.location}`, timestamp:new Date().toISOString() });
+                    confirmVulnBelief(model.beliefs, cls, `verified signal: ${successResult.signal}`.slice(0, 240));
+                    emit(runId, { type: 'status', content: `✅ Hypothesis confirmed: ${h.vulnClass} @ ${h.location}`, timestamp: new Date().toISOString() });
                   }
                 }
               }
@@ -2890,9 +3040,30 @@ What is your next ACTION?`,
         }
       }
       // S2.T3(e): record progress after processing all results
-      if (recordProgress(progress, evidenceKeys)) emit(runId, { type:'status', content:`📈 evidence total ${progress.evidenceSeen.size}`, timestamp:new Date().toISOString() });
+      if (recordProgress(progress, evidenceKeys)) emit(runId, { type: 'status', content: `📈 evidence total ${progress.evidenceSeen.size}`, timestamp: new Date().toISOString() });
+
+      // ── Deliverable-completion auto-break (pentest pipeline) ──────────────────
+      // If this iteration successfully wrote a phase deliverable, the phase is done.
+      // Don't wait for the LLM to announce "RECON COMPLETE" — it may loop instead.
+      if (!isCTF) {
+        const deliverableWritten = executableActions.some((a, idx) => {
+          const t = a.tool.toLowerCase();
+          const r = results[idx] ?? '';
+          const isWriteTool = t === 'writefile' || t === 'write_file' || t === 'savefile' ||
+                              t === 'save_file' || t === 'save_deliverable' || t === 'savedeliverable';
+          const isSuccess = r.includes('✅ File saved') || r.includes('"status": "success"') ||
+                            r.includes('"status":"success"');
+          return isWriteTool && isSuccess;
+        });
+        if (deliverableWritten) {
+          emit(runId, { type: 'status', content: `✅ ${spec.phase} phase complete — deliverable saved`, timestamp: new Date().toISOString() });
+          console.log(`[Run ${runId}] Deliverable written — breaking loop early (iteration ${iteration})`);
+          break;
+        }
+      }
 
       // Feed results back to LLM - keep it concise
+
       // FIXED: Better error awareness - make LLM aware of failures
       let toolSummary = "";
       let successCount = 0;
@@ -3031,6 +3202,12 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
   }
 
   // ── POST-RUN INTELLIGENCE PERSISTENCE ───────────────────────────────────────
+  // Phase 0: unconditional run-end distillation seam. Called for EVERY run —
+  // success, failure, or abandoned — not gated on human scoring or flag capture.
+  // Today it only re-deposits the run's already-verified success signals into
+  // semantic memory with source='automated'. Future phases plug in here.
+  await triggerRunEndLearning(runId, cfg.target, verifiedSuccesses);
+
   try {
     // Always persist dead ends — even failed runs teach the system something
     await persistRunDeadEnds(runId, cfg.target, attackState.deadEndTools);
@@ -3062,6 +3239,57 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
   });
 
   return { findings: allFindings, flag: flagCaptured };
+}
+
+/**
+ * Phase 0 — run-end distillation hook.
+ *
+ * The single, deterministic seam every future learning phase plugs into. Called
+ * unconditionally at the end of every run (success, failure, abandoned), never
+ * gated on human scoring or flag capture.
+ *
+ * Today it does exactly one thing: re-deposits the run's already-verified
+ * success signals (the validateExperienceCapture-gated outcomes collected in
+ * `verifiedSuccesses`) into Neo4j TacticMemory with source='automated'. These
+ * are evidence-gated, NOT raw substring guesses — so this is a higher-trust
+ * write than the per-tool updateTacticMemoryFromResult heuristic.
+ *
+ * Must never throw: a learning failure cannot break run completion.
+ */
+async function triggerRunEndLearning(
+  runId: string,
+  _target: string,
+  verifiedSuccesses: Array<{ serviceType: string; tool: string; signal: SuccessSignal }>
+): Promise<void> {
+  try {
+    if (verifiedSuccesses.length === 0) return;
+    // Dedupe by (serviceType, tool) so N successes with the same tool don't
+    // over-weight the EMA in a single run. When the same (serviceType, tool)
+    // appears with signals of differing trust, keep the HIGHEST-alpha one — a
+    // human/flag-grade signal must not be diluted by a co-occurring heuristic.
+    const best = new Map<string, { serviceType: string; tool: string; signal: SuccessSignal }>();
+    for (const s of verifiedSuccesses) {
+      const key = `${s.serviceType} ${s.tool}`;
+      const prior = best.get(key);
+      if (!prior || s.signal.alpha > prior.signal.alpha) best.set(key, s);
+    }
+    for (const s of best.values()) {
+      // Trust-differentiated update: alpha comes from the signal's trust tier
+      // (human/flag => high => larger alpha => the EMA moves harder). source is
+      // 'human' only for human-validated evidence; everything else is a
+      // deterministic automated oracle, still 'automated'.
+      const source = s.signal.kind === 'vuln_confirmed_by_human' ? 'human' : 'automated';
+      await updateTacticMemory(s.serviceType, s.tool, 'success', { alpha: s.signal.alpha, source });
+    }
+    console.log(`[PostRunLearning] Run ${runId}: distilled ${best.size} verified success(es) into TacticMemory`);
+    // Phase 4-B: persist the SAME verified-evidence set so the later competency
+    // reflection (executeBackgroundReflection, run from the HTTP route with only
+    // a runId) can ground its score in this evidence instead of LLM narration
+    // alone. Non-fatal by construction — never breaks run completion.
+    persistVerifiedSignals(runId, verifiedSuccesses);
+  } catch (err) {
+    console.warn(`[PostRunLearning] Run ${runId}: run-end learning failed (non-fatal):`, err);
+  }
 }
 
 /**
@@ -3118,13 +3346,13 @@ function buildAgentSystemMessage(
     `  Purpose      : ${cfg.purpose}`,
     `  Files        : ${uploadedFiles}`,
   ];
-  if (cfg.flagFormat)        missionLines.push(`  Flag Format  : ${cfg.flagFormat}`);
-  if (cfg.challengeName)     missionLines.push(`  Challenge    : ${cfg.challengeName}`);
+  if (cfg.flagFormat) missionLines.push(`  Flag Format  : ${cfg.flagFormat}`);
+  if (cfg.challengeName) missionLines.push(`  Challenge    : ${cfg.challengeName}`);
   if (cfg.loginInstructions) missionLines.push(`  Auth Steps   : ${cfg.loginInstructions}`);
-  if (cfg.rulesAvoid)        missionLines.push(`  ⛔ AVOID     : ${cfg.rulesAvoid}`);
-  if (cfg.rulesFocus)        missionLines.push(`  🎯 FOCUS ON  : ${cfg.rulesFocus}`);
-  if (cfg.host)              missionLines.push(`  Host         : ${cfg.host}`);
-  if (cfg.port)              missionLines.push(`  Port         : ${cfg.port}`);
+  if (cfg.rulesAvoid) missionLines.push(`  ⛔ AVOID     : ${cfg.rulesAvoid}`);
+  if (cfg.rulesFocus) missionLines.push(`  🎯 FOCUS ON  : ${cfg.rulesFocus}`);
+  if (cfg.host) missionLines.push(`  Host         : ${cfg.host}`);
+  if (cfg.port) missionLines.push(`  Port         : ${cfg.port}`);
   missionLines.push(`  ──────────────────────────────────────────`);
   missionLines.push(`  ⚡ MANDATORY: Every field above is a hard`);
   missionLines.push(`  constraint. Respect scope, rules, and files`);

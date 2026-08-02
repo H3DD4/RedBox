@@ -17,6 +17,7 @@ export function getDb(): Database.Database {
     db.pragma("foreign_keys = ON");
     initSchema();
     try { runMigration001(); } catch (e) { console.warn('[DB] Migration 001:', e); }
+    try { sweepOrphanedRuns(); } catch (e) { console.warn('[DB] Orphaned-run sweep:', e); }
 
     // FIXED: DB-02 — periodic WAL checkpoint every 5 minutes
     setInterval(() => {
@@ -121,6 +122,19 @@ function initSchema() {
       created_at TEXT DEFAULT (datetime('now'))
     );
 
+    CREATE TABLE IF NOT EXISTS run_verified_signals (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL,
+      service_type TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      trust TEXT NOT NULL,
+      alpha REAL NOT NULL,
+      raw TEXT,
+      created_at TEXT DEFAULT (datetime('now')),
+      FOREIGN KEY (run_id) REFERENCES runs(id)
+    );
+
     CREATE TABLE IF NOT EXISTS rag_documents (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -173,6 +187,7 @@ function initSchema() {
     CREATE INDEX IF NOT EXISTS idx_reports_run_id ON reports(run_id);
     CREATE INDEX IF NOT EXISTS idx_rag_chunks_doc_id ON rag_chunks(document_id);
     CREATE INDEX IF NOT EXISTS idx_uploads_run_id ON uploads(run_id);
+    CREATE INDEX IF NOT EXISTS idx_rvs_run ON run_verified_signals(run_id);
   `);
 
   // FIXED: DB-02 — WAL checkpoint configuration
@@ -215,5 +230,36 @@ function initSchema() {
       "INSERT INTO llm_providers (id, type, name, endpoint, model, active, is_default) VALUES (?, ?, ?, ?, ?, 1, 1)"
     ).run(uuidv4(), "ollama", "Ollama (local)", "http://localhost:11434", "llama3");
     console.log("  Default LLM provider seeded: Ollama");
+  }
+}
+
+/**
+ * Orphaned-run sweep (Phase 5 follow-up, 2026-08-02).
+ *
+ * The agent loop runs in-memory inside the Node process. Any run left in
+ * `status='running'` when THIS process starts is by definition orphaned — a
+ * previous server was restarted/killed mid-run (e.g. `tsx watch` restarting on
+ * file save) and its loop cannot survive. Without this sweep the UI would show
+ * a zombie "running" run forever, and a later start of the same target would
+ * collide with the stale row.
+ *
+ * `'failed'` is used rather than a new `'interrupted'` status because the runs
+ * table's status CHECK constraint does not allow it — adding a value would mean
+ * recreating the table (a data-affecting migration), which this deliberately
+ * avoids. `'failed'` is already in the CHECK and honestly marks the run as not
+ * having completed.
+ *
+ * Non-fatal: wrapped by the caller (getDb).
+ */
+export function sweepOrphanedRuns(database: Database.Database = db): void {
+  const { changes } = database
+    .prepare(
+      `UPDATE runs
+       SET status = 'failed', completed_at = datetime('now')
+       WHERE status = 'running'`
+    )
+    .run();
+  if (changes > 0) {
+    console.warn(`[DB] Marked ${changes} orphaned 'running' run(s) as failed (server restarted mid-run).`);
   }
 }

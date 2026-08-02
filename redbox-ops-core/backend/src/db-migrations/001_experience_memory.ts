@@ -22,6 +22,14 @@ export function runMigration001(): void {
       created_at TEXT DEFAULT (datetime('now'))
     );
   `);
+  // Composite index for findSimilarExperience's hot lookup
+  // (test_type + phase + validation_status filter, q_value DESC order).
+  // Idempotent and additive — safe to run on populated databases.
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_exp_lookup
+      ON experiences(test_type, phase, validation_status, q_value DESC);
+  `);
+
   // Safe column addition — check existence first (works on ALL SQLite versions)
   const cols = new Set((db.prepare("PRAGMA table_info(runs)").all() as {name:string}[]).map(c => c.name));
   if (!cols.has('token_usage'))       db.exec("ALTER TABLE runs ADD COLUMN token_usage INTEGER DEFAULT 0");

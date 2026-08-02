@@ -50,21 +50,39 @@ export interface FailureWarning {
 // ─── Fingerprint helper ───────────────────────────────────────────────────────
 
 /**
- * Builds a stable target fingerprint from hostname + sorted observed indicators.
- * Reduces collision probability (spec §edge-cases).
+ * Builds a stable target fingerprint from host (host:port) + sorted observed
+ * indicators (+ optional extra service ports). Reduces collision probability
+ * (spec §edge-cases).
+ *
+ * Phase 5: the fingerprint is a STABLE TARGET IDENTITY — it must be byte-identical
+ * at the run-creation write (runs.ts), the phase-start read (orchestrator.ts), and
+ * any FAILED_ON exclusion, or the exclusion join silently never matches. So it
+ * folds in the URL's own port (via `.host`, which keeps `:port`) plus any extra
+ * `opts.ports` discovered out-of-band. Two runs against the same host on different
+ * ports (e.g. :8080 vs :3000 — different apps) therefore do NOT collide, which the
+ * previous `.hostname`-based version (port stripped) did. No stored hash predates
+ * this change (run creation persisted the raw target string), so there is no
+ * external byte-equality contract to break — only self-stability going forward.
  */
 export function buildTargetFingerprint(
   targetUrl: string,
-  observedIndicators: string[] = []
+  observedIndicators: string[] = [],
+  opts: { ports?: number[]; hostname?: string } = {}
 ): string {
-  let hostname = targetUrl;
+  // Use `.host` (host:port) rather than `.hostname` (port stripped) so a URL that
+  // carries its own port participates in the identity — http://h:8080 and
+  // http://h:3000 are different apps and must not collide. `opts.ports` folds in
+  // ADDITIONAL ports discovered out-of-band (e.g. a service-port override not in
+  // the URL). `opts.hostname` overrides only when targetUrl isn't URL-parseable.
+  let host = opts.hostname ?? targetUrl;
   try {
-    hostname = new URL(targetUrl).hostname;
+    host = new URL(targetUrl).host; // host INCLUDES :port when present
   } catch {
-    // not a URL — use raw string
+    // not a URL — use the raw string (or the opts.hostname override)
   }
   const sorted = [...observedIndicators].sort().join(',');
-  return createHash('sha256').update(`${hostname}|${sorted}`).digest('hex').slice(0, 32);
+  const ports = [...(opts.ports ?? [])].sort((a, b) => a - b).join(',');
+  return createHash('sha256').update(`${host}|${sorted}|${ports}`).digest('hex').slice(0, 32);
 }
 
 // ─── Stage 1 — Phase Start Query ─────────────────────────────────────────────

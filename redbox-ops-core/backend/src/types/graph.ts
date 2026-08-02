@@ -80,6 +80,12 @@ export interface GraphContext {
   recommendedTools: string[];
   successfulPaths: Array<{ steps: string[]; successRate: number }>;
   exploredEndpoints: string[];
+  /**
+   * Health of the Neo4j memory layer at context-build time (P3-D).
+   * 'healthy' | 'degraded' | 'unknown' — lets the agent/operator distinguish
+   * "no relevant history" from "the graph was unreachable, running blind".
+   */
+  memoryStatus: 'healthy' | 'degraded' | 'unknown';
 }
 
 /**

@@ -23,6 +23,8 @@ export interface ChatOptions {
   topP?: number;
   stream?: boolean;
   jsonMode?: boolean;
+  /** Optional abort signal — lets callers enforce a hard timeout on the request. */
+  signal?: AbortSignal;
 }
 
 export interface ChatResult {
@@ -278,6 +280,7 @@ async function chatOllama(
         top_p: options.topP ?? 0.1,
       },
     }),
+    signal: options.signal,
   });
 
   if (!resp.ok) {
@@ -386,6 +389,7 @@ async function chatOpenAI(
       stream: false,
       ...(options.jsonMode && supportsNativeJsonMode ? { response_format: { type: "json_object" } } : {}),
     }),
+    signal: options.signal,
   });
 
   if (!resp.ok) {
@@ -542,6 +546,7 @@ async function chatAnthropic(
       ...(systemMsg ? { system: systemMsg.content } : {}),
       messages: anthropicMessages.map((m) => ({ role: m.role, content: m.content })),
     }),
+    signal: options.signal,
   });
 
   if (!resp.ok) {
@@ -669,6 +674,7 @@ async function chatGemini(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
+    signal: options.signal,
   });
 
   if (!resp.ok) {

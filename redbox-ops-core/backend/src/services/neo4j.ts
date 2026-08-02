@@ -104,6 +104,26 @@ function getNeo4jErrorCode(err: unknown): string | undefined {
   return undefined;
 }
 
+export type Neo4jHealth = 'healthy' | 'degraded' | 'unknown';
+
+/**
+ * Report Neo4j health from the *cached* connectivity check only — no new network
+ * round trip (P3-D). This lets callers distinguish "memory is down" from "memory
+ * is up but had nothing relevant", without perturbing the hot path.
+ *
+ *  - 'healthy'  : a check within the TTL window succeeded
+ *  - 'degraded' : a check within the TTL window failed
+ *  - 'unknown'  : no check has run yet, or the last result is stale (TTL expired)
+ *
+ * A query via runQuery() refreshes this state as a side effect of its own
+ * connectivity check, so status reflects the most recent real interaction.
+ */
+export function getConnectivityStatus(): Neo4jHealth {
+  if (lastConnectivityCheckMs === 0) return 'unknown';
+  if (Date.now() - lastConnectivityCheckMs >= CONNECTIVITY_TTL_MS) return 'unknown';
+  return lastConnectivityOk ? 'healthy' : 'degraded';
+}
+
 async function verifyConnectivityCached(driverInstance: Driver): Promise<boolean> {
   const now = Date.now();
   if (now - lastConnectivityCheckMs < CONNECTIVITY_TTL_MS) {

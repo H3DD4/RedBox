@@ -1,3 +1,5 @@
+import { BeliefGraph } from './belief-graph.js';
+
 export interface DiscoveredEndpoint { url: string; method: string; params: string[]; status?: number; }
 export interface DiscoveredService { port: number; version?: string; }
 export interface LootedCredential { username: string; secret: string; source: string; }
@@ -19,11 +21,17 @@ export interface TargetModel {
   tokens: LootedToken[];
   confirmedVulns: ConfirmedVuln[];
   hypotheses: Hypothesis[];
+  /**
+   * Probabilistic belief layer (P3-B). Runs alongside the binary `hypotheses`
+   * list rather than replacing it: every hypothesis hook also updates a mirrored
+   * belief so the graph carries confidence, contradiction, and support links.
+   */
+  beliefs: BeliefGraph;
   notes: string[];
 }
 
 export function emptyTargetModel(target: string): TargetModel {
-  return { target, endpoints: [], services: [], tech: [], credentials: [], tokens: [], confirmedVulns: [], hypotheses: [], notes: [] };
+  return { target, endpoints: [], services: [], tech: [], credentials: [], tokens: [], confirmedVulns: [], hypotheses: [], beliefs: new BeliefGraph(), notes: [] };
 }
 
 export function addEndpoint(m: TargetModel, ep: DiscoveredEndpoint): void {
@@ -75,6 +83,8 @@ export function renderTargetModel(m: TargetModel): string {
   if (open.length) { lines.push('Open hypotheses to TEST (highest confidence first):'); for (const h of open.slice(0, 15)) lines.push(`  - [${(h.confidence*100).toFixed(0)}%] ${h.vulnClass} @ ${h.location} — ${h.rationale}`); }
   const conf = m.hypotheses.filter((h) => h.status === 'confirmed');
   if (conf.length) { lines.push('Confirmed hypotheses:'); for (const h of conf) lines.push(`  - ${h.vulnClass} @ ${h.location}`); }
+  const beliefBlock = m.beliefs.toPromptString();
+  if (beliefBlock) { lines.push(beliefBlock); }
   if (m.notes.length) { lines.push('Notes:'); for (const n of m.notes.slice(-10)) lines.push(`  - ${n}`); }
   if (!lines.length) return '';
   return ['## CARRIED-FORWARD TARGET MODEL (confirmed evidence from prior phases)', ...lines].join('\n');
