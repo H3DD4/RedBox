@@ -1,6 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import { getDb } from "../db.js";
-import { chatComplete, getActiveProvider } from "./llm-gateway.js";
+import { chatComplete, getActiveProvider, getProviderById } from "./llm-gateway.js";
+import { LlmProviderError } from "../lib/llm-errors.js";
 import { EventEmitter } from "events";
 import { getRoute, getFallbackRoute, type TaskRoute } from "../lib/task-router.js";
 import { getRateLimiter } from "../lib/rate-limiter.js";
@@ -1050,8 +1051,6 @@ const DEFAULT_FLAG_PATTERNS = [
   /FCSC\{[^}]+\}/gi,
   /WH\{[^}]+\}/gi,
   /n00bz\{[^}]+\}/gi,
-  // Generic fallback: WORD{content} where WORD is 2-12 alphanumeric chars
-  /[A-Za-z0-9_-]{2,12}\{[A-Za-z0-9_\-!@#$%^&*()+\=<>.,?/:;'" ]{4,}\}/g,
 ];
 
 function extractFlag(text: string, customFormat?: string): string | null {
@@ -1454,7 +1453,7 @@ function validateExperienceCapture(
     return { valid: false, reason: "placeholder output" };
   }
 
-  const verifiedFlag = extractFlag(output, cfg.flagFormat);
+  const verifiedFlag = cfg.purpose === "ctf" ? extractFlag(output, cfg.flagFormat) : null;
   if (verifiedFlag) {
     return { valid: true, outputSignature: `FLAG: ${verifiedFlag}` };
   }
@@ -2050,7 +2049,7 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
   try {
     const provider = getActiveProvider();
     if (provider && provider.type === 'cerebras') {
-      const rateLimiter = getRateLimiter(provider.type);
+      const rateLimiter = getRateLimiter(provider.id, provider.type);
       const status = rateLimiter.getStatus();
 
       console.log(`[SCAN MONITOR] Step: ${stepName} | Requests: ${status.requestsUsed}/${status.requestsLimit} | Tokens: ${status.tokensUsed}/${status.tokensLimit}`);
@@ -2402,59 +2401,21 @@ async function executePhase(runId: string, cfg: RunConfig, route: TaskRoute, spe
       // FIXED: ISSUE-06 — use token-based trimming
       const trimmedMessages = trimMessages(messages);
 
-      // Get LLM response with AUTOMATIC RETRY for guaranteed completion
-      let response: string | null = null;
-      let retryCount = 0;
-      const MAX_RETRIES = 5;
-
-      while (!response && retryCount < MAX_RETRIES) {
-        try {
-          // FIXED: ISSUE-06 — dynamic token budget per phase
-          // FIXED: Lower temperature (0.3) for more deterministic output, helps weak models follow instructions
-          // ANTI-HANG: hard timeout so a stalled provider request can NEVER freeze the
-          // phase. On timeout we abort the fetch and throw, which the retry logic below
-          // turns into a visible status + retry, guaranteeing the loop always advances.
-          const LLM_TIMEOUT_MS = 120000; // 2 min per attempt
-          const llmController = new AbortController();
-          const llmTimer = setTimeout(() => llmController.abort(), LLM_TIMEOUT_MS);
-          try {
-            response = await chatComplete(trimmedMessages, {
-              providerId: cfg.llmProviderId,
-              modelOverride: cfg.modelOverride,
-              temperature: 0.3, // Low temperature = more focused, less hallucination
-              maxTokens: getMaxTokens(spec.promptFile || null, cfg.testType),
-              signal: llmController.signal,
-            });
-          } finally {
-            clearTimeout(llmTimer);
-          }
-        } catch (llmError) {
-          retryCount++;
-          const errorMsg = llmError instanceof Error ? llmError.message : String(llmError);
-          const isTimeout = errorMsg.includes('abort') || errorMsg.includes('Abort') || (llmError as { name?: string })?.name === 'AbortError';
-
-          // Check if it's a rate limit error
-          if (errorMsg.includes('RATE_LIMIT') || errorMsg.includes('429')) {
-            const waitTime = Math.min(60000, 10000 * Math.pow(2, retryCount)); // 10s, 20s, 40s, 60s max
-            console.warn(`[Run ${runId}] ⚠️ Rate limit hit, retrying in ${Math.round(waitTime / 1000)}s (attempt ${retryCount}/${MAX_RETRIES})`);
-            emit(runId, { type: "status", content: `⏳ Rate limit - waiting ${Math.round(waitTime / 1000)}s then retrying (${retryCount}/${MAX_RETRIES})...`, timestamp: new Date().toISOString() });
-            await new Promise(resolve => setTimeout(resolve, waitTime));
-          } else {
-            // Non-rate-limit error - still retry but with shorter wait
-            const label = isTimeout
-              ? `⏱️ LLM timed out after 120s — retrying (${retryCount}/${MAX_RETRIES})...`
-              : `⚠️ Error: ${errorMsg.slice(0, 100)}... Retrying...`;
-            console.error(`[Run ${runId}] LLM ${isTimeout ? 'timeout' : 'error'}: ${errorMsg}, retrying...`);
-            emit(runId, { type: "status", content: label, timestamp: new Date().toISOString() });
-            await new Promise(resolve => setTimeout(resolve, isTimeout ? 1000 : 5000));
-          }
-
-          if (retryCount >= MAX_RETRIES) {
-            console.error(`[Run ${runId}] Max retries reached, skipping iteration`);
-            emit(runId, { type: "status", content: `❌ Max retries reached for iteration ${iteration}, continuing...`, timestamp: new Date().toISOString() });
-            break;
-          }
-        }
+      // Same-provider retries are centralized in the gateway.
+      const LLM_TIMEOUT_MS = 120000;
+      const llmController = new AbortController();
+      const llmTimer = setTimeout(() => llmController.abort(), LLM_TIMEOUT_MS);
+      let response: string;
+      try {
+        response = await chatComplete(trimmedMessages, {
+          providerId: cfg.llmProviderId,
+          modelOverride: cfg.modelOverride,
+          temperature: 0.3,
+          maxTokens: getMaxTokens(spec.promptFile || null, cfg.testType),
+          signal: llmController.signal,
+        });
+      } finally {
+        clearTimeout(llmTimer);
       }
 
       if (!response) {
@@ -2522,7 +2483,7 @@ Try again now.`,
       const actions: ProposedAction[] = parseResult.status === 'ok' ? [...parseResult.actions] : [];
 
       // Competency System (Part 7): Auto-intercept flags in LLM output
-      const mentionedFlag = extractFlag(response, cfg.flagFormat);
+      const mentionedFlag = isCTF ? extractFlag(response, cfg.flagFormat) : null;
       if (mentionedFlag && !flagCaptured) {
         console.log(`[Run ${runId}] Auto-intercepted flag from text: ${mentionedFlag}`);
         emit(runId, {
@@ -2910,7 +2871,7 @@ What is your next ACTION?`,
         }
 
         // ── Flag detection ──
-        const flagInResult = extractFlag(result, cfg.flagFormat);
+        const flagInResult = isCTF ? extractFlag(result, cfg.flagFormat) : null;
         if (flagInResult && !flagCaptured) {
           flagCaptured = flagInResult;
           console.log(`[Run ${runId}] 🚩 FLAG FOUND IN TOOL RESULT: ${flagInResult}`);
@@ -3138,13 +3099,22 @@ ${isCTF ? "**NEXT**: Search the output above for the flag. If found, report it i
       consecutiveErrors++;
 
       // SMART RATE LIMIT HANDLING: Better detection and progressive backoff
-      const isRateLimit = errMsg.includes('RATE_LIMIT') || errMsg.includes('429') ||
+      const providerError = err instanceof LlmProviderError ? err : null;
+      const isRateLimit = providerError?.details.category === 'rate_limit' || errMsg.includes('RATE_LIMIT') || errMsg.includes('429') ||
         errMsg.includes('too_many_tokens') || errMsg.includes('quota_exceeded') ||
         errMsg.includes('rate limit') || errMsg.includes('high traffic');
 
       if (isRateLimit) {
-        // OPTIMIZED: Much shorter waits - rate limiter should prevent most of these
-        const rateLimitBackoff = Math.min(15000 * Math.pow(1.4, consecutiveErrors - 1), 60000); // 15s → 60s max
+        const retryAfterMs = providerError?.details.retryAfterMs;
+        if (retryAfterMs && retryAfterMs > 120000) {
+          emit(runId, {
+            type: "error",
+            content: `Selected LLM quota is unavailable for ${Math.ceil(retryAfterMs / 60000)} minutes.`,
+            timestamp: new Date().toISOString(),
+          });
+          break;
+        }
+        const rateLimitBackoff = retryAfterMs ?? Math.min(15000 * Math.pow(1.4, consecutiveErrors - 1), 60000);
         emit(runId, {
           type: "status",
           content: `⏱️ Rate limit hit → waiting ${Math.round(rateLimitBackoff / 1000)}s (conversation continues where left off)`,
@@ -3393,13 +3363,21 @@ export async function startRun(cfg: RunConfig): Promise<string> {
   const emitter = new EventEmitter();
   runEmitters.set(runId, emitter);
 
-  const activeProvider = getActiveProvider();
-  if (!activeProvider && !cfg.llmProviderId) {
+  const provider = cfg.llmProviderId ? getProviderById(cfg.llmProviderId) : getActiveProvider();
+  if (!provider) {
+    if (cfg.llmProviderId) {
+      throw new Error("Selected LLM provider no longer exists. Select another provider.");
+    }
     emit(runId, { type: "error", content: "No LLM provider configured", timestamp: new Date().toISOString() });
     emit(runId, { type: "complete", timestamp: new Date().toISOString() });
     cleanupEmitter(runId);
     return runId;
   }
+  if (cfg.modelOverride && cfg.modelOverride !== provider.model) {
+    throw new Error("Selected model no longer matches this provider. Refresh the provider list.");
+  }
+  cfg.llmProviderId = provider.id;
+  cfg.modelOverride = cfg.modelOverride || provider.model;
 
   const route = getRoute(cfg.testType, cfg.purpose) || getFallbackRoute(cfg.testType, cfg.purpose);
 

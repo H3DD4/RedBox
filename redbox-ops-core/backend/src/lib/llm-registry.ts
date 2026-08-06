@@ -106,10 +106,18 @@ export const PROVIDER_REGISTRY: Record<string, ProviderConfig> = {
   openrouter: {
     label: "OpenRouter",
     defaultEndpoint: "https://openrouter.ai/api/v1",
-    defaultModel: "anthropic/claude-3.5-sonnet",
+    defaultModel: "nvidia/nemotron-3-ultra-550b-a55b:free",
     requiresApiKey: true,
     apiStyle: "openai", // OpenRouter uses OpenAI-compatible API
-    description: "Access multiple providers through one API",
+    availableModels: [
+      "nvidia/nemotron-3-ultra-550b-a55b:free",
+      "poolside/laguna-s-2.1:free",
+      "nvidia/nemotron-3-super-120b-a12b:free",
+      "cohere/north-mini-code:free",
+      "google/gemma-4-31b-it:free",
+      "openai/gpt-oss-20b:free",
+    ],
+    description: "OpenRouter gateway with pinned free reasoning and coding models",
   },
 
   "opencode-zen": {
@@ -118,8 +126,24 @@ export const PROVIDER_REGISTRY: Record<string, ProviderConfig> = {
     defaultModel: "big-pickle",
     requiresApiKey: true,
     apiStyle: "openai", // OpenCode Zen provides OpenAI-compatible chat/completions
-    availableModels: ["big-pickle", "opencode/big-pickle"],
+    availableModels: ["big-pickle"],
     description: "OpenCode Zen gateway (OpenAI-compatible)",
+  },
+
+  nvidia: {
+    label: "NVIDIA NIM",
+    defaultEndpoint: "https://integrate.api.nvidia.com/v1",
+    defaultModel: "nvidia/nemotron-3-ultra-550b-a55b",
+    requiresApiKey: true,
+    apiStyle: "openai",
+    availableModels: [
+      "nvidia/nemotron-3-ultra-550b-a55b",
+      "nvidia/nemotron-3-super-120b-a12b",
+      "nvidia/nemotron-3-nano-30b-a3b",
+      "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+      "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    ],
+    description: "NVIDIA-hosted Nemotron reasoning models; Ultra 550B is the strongest tier",
   },
 
   deepseek: {

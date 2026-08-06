@@ -83,8 +83,8 @@ function loadOrchestratorSessionState(): OrchestratorSessionState | null {
       findings: Array.isArray(parsed.findings) ? parsed.findings as Finding[] : [],
       uploadedFiles: Array.isArray(parsed.uploadedFiles)
         ? parsed.uploadedFiles.filter((f): f is { id: string; name: string; path?: string } =>
-            !!f && typeof f === "object" && typeof (f as { id?: unknown }).id === "string" && typeof (f as { name?: unknown }).name === "string"
-          )
+          !!f && typeof f === "object" && typeof (f as { id?: unknown }).id === "string" && typeof (f as { name?: unknown }).name === "string"
+        )
         : [],
       showHistory: Boolean(parsed.showHistory),
     };
@@ -158,7 +158,7 @@ const Orchestrator = () => {
     initialSessionRef.current?.output?.length ? initialSessionRef.current.output : DEFAULT_OUTPUT_LINES
   );
   const [findings, setFindings] = useState<Finding[]>(initialSessionRef.current?.findings ?? []);
-  
+
   // Competency System state
   const [liveEvents, setLiveEvents] = useState<any[]>([]);
   const [currentConfidence, setCurrentConfidence] = useState(0);
@@ -166,7 +166,7 @@ const Orchestrator = () => {
   const [pendingFeedback, setPendingFeedback] = useState<RunFeedbackSummary | null>(() => loadPendingFeedback());
   const [showScoringModal, setShowScoringModal] = useState(false);
   const [feedbackSubmittedRuns, setFeedbackSubmittedRuns] = useState<Set<string>>(() => loadSubmittedFeedbackRuns());
-  
+
   const streamAbortRef = useRef<AbortController | null>(null);
   const activeStreamRunIdRef = useRef<string | null>(null);
   const targetRef = useRef(target);
@@ -200,7 +200,7 @@ const Orchestrator = () => {
   const [showToolTestResults, setShowToolTestResults] = useState(false);
 
   const refreshRuns = () => {
-    orchestrator.listRuns().then(({ runs: r }) => setRuns(r)).catch(() => {});
+    orchestrator.listRuns().then(({ runs: r }) => setRuns(r)).catch(() => { });
   };
 
   // Handle MCP tool testing
@@ -342,7 +342,7 @@ const Orchestrator = () => {
       setPurposes(pp);
       setTestType((prev) => prev || tt[0]?.value || "");
       setPurpose((prev) => prev || pp[0]?.value || "");
-    }).catch(() => {});
+    }).catch(() => { });
 
     mcpServers.list().then(({ servers }) => {
       setMcpList(servers);
@@ -350,15 +350,15 @@ const Orchestrator = () => {
       if (def) {
         setSelMcp((prev) => prev || def.id);
       }
-    }).catch(() => {});
+    }).catch(() => { });
 
     llmProviders.list().then(({ providers }) => {
       setProviderList(providers);
       const active = providers.find((p) => p.active) || providers[0];
-      if (active) {
-        setSelProvider((prev) => prev || active.id);
-      }
-    }).catch(() => {});
+      setSelProvider((prev) => prev && providers.some((provider) => provider.id === prev)
+        ? prev
+        : active?.id || "");
+    }).catch(() => { });
 
     refreshRuns();
   }, []);
@@ -424,7 +424,7 @@ const Orchestrator = () => {
         const { upload } = await uploads.upload(file);
         added.push({ id: upload.id, name: upload.original_name, path: upload.file_path || upload.original_name });
       } catch (err) {
-        toast({ title: "Upload failed", description: `${file.name}: ${(err as {error?:string}).error || "error"}`, variant: "destructive" });
+        toast({ title: "Upload failed", description: `${file.name}: ${(err as { error?: string }).error || "error"}`, variant: "destructive" });
       }
     }
     setUploadedFiles((p) => [...p, ...added]);
@@ -618,6 +618,11 @@ const Orchestrator = () => {
       toast({ title: "Invalid configuration", description: "Select a valid test type and purpose combination.", variant: "destructive" });
       return;
     }
+    const selectedLlmProvider = providerList.find((provider) => provider.id === selProvider);
+    if (!selectedLlmProvider) {
+      toast({ title: "Model required", description: "Select an available LLM provider and model.", variant: "destructive" });
+      return;
+    }
     setIsRunning(true);
     setFindings([]);
 
@@ -638,7 +643,8 @@ const Orchestrator = () => {
         testType,
         purpose,
         mcpServerId: selMcp || undefined,
-        llmProviderId: selProvider || undefined,
+        llmProviderId: selectedLlmProvider.id,
+        modelOverride: selectedLlmProvider.model,
         uploadIds: uploadedFiles.map((f) => f.id),
         challengeName: purpose === "ctf" ? challengeName : undefined,
         // FIXED: UI-01, UI-04 — include new optional fields
@@ -669,10 +675,10 @@ const Orchestrator = () => {
     if (!runId) return;
     try {
       const { report } = await reports.generate(runId, type);
-      toast({ title: "Report ready", description: `${type} report generated (ID: ${report.id.slice(0,8)})` });
+      toast({ title: "Report ready", description: `${type} report generated (ID: ${report.id.slice(0, 8)})` });
       window.open(reports.downloadUrl(report.id, "html"), "_blank");
     } catch (err) {
-      toast({ title: "Report failed", description: (err as {error?:string}).error || "error", variant: "destructive" });
+      toast({ title: "Report failed", description: (err as { error?: string }).error || "error", variant: "destructive" });
     }
   };
 
@@ -684,7 +690,7 @@ const Orchestrator = () => {
       toast({ title: "Run deleted", description: "The scan has been removed from history." });
       refreshRuns();
     } catch (err) {
-      toast({ title: "Delete failed", description: (err as {error?:string}).error || "error", variant: "destructive" });
+      toast({ title: "Delete failed", description: (err as { error?: string }).error || "error", variant: "destructive" });
     } finally {
       setDeletingRunId(null);
     }
@@ -1056,7 +1062,7 @@ const Orchestrator = () => {
             {runId && !isRunning && (
               <div className="bg-zinc-900/80 border border-zinc-700/50 rounded-lg p-4 space-y-2">
                 <p className="text-zinc-200 font-mono text-xs uppercase tracking-[0.15em] mb-2">// Generate Report</p>
-                {(["executive","technical","full"] as const).map((type) => (
+                {(["executive", "technical", "full"] as const).map((type) => (
                   <button
                     key={type}
                     onClick={() => handleGenerateReport(type)}
@@ -1091,10 +1097,10 @@ const Orchestrator = () => {
 
             {/* Findings Panel (Competency System) */}
             <div className="h-[400px]">
-              <FindingsPanel 
-                findings={findings} 
-                liveEvents={liveEvents} 
-                currentConfidence={currentConfidence} 
+              <FindingsPanel
+                findings={findings}
+                liveEvents={liveEvents}
+                currentConfidence={currentConfidence}
               />
             </div>
 
@@ -1159,8 +1165,8 @@ const Orchestrator = () => {
                                     {isCTF && hasFlags
                                       ? `🚩 ${flags.length} flag${flags.length !== 1 ? 's' : ''}`
                                       : vulnerabilities.length > 0
-                                      ? `${vulnerabilities.length} finding${vulnerabilities.length !== 1 ? 's' : ''}`
-                                      : "No findings"}
+                                        ? `${vulnerabilities.length} finding${vulnerabilities.length !== 1 ? 's' : ''}`
+                                        : "No findings"}
                                   </span>
                                 )}
                               </div>
@@ -1207,7 +1213,7 @@ const Orchestrator = () => {
       )}
 
       {/* Competency System Modals */}
-      <FlagVerificationModal 
+      <FlagVerificationModal
         candidate={flagCandidate}
         onVerify={async (flagId, verdict) => {
           if (!runId) return;
@@ -1225,17 +1231,17 @@ const Orchestrator = () => {
       {pendingFeedback &&
         !showScoringModal &&
         !feedbackSubmittedRuns.has(pendingFeedback.runId) && (
-        <div className="fixed bottom-6 right-6 z-40">
-          <Button
-            type="button"
-            onClick={() => setShowScoringModal(true)}
-            className="shadow-lg gap-2"
-          >
-            <Trophy className="h-4 w-4" />
-            Rate this run
-          </Button>
-        </div>
-      )}
+          <div className="fixed bottom-6 right-6 z-40">
+            <Button
+              type="button"
+              onClick={() => setShowScoringModal(true)}
+              className="shadow-lg gap-2"
+            >
+              <Trophy className="h-4 w-4" />
+              Rate this run
+            </Button>
+          </div>
+        )}
 
       {showScoringModal && pendingFeedback && !feedbackSubmittedRuns.has(pendingFeedback.runId) && (
         <ScoringModal

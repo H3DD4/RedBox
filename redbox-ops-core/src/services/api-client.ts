@@ -514,8 +514,8 @@ export const hexstrike = {
 
 export const chat = {
   /** Simple non-streaming chat request */
-  send: (message: string, systemPrompt?: string) =>
-    json("/api/chat/simple", "POST", { message, systemPrompt }) as Promise<{
+  send: (message: string, providerId: string, model: string, systemPrompt?: string) =>
+    json("/api/chat/simple", "POST", { message, providerId, model, systemPrompt }) as Promise<{
       response: string;
       provider: string;
       model: string;

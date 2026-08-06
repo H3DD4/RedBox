@@ -6,8 +6,20 @@
  */
 
 interface TokenRecord {
+  id: number;
   timestamp: number;
   tokens: number;
+}
+
+export interface RateLimitReservation {
+  id: number;
+}
+
+export class RateLimitQueueError extends Error {
+  constructor(public readonly retryAfterMs: number) {
+    super(`Provider is rate limited for another ${Math.ceil(retryAfterMs / 1000)} seconds`);
+    this.name = "RateLimitQueueError";
+  }
 }
 
 interface RateLimiterConfig {
@@ -54,6 +66,8 @@ class TokenRateLimiter {
   private rateLimitUntil: number = 0;
   private consecutiveRateLimits: number = 0;
   private circuitBreakerUntil: number = 0;
+  private nextReservationId = 1;
+  private admissionQueue: Promise<void> = Promise.resolve();
 
   constructor(providerType: string = 'default') {
     this.providerType = providerType;
@@ -119,10 +133,17 @@ class TokenRateLimiter {
   /**
    * Record a completed request with actual token usage
    */
-  recordUsage(promptTokens: number, completionTokens: number): void {
+  recordUsage(promptTokens: number, completionTokens: number, reservation?: RateLimitReservation): void {
     const total = promptTokens + completionTokens;
-    this.tokenHistory.push({ timestamp: Date.now(), tokens: total });
-    this.requestHistory.push(Date.now());
+    const record = reservation
+      ? this.tokenHistory.find((item) => item.id === reservation.id)
+      : undefined;
+    if (record) {
+      record.tokens = total;
+    } else {
+      this.tokenHistory.push({ id: this.nextReservationId++, timestamp: Date.now(), tokens: total });
+      this.requestHistory.push(Date.now());
+    }
 
     // Reset consecutive rate limits on successful request
     if (this.consecutiveRateLimits > 0) {
@@ -139,13 +160,15 @@ class TokenRateLimiter {
   /**
    * Mark that we hit a rate limit (from 429 response)
    */
-  markRateLimited(): void {
+  markRateLimited(retryAfterMs?: number): void {
     this.isRateLimited = true;
     this.consecutiveRateLimits++;
 
-    // Exponential backoff based on consecutive rate limits
-    let waitTime = 30000; // Base 30-second wait
-    if (this.consecutiveRateLimits >= 3) {
+    // Prefer the provider's reset window; otherwise use bounded local backoff.
+    let waitTime = retryAfterMs ?? 30000;
+    if (retryAfterMs !== undefined) {
+      console.log(`[RateLimiter] Provider requested a ${Math.round(waitTime / 1000)}s cooldown`);
+    } else if (this.consecutiveRateLimits >= 3) {
       // Circuit breaker: Wait much longer after multiple consecutive hits
       waitTime = Math.min(300000, 60000 * Math.pow(2, this.consecutiveRateLimits - 3)); // Up to 5 min
       this.circuitBreakerUntil = Date.now() + waitTime;
@@ -156,7 +179,9 @@ class TokenRateLimiter {
       console.log(`[RateLimiter] Rate limit #${this.consecutiveRateLimits} hit! Waiting ${Math.round(waitTime/1000)}s`);
     }
 
+    waitTime = Math.max(0, waitTime);
     this.rateLimitUntil = Date.now() + waitTime;
+    this.circuitBreakerUntil = Math.max(this.circuitBreakerUntil, this.rateLimitUntil);
   }
 
   /**
@@ -216,10 +241,31 @@ class TokenRateLimiter {
   /**
    * Wait if necessary, then allow the request to proceed
    */
-  async waitForSlot(estimatedTokens: number): Promise<void> {
-    const delay = await this.getDelay(estimatedTokens);
-    if (delay > 0) {
-      await new Promise(resolve => setTimeout(resolve, delay));
+  async waitForSlot(
+    estimatedTokens: number,
+    options: { signal?: AbortSignal; maxWaitMs?: number } = {}
+  ): Promise<RateLimitReservation> {
+    let release!: () => void;
+    const previous = this.admissionQueue;
+    this.admissionQueue = new Promise<void>((resolve) => { release = resolve; });
+
+    await previous;
+    try {
+      const delay = await this.getDelay(estimatedTokens);
+      if (delay > (options.maxWaitMs ?? 120000)) {
+        throw new RateLimitQueueError(delay);
+      }
+      if (delay > 0) {
+        await abortableDelay(delay, options.signal);
+      }
+
+      const id = this.nextReservationId++;
+      const now = Date.now();
+      this.tokenHistory.push({ id, timestamp: now, tokens: estimatedTokens });
+      this.requestHistory.push(now);
+      return { id };
+    } finally {
+      release();
     }
   }
 
@@ -257,14 +303,25 @@ class TokenRateLimiter {
   }
 }
 
+function abortableDelay(delayMs: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, delayMs);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  });
+}
+
 // Singleton instance per provider type
 const limiters: Map<string, TokenRateLimiter> = new Map();
 
-export function getRateLimiter(providerType: string = 'default'): TokenRateLimiter {
-  if (!limiters.has(providerType)) {
-    limiters.set(providerType, new TokenRateLimiter(providerType));
+export function getRateLimiter(key: string = 'default', providerType: string = key): TokenRateLimiter {
+  if (!limiters.has(key)) {
+    limiters.set(key, new TokenRateLimiter(providerType));
   }
-  return limiters.get(providerType)!;
+  return limiters.get(key)!;
 }
 
 export function setProviderLimits(providerType: string, config: Partial<RateLimiterConfig>): void {

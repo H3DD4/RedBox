@@ -10,7 +10,8 @@
 
 import { getDb } from "../db.js";
 import { getApiStyle } from "../lib/llm-registry.js";
-import { getRateLimiter } from "../lib/rate-limiter.js";
+import { LlmProviderError, providerResponseError } from "../lib/llm-errors.js";
+import { getRateLimiter, RateLimitQueueError } from "../lib/rate-limiter.js";
 
 export interface ChatMessage {
   role: "system" | "user" | "assistant";
@@ -74,86 +75,99 @@ export async function chat(
   }
 
   const model = options.modelOverride || provider.model;
+  return chatWithProvider(provider, model, messages, options);
+}
 
-  // SMART RATE LIMITING: Get rate limiter for this provider type
-  const rateLimiter = getRateLimiter(provider.type);
+async function chatWithProvider(
+  provider: ProviderRow,
+  model: string,
+  messages: ChatMessage[],
+  options: ChatOptions
+): Promise<ChatResult> {
+  const rateLimiter = getRateLimiter(provider.id, provider.type);
+  const estimatedTokens = rateLimiter.estimateTokens(messages) + (options.maxTokens ?? 1024);
+  const maxAttempts = Math.max(1, Number(process.env.LLM_MAX_ATTEMPTS_PER_PROVIDER || 2));
+  const maxRetryDelayMs = Math.max(0, Number(process.env.LLM_MAX_RETRY_DELAY_MS || 30000));
+  const maxQueueWaitMs = Math.max(0, Number(process.env.LLM_MAX_QUEUE_WAIT_MS || 120000));
 
-  // Check if we should recommend switching providers due to excessive rate limiting
-  if (rateLimiter.shouldRecommendProviderSwitch()) {
-    console.warn(`[LLM] ⚠️  RECOMMENDATION: Consider switching from ${provider.name} to Groq or OpenAI for better performance due to frequent rate limits.`);
-  }
-
-  // Estimate tokens for this request
-  const estimatedTokens = rateLimiter.estimateTokens(messages);
-
-  // Log current rate limiter status
-  const status = rateLimiter.getStatus();
-  console.log(`[LLM] ${provider.name}: ${status.tokensUsed}/${status.tokensLimit} tokens, ${status.requestsUsed}/${status.requestsLimit} requests, est: +${estimatedTokens}`);
-
-  if (status.circuitBreakerActive) {
-    console.warn(`[LLM] 🚨 Circuit breaker active for ${provider.name} - waiting for recovery`);
-  }
-
-  // Wait if necessary to avoid hitting rate limits
-  try {
-    await rateLimiter.waitForSlot(estimatedTokens);
-  } catch (err) {
-    console.error('[LLM] Rate limiter failed:', err);
-    // Continue anyway - rate limiter is auxiliary
-  }
-
-  // Use apiStyle from registry to determine which handler to use
-  const apiStyle = getApiStyle(provider.type);
-
-  let result: ChatResult;
-
-  try {
-    switch (apiStyle) {
-      case "ollama":
-        result = await chatOllama(provider, model, messages, options);
-        break;
-      case "openai":
-        // Handles: openai, cerebras, groq, together, deepseek, openrouter, custom, and any future OpenAI-compatible
-        result = await chatOpenAI(provider, model, messages, options);
-        break;
-      case "anthropic":
-        result = await chatAnthropic(provider, model, messages, options);
-        break;
-      case "gemini":
-        result = await chatGemini(provider, model, messages, options);
-        break;
-      default:
-        // Fallback to OpenAI-compatible for unknown providers
-        result = await chatOpenAI(provider, model, messages, options);
-        break;
-    }
-
-    // Record actual usage in rate limiter
-    if (result.usage) {
-      rateLimiter.recordUsage(result.usage.promptTokens, result.usage.completionTokens);
-    }
-
-    return result;
-
-  } catch (error) {
-    // Check if this is a rate limit error
-    const errorMessage = error instanceof Error ? error.message : String(error);
-
-    if (errorMessage.includes('RATE_LIMIT') || errorMessage.includes('429')) {
-      console.warn(`[LLM] 🚨 Rate limit hit for ${provider.name}: ${errorMessage}`);
-      rateLimiter.markRateLimited();
-
-      // After marking rate limited, check if we should recommend switching
-      if (rateLimiter.shouldRecommendProviderSwitch()) {
-        console.error(`[LLM] 💡 STRONG RECOMMENDATION: Switch to Groq (llama-3.3-70b-versatile) or OpenAI (gpt-4o-mini) for ${Math.round(15/1)} times faster execution!`);
-
-        // Add provider switching suggestion to error message
-        throw new Error(`${errorMessage}\n\n💡 TIP: This provider (${provider.name}) has very restrictive rate limits. Consider switching to Groq or OpenAI in Settings for much faster execution.`);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let reservation;
+    try {
+      reservation = await rateLimiter.waitForSlot(estimatedTokens, {
+        signal: options.signal,
+        maxWaitMs: maxQueueWaitMs,
+      });
+    } catch (error) {
+      if (error instanceof RateLimitQueueError) {
+        throw new LlmProviderError(
+          `RATE_LIMIT: ${error.message} [Provider: ${provider.name}, Model: ${model}]`,
+          { category: "rate_limit", retryable: true, retryAfterMs: error.retryAfterMs, provider: provider.name, model }
+        );
       }
+      throw error;
     }
 
-    throw error;
+    try {
+      const result = await dispatchChat(provider, model, messages, options);
+      const usage = result.usage ?? { promptTokens: estimatedTokens, completionTokens: 0 };
+      rateLimiter.recordUsage(usage.promptTokens, usage.completionTokens, reservation);
+      return result;
+    } catch (error) {
+      const normalized = normalizeProviderError(error, provider, model);
+      if (normalized.details.category === "rate_limit") {
+        rateLimiter.markRateLimited(normalized.details.retryAfterMs);
+      }
+
+      const retryDelayMs = normalized.details.retryAfterMs ?? Math.min(maxRetryDelayMs, 1000 * 2 ** (attempt - 1));
+      if (!normalized.details.retryable || attempt === maxAttempts || retryDelayMs > maxRetryDelayMs) {
+        throw normalized;
+      }
+      await delay(retryDelayMs + Math.floor(Math.random() * 250), options.signal);
+    }
   }
+
+  throw new Error("LLM request exhausted its retry policy");
+}
+
+async function dispatchChat(
+  provider: ProviderRow,
+  model: string,
+  messages: ChatMessage[],
+  options: ChatOptions
+): Promise<ChatResult> {
+  switch (getApiStyle(provider.type)) {
+    case "ollama": return chatOllama(provider, model, messages, options);
+    case "anthropic": return chatAnthropic(provider, model, messages, options);
+    case "gemini": return chatGemini(provider, model, messages, options);
+    default: return chatOpenAI(provider, model, messages, options);
+  }
+}
+
+function normalizeProviderError(error: unknown, provider: ProviderRow, model: string): LlmProviderError {
+  if (error instanceof LlmProviderError) return error;
+  if (optionsAborted(error)) {
+    return new LlmProviderError("LLM request aborted", {
+      category: "timeout", retryable: false, provider: provider.name, model,
+    });
+  }
+  return new LlmProviderError(error instanceof Error ? error.message : String(error), {
+    category: "network", retryable: true, provider: provider.name, model,
+  });
+}
+
+function optionsAborted(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal?.addEventListener("abort", () => {
+      clearTimeout(timer);
+      reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    }, { once: true });
+  });
 }
 
 /**
@@ -186,7 +200,7 @@ export async function* chatStream(
   const model = options.modelOverride || provider.model;
 
   // SMART RATE LIMITING: Apply to streaming as well
-  const rateLimiter = getRateLimiter(provider.type);
+  const rateLimiter = getRateLimiter(provider.id, provider.type);
 
   if (rateLimiter.shouldRecommendProviderSwitch()) {
     console.warn(`[LLM] ⚠️  RECOMMENDATION: Consider switching from ${provider.name} to Groq or OpenAI for better performance due to frequent rate limits.`);
@@ -200,11 +214,10 @@ export async function* chatStream(
     console.warn(`[LLM] 🚨 Circuit breaker active for ${provider.name} - waiting for recovery`);
   }
 
-  try {
-    await rateLimiter.waitForSlot(estimatedPromptTokens);
-  } catch (err) {
-    console.error("[LLM] Rate limiter failed (stream):", err);
-  }
+  const reservation = await rateLimiter.waitForSlot(
+    estimatedPromptTokens + (options.maxTokens ?? 1024),
+    { signal: options.signal, maxWaitMs: Number(process.env.LLM_MAX_QUEUE_WAIT_MS || 120000) }
+  );
 
   // Use apiStyle from registry to determine which handler to use
   const apiStyle = getApiStyle(provider.type);
@@ -242,13 +255,13 @@ export async function* chatStream(
     }
 
     const estimatedCompletionTokens = Math.ceil(outputChars / 3.5);
-    rateLimiter.recordUsage(estimatedPromptTokens, estimatedCompletionTokens);
+    rateLimiter.recordUsage(estimatedPromptTokens, estimatedCompletionTokens, reservation);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
 
     if (errorMessage.includes("RATE_LIMIT") || errorMessage.includes("429")) {
       console.warn(`[LLM] 🚨 Rate limit hit for ${provider.name}: ${errorMessage}`);
-      rateLimiter.markRateLimited();
+      rateLimiter.markRateLimited(error instanceof LlmProviderError ? error.details.retryAfterMs : undefined);
 
       if (rateLimiter.shouldRecommendProviderSwitch()) {
         throw new Error(`${errorMessage}\n\n💡 TIP: This provider (${provider.name}) has very restrictive rate limits. Consider switching to Groq or OpenAI in Settings for much faster execution.`);
@@ -284,8 +297,7 @@ async function chatOllama(
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Ollama error (${resp.status}): ${text}`);
+    throw await providerResponseError(resp, provider.name, model);
   }
 
   const data = (await resp.json()) as { message?: { content: string }; eval_count?: number; prompt_eval_count?: number };
@@ -319,10 +331,12 @@ async function* streamOllama(
         top_p: options.topP ?? 0.1,
       },
     }),
+    signal: options.signal,
   });
 
   if (!resp.ok || !resp.body) {
-    throw new Error(`Ollama stream error: ${resp.status}`);
+    if (!resp.ok) throw await providerResponseError(resp, provider.name, model);
+    throw new Error("Ollama stream error: empty response body");
   }
 
   const reader = resp.body.getReader();
@@ -351,18 +365,12 @@ async function* streamOllama(
 
 // ─── OpenAI-compatible ───────────────────────────────────────────────────────
 
-function normalizeOpenCodeModel(providerType: string, model: string): string {
-  if (providerType !== "opencode-zen") return model;
-  return model.startsWith("opencode/") ? model.slice("opencode/".length) : model;
-}
-
 async function chatOpenAI(
   provider: ProviderRow,
   model: string,
   messages: ChatMessage[],
   options: ChatOptions
 ): Promise<ChatResult> {
-  const normalizedModel = normalizeOpenCodeModel(provider.type, model);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
@@ -381,7 +389,7 @@ async function chatOpenAI(
     method: "POST",
     headers,
     body: JSON.stringify({
-      model: normalizedModel,
+      model,
       messages: preparedMessages,
       temperature: options.temperature ?? 0.0,
       max_tokens: options.maxTokens ?? 1024,
@@ -393,24 +401,7 @@ async function chatOpenAI(
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-
-    // RATE LIMIT HANDLING: Detect 429 errors and provide more context
-    if (resp.status === 429) {
-      // Parse error to check if it's token quota vs request rate
-      let errorDetail = text;
-      try {
-        const errorJson = JSON.parse(text);
-        errorDetail = errorJson.message || errorJson.error?.message || text;
-      } catch {
-        // plain text error
-      }
-
-      // Throw with RATE_LIMIT prefix so orchestrator can implement smart backoff
-      throw new Error(`RATE_LIMIT: ${errorDetail}  [Provider: ${provider.name}, Model: ${model}]`);
-    }
-
-    throw new Error(`OpenAI error (${resp.status}): ${text}`);
+    throw await providerResponseError(resp, provider.name, model);
   }
 
   const data = (await resp.json()) as {
@@ -420,7 +411,7 @@ async function chatOpenAI(
 
   return {
     content: data.choices?.[0]?.message?.content || "",
-    model: normalizedModel,
+    model,
     provider: provider.name,
     usage: data.usage
       ? { promptTokens: data.usage.prompt_tokens, completionTokens: data.usage.completion_tokens }
@@ -434,7 +425,6 @@ async function* streamOpenAI(
   messages: ChatMessage[],
   options: ChatOptions
 ): AsyncGenerator<string> {
-  const normalizedModel = normalizeOpenCodeModel(provider.type, model);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (provider.api_key) headers["Authorization"] = `Bearer ${provider.api_key}`;
 
@@ -452,7 +442,7 @@ async function* streamOpenAI(
     method: "POST",
     headers,
     body: JSON.stringify({
-      model: normalizedModel,
+      model,
       messages: preparedMessages,
       temperature: options.temperature ?? 0.0,
       max_tokens: options.maxTokens ?? 1024,
@@ -460,24 +450,11 @@ async function* streamOpenAI(
       stream: true,
       ...(options.jsonMode && supportsNativeJsonMode ? { response_format: { type: "json_object" } } : {}),
     }),
+    signal: options.signal,
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-
-    if (resp.status === 429) {
-      let errorDetail = text;
-      try {
-        const errorJson = JSON.parse(text);
-        errorDetail = errorJson.message || errorJson.error?.message || text;
-      } catch {
-        // plain text error
-      }
-
-      throw new Error(`RATE_LIMIT: ${errorDetail}  [Provider: ${provider.name}, Model: ${model}]`);
-    }
-
-    throw new Error(`OpenAI stream error (${resp.status}): ${text}`);
+    throw await providerResponseError(resp, provider.name, model);
   }
 
   if (!resp.body) {
@@ -550,8 +527,7 @@ async function chatAnthropic(
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Anthropic error (${resp.status}): ${text}`);
+    throw await providerResponseError(resp, provider.name, model);
   }
 
   const data = (await resp.json()) as {
@@ -601,10 +577,12 @@ async function* streamAnthropic(
       ...(systemMsg ? { system: systemMsg.content } : {}),
       messages: anthropicStreamMessages.map((m) => ({ role: m.role, content: m.content })),
     }),
+    signal: options.signal,
   });
 
   if (!resp.ok || !resp.body) {
-    throw new Error(`Anthropic stream error: ${resp.status}`);
+    if (!resp.ok) throw await providerResponseError(resp, provider.name, model);
+    throw new Error("Anthropic stream error: empty response body");
   }
 
   const reader = resp.body.getReader();
@@ -678,8 +656,7 @@ async function chatGemini(
   });
 
   if (!resp.ok) {
-    const text = await resp.text();
-    throw new Error(`Gemini error (${resp.status}): ${text}`);
+    throw await providerResponseError(resp, provider.name, model);
   }
 
   const data = (await resp.json()) as {

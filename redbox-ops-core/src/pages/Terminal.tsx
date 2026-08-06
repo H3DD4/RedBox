@@ -108,13 +108,23 @@ const Terminal = () => {
   const handleChatSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!chatInput.trim() || isSending) return;
+    const provider = providers.find((item) => item.id === selectedProvider);
+    if (!provider) {
+      toast({ title: "Model required", description: "Select an available LLM provider and model.", variant: "destructive" });
+      return;
+    }
     const content = chatInput.trim();
     setMessages((m) => [...m, { role: "user", content, timestamp: now() }]);
     setChatInput("");
     setIsSending(true);
     try {
       // Use the LLM chat endpoint instead of HexStrike
-      const res = await chat.send(content, "You are RedBox AI, a helpful security assistant. Be concise and helpful.");
+      const res = await chat.send(
+        content,
+        provider.id,
+        provider.model,
+        "You are RedBox AI, a helpful security assistant. Be concise and helpful."
+      );
       setMessages((m) => [...m, { role: "assistant", content: res.response, timestamp: now() }]);
     } catch (err) {
       const msg = (err as { error?: string }).error || "Connection failed";

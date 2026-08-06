@@ -37,6 +37,7 @@ const PROVIDER_TYPES = [
   { value: "deepseek",   label: "DeepSeek" },                      // ADDED
   { value: "openrouter", label: "OpenRouter" },                    // ADDED
   { value: "opencode-zen", label: "OpenCode Zen" },
+  { value: "nvidia",     label: "NVIDIA NIM" },
   { value: "custom",     label: "Custom (OpenAI-compatible)" },
 ];
 
@@ -51,6 +52,7 @@ const DEFAULT_ENDPOINTS: Record<string, string> = {
   deepseek:   "https://api.deepseek.com/v1",          // ADDED
   openrouter: "https://openrouter.ai/api/v1",         // ADDED
   "opencode-zen": "https://opencode.ai/zen/v1",
+  nvidia:     "https://integrate.api.nvidia.com/v1",
   custom:     "",
 };
 
@@ -63,8 +65,9 @@ const DEFAULT_MODELS: Record<string, string> = {
   groq:       "qwen/qwen3-32b",
   together:   "meta-llama/Llama-3.3-70B-Instruct-Turbo",          // ADDED
   deepseek:   "deepseek-chat",                                    // ADDED
-  openrouter: "anthropic/claude-3.5-sonnet",                      // ADDED
+  openrouter: "nvidia/nemotron-3-ultra-550b-a55b:free",
   "opencode-zen": "big-pickle",
+  nvidia:     "nvidia/nemotron-3-ultra-550b-a55b",
   custom:     "model-name",
 };
 
@@ -75,7 +78,22 @@ const AVAILABLE_MODELS: Record<string, string[]> = {
   openai:    ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"],
   anthropic: ["claude-sonnet-4-20250514", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307"],
   gemini:    ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-2.0-flash"],
-  "opencode-zen": ["big-pickle", "opencode/big-pickle"],
+  openrouter: [
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "poolside/laguna-s-2.1:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "cohere/north-mini-code:free",
+    "google/gemma-4-31b-it:free",
+    "openai/gpt-oss-20b:free",
+  ],
+  "opencode-zen": ["big-pickle"],
+  nvidia: [
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia/nemotron-3-nano-30b-a3b",
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1",
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+  ],
 };
 
 const SettingsPage = () => {

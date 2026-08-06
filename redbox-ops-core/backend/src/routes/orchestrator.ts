@@ -221,7 +221,7 @@ router.get("/rate-limiter-status", (_req, res) => {
       return;
     }
 
-    const rateLimiter = getRateLimiter(provider.type);
+    const rateLimiter = getRateLimiter(provider.id, provider.type);
     const status = rateLimiter.getStatus();
 
     res.json({
