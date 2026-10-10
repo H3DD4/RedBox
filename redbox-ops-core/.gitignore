@@ -23,3 +23,9 @@ redbox-ops-core/backend/tmp/
 *.njsproj
 *.sln
 *.sw?
+
+# Secrets and credential files (never commit)
+.env
+*.key
+*.pem
+cookies.txt

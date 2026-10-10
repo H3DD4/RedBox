@@ -1,0 +1,8 @@
+
+# Secrets and credential files (never commit)
+.env
+*.key
+*.pem
+cookies.txt
+cook.txt
+c.txt
